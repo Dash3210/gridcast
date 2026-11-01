@@ -1,0 +1,38 @@
+{ 
+  "data":[{ 
+    "from": "2025-01-11T23:00Z",
+    "to": "2025-01-11T23:30Z",
+    "intensity": {
+      "forecast": 72,
+      "actual": 64,
+      "index": "low"
+    }
+  },
+  { 
+    "from": "2025-01-11T23:30Z",
+    "to": "2025-01-12T00:00Z",
+    "intensity": {
+      "forecast": 73,
+      "actual": 62,
+      "index": "low"
+    }
+  },
+  { 
+    "from": "2025-01-12T00:00Z",
+    "to": "2025-01-12T00:30Z",
+    "intensity": {
+      "forecast": ,
+      "actual": 64,
+      "index": "low"
+    }
+  },
+  { 
+    "from": "2025-01-12T00:30Z",
+    "to": "2025-01-12T01:00Z",
+    "intensity": {
+      "forecast": ,
+      "actual": 63,
+      "index": "low"
+    }
+  }]
+}

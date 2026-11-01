@@ -25,12 +25,6 @@ def test_cli_version(capsys: pytest.CaptureFixture[str]) -> None:
     assert captured.out.strip() == f"gridcast {gridcast.__version__}"
 
 
-def test_cli_ingest_raises_phase_exit() -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main(["ingest"])
-    assert "P1" in str(exc_info.value)
-
-
 def test_cli_unknown_subcommand_exits_two() -> None:
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["unknown-subcommand"])
@@ -40,7 +34,6 @@ def test_cli_unknown_subcommand_exits_two() -> None:
 @pytest.mark.parametrize(
     ("subcommand", "expected_phase"),
     [
-        ("ingest", "P1"),
         ("train", "P3"),
         ("backtest", "P3"),
         ("serve", "P4"),
@@ -58,7 +51,6 @@ def test_cli_unimplemented_subcommands_raise_phase_exit(
 @pytest.mark.parametrize(
     "module_name",
     [
-        "gridcast.ingest",
         "gridcast.features",
         "gridcast.models",
         "gridcast.backtest",
@@ -68,6 +60,15 @@ def test_cli_unimplemented_subcommands_raise_phase_exit(
 def test_stub_modules_expose_empty_all(module_name: str) -> None:
     mod = importlib.import_module(module_name)
     assert getattr(mod, "__all__", None) == []
+
+
+def test_ingest_module_exposes_non_empty_all() -> None:
+    mod = importlib.import_module("gridcast.ingest")
+    all_symbols = getattr(mod, "__all__", None)
+    assert isinstance(all_symbols, list)
+    assert len(all_symbols) > 0
+    for symbol in all_symbols:
+        assert hasattr(mod, symbol)
 
 
 def test_version_fallback_when_package_not_found(monkeypatch: pytest.MonkeyPatch) -> None:

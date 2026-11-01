@@ -1,6 +1,7 @@
-"""Enable ``python -m gridcast`` to run the CLI.
+"""Enable execution via ``python -m gridcast``.
 
-A GitHub Action and a reviewer on a machine without the console script on PATH both need this.
+Entry point for running the Gridcast CLI as a module without requiring
+the console script to be installed on PATH.
 """
 
 from gridcast.cli import main
