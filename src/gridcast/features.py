@@ -5,7 +5,7 @@ No feature at target period t may use any value stamped after t.
 All lags and rolling statistics are keyed and resolved by timestamp lookup,
 never by row position, preserving temporal correctness across DST transitions.
 
-Bounded Feature Set (ADR-006 / D3):
+Bounded Feature Set (ADR-006):
 - Lags of actual: t-1h, t-2h, t-3h, t-24h, t-48h, t-168h
 - Rolling of actual: mean and std over 3h, 24h, 168h (windows ending at t-1h)
 - Calendar: hour of day, day of week, month, is-weekend, is-UK-bank-holiday,
@@ -149,7 +149,7 @@ FEATURE_COLUMNS: Final[list[str]] = [
     "cos_hour",
     "sin_day_of_year",
     "cos_day_of_year",
-    # Weather features (D1 previous-runs day 2)
+    # Weather features: previous-runs day 2
     "temperature",
     "temperature_24h_mean",
     "temperature_24h_min",
@@ -303,7 +303,7 @@ def build_feature_frame(
     result["sin_day_of_year"] = np.sin(2.0 * np.pi * doy_continuous / 365.25)
     result["cos_day_of_year"] = np.cos(2.0 * np.pi * doy_continuous / 365.25)
 
-    # 4. Weather features (D1 — previous-runs forecast issued 48 hours earlier)
+    # Weather features: previous-runs forecast issued 48 hours earlier
     # Check for invalid reanalysis sources
     w_source = weather_df if weather_df is not None else sorted_intensity
 
@@ -342,7 +342,7 @@ def build_feature_frame(
         containing_hours = timestamps.dt.floor("h")
         result["temperature"] = containing_hours.map(w_series).to_numpy(dtype=float)
 
-        # 24h mean and 24h min of D1 temperatures ending at t
+        # 24h mean and 24h min of the previous-runs temperatures ending at t
         w_roll_24h = w_series.rolling("24h", min_periods=1)
         w_24h_mean = w_roll_24h.mean()
         w_24h_min = w_roll_24h.min()
@@ -355,7 +355,7 @@ def build_feature_frame(
         result["temperature_24h_mean"] = np.nan
         result["temperature_24h_min"] = np.nan
 
-    # 5. Generation mix features (D2 — lagged to t-48h)
+    # Generation mix features: lagged to t-48h
     m_source = mix_df if mix_df is not None else sorted_intensity
     t_minus_48h = timestamps - pd.Timedelta(hours=48)
 

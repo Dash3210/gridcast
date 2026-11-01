@@ -2,7 +2,7 @@
 
 Validates that no feature at target period t uses any value stamped after t.
 Tests future-perturbation invariance across multiple cutoffs (mid-window, DST
-transition days, and window end), enforces bounded feature definitions (D1-D4),
+transition days, and window end), enforces the bounded feature definitions,
 and proves that leaks in actuals, weather, or generation mix fail loudly.
 """
 
@@ -194,7 +194,7 @@ class TestFeatureContractAndInvariants:
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ) -> None:
-        """Every feature in D3 must be present; no unapproved features."""
+        """Every declared feature must be present; no unapproved features."""
         intensity_df, weather_df, mix_df = curated_sample_data
         features = build_feature_frame(intensity_df, weather_df, mix_df)
 
@@ -407,7 +407,7 @@ class TestLeakageTeethDemonstrations:
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ) -> None:
-        """D1: If previous-runs is null in window, weather feature is null."""
+        """If the previous-runs series is null inside the window, the weather feature is null."""
         intensity_df, weather_df, mix_df = curated_sample_data
         bad_weather = weather_df.copy()
         # Null out some values inside window
@@ -444,7 +444,7 @@ class TestLeakageTeethDemonstrations:
 
 
 class TestTimestampKeyingAndDST:
-    """D4: Timestamp-based lookups across DST shifts rather than row shifting."""
+    """Timestamp-based lookups across DST shifts rather than row shifting."""
 
     def test_dst_spring_forward_lag_lookup(
         self,

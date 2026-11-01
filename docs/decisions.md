@@ -98,7 +98,7 @@
   - Overriding the reviewer's verdict on the operator's authority (rejected: it makes the verdict meaningless and hides the circularity instead of removing it).
   - Letting reviewers block on publication (rejected: it creates a deadlock in which a phase can never ship because it is not yet shipped).
 
-## ADR-006 — Weather source: previous-runs forecast issued 48 hours earlier (D1)
+## ADR-006 — Weather source: previous-runs forecast issued 48 hours earlier
 - Status: accepted
 - Date: 2026-11-01
 - Context:

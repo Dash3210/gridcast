@@ -90,7 +90,7 @@ Phase P2 provides a bounded, leakage-free feature construction pipeline in `grid
 - **Temporal Integrity**: Enforces that no feature at target period `t` uses any value stamped after `t`. Verified via future-perturbation invariance tests across multiple cutoffs (mid-window, DST transitions, and dataset boundary).
 - **Time-based Keying**: All lags and rolling stats are keyed and sorted by `period_start_utc` timestamp lookup rather than row positions, ensuring correctness across 46-period (spring forward) and 50-period (autumn back) clock changes.
 - **Auxiliary Store Requirement**: The real build path (`load_feature_sources()`) loads all three source datasets from `data/curated/`, `data/weather/`, and `data/mix/`. `build_feature_frame(..., require_aux=True)` strictly requires all auxiliary features to be populated, failing if any feature column is entirely null or if previous-runs weather contains nulls within the active window.
-- **Bounded Feature Set (ADR-006 / ADR-008 / D3)**:
+- **Bounded Feature Set (ADR-006, ADR-008)**:
   - *Actual Lags*: `actual_lag_1h`, `actual_lag_2h`, `actual_lag_3h`, `actual_lag_24h`, `actual_lag_48h`, `actual_lag_168h`.
   - *Actual Rolling Stats*: 3h, 24h, and 168h rolling mean and std, each window strictly ending at `t-1h`.
   - *Calendar*: `hour_of_day`, `day_of_week`, `month`, `is_weekend`, `is_uk_bank_holiday` (from static 2024-2027 register), plus sin/cos cyclical encodings of hour and day-of-year.
