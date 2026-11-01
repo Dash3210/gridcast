@@ -36,8 +36,14 @@ API_BASE_URL = "https://api.carbonintensity.org.uk"
 DEFAULT_USER_AGENT = "gridcast/0.1.0 (+https://github.com/Dash3210/gridcast)"
 
 CURATED_DIR_DEFAULT = Path("data/curated")
+WEATHER_DIR_DEFAULT = Path("data/weather")
+MIX_DIR_DEFAULT = Path("data/mix")
 CACHE_DIR_DEFAULT = Path("data/cache/http")
+WEATHER_CACHE_DIR_DEFAULT = Path("data/cache/weather")
+MIX_CACHE_DIR_DEFAULT = Path("data/cache/mix")
 AUDIT_DIR_DEFAULT = Path("data/audit")
+
+OPEN_METEO_BASE_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 
 ARCHIVE_FLOOR = date(2017, 9, 12)
 
@@ -50,15 +56,31 @@ __all__: list[str] = [
     "DayIngestResult",
     "Gap",
     "IngestSummary",
+    "MIX_CACHE_DIR_DEFAULT",
+    "MIX_DIR_DEFAULT",
+    "OPEN_METEO_BASE_URL",
     "UpsertResult",
+    "WEATHER_CACHE_DIR_DEFAULT",
+    "WEATHER_DIR_DEFAULT",
     "dst_row_count",
     "expected_row_count",
+    "expected_weather_row_count",
     "fetch_day",
+    "fetch_mix_chunk",
     "fetch_range_for_day",
+    "fetch_weather_chunk",
+    "generate_monthly_chunks",
     "ingest_day",
+    "ingest_mix_day",
+    "ingest_mix_range",
     "ingest_range",
+    "ingest_weather_day",
+    "ingest_weather_range",
     "is_cache_usable",
     "is_day_complete",
+    "is_mix_day_complete",
+    "is_weather_day_complete",
+    "mix_payload_to_frame",
     "partition_path",
     "payload_to_frame",
     "prune_cache",
@@ -67,6 +89,9 @@ __all__: list[str] = [
     "record_conflicts",
     "record_gaps",
     "upsert_day",
+    "upsert_mix_day",
+    "upsert_weather_day",
+    "weather_payload_to_frame",
     "write_partition_atomic",
 ]
 
@@ -154,6 +179,7 @@ class Client:
         self.backoff_cap = backoff_cap
         self.jitter_fn = jitter_fn
         self._last_request_time: float = 0.0
+        self.request_count: int = 0
 
     def _rate_limit(self) -> None:
         elapsed = self.time_fn() - self._last_request_time
@@ -169,6 +195,7 @@ class Client:
 
         for attempt in range(1, self.max_attempts + 1):
             self._rate_limit()
+            self.request_count += 1
             try:
                 response = self.session.get(url, headers=headers, timeout=30)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
@@ -253,6 +280,52 @@ class Client:
             e_str = str(end_utc)
 
         url = f"{self.base_url}/intensity/{s_str}/{e_str}"
+        return self._fetch_url(url)
+
+    def get_generation_range(
+        self,
+        start_utc: datetime | str,
+        end_utc: datetime | str,
+    ) -> dict:
+        """Fetch generation mix for a UTC range."""
+        if isinstance(start_utc, datetime):
+            s_dt = (
+                start_utc.astimezone(UTC_TZ)
+                if start_utc.tzinfo is not None
+                else start_utc.replace(tzinfo=UTC_TZ)
+            )
+            s_str = s_dt.strftime("%Y-%m-%dT%H:%MZ")
+        else:
+            s_str = str(start_utc)
+
+        if isinstance(end_utc, datetime):
+            e_dt = (
+                end_utc.astimezone(UTC_TZ)
+                if end_utc.tzinfo is not None
+                else end_utc.replace(tzinfo=UTC_TZ)
+            )
+            e_str = e_dt.strftime("%Y-%m-%dT%H:%MZ")
+        else:
+            e_str = str(end_utc)
+
+        url = f"{self.base_url}/generation/{s_str}/{e_str}"
+        return self._fetch_url(url)
+
+    def get_weather_previous_runs(
+        self,
+        start_date: date | str,
+        end_date: date | str,
+        latitude: float = 51.5074,
+        longitude: float = -0.1278,
+    ) -> dict:
+        """Fetch hourly temperature_2m_previous_day2 from Open-Meteo previous-runs API."""
+        s_str = start_date.isoformat() if isinstance(start_date, date) else str(start_date)
+        e_str = end_date.isoformat() if isinstance(end_date, date) else str(end_date)
+        url = (
+            f"{OPEN_METEO_BASE_URL}?"
+            f"latitude={latitude}&longitude={longitude}&hourly=temperature_2m_previous_day2&"
+            f"start_date={s_str}&end_date={e_str}&timezone=UTC"
+        )
         return self._fetch_url(url)
 
 
@@ -1443,4 +1516,603 @@ def reconcile_recent(
 
     print(f"reconciled: {reconciled_count} date(s)")
     return reconciled_count
+
+
+def generate_monthly_chunks(start: date, end: date) -> list[tuple[date, date]]:
+    """Split [start, end] into monthly intervals."""
+    if start > end:
+        raise ValueError(f"Start date {start} must be on or before end date {end}")
+    chunks: list[tuple[date, date]] = []
+    curr = start
+    while curr <= end:
+        if curr.month == 12:
+            next_month = date(curr.year + 1, 1, 1)
+        else:
+            next_month = date(curr.year, curr.month + 1, 1)
+        chunk_end = min(next_month - timedelta(days=1), end)
+        chunks.append((curr, chunk_end))
+        curr = chunk_end + timedelta(days=1)
+    return chunks
+
+
+def expected_weather_row_count(local_date: date | str) -> int:
+    """Return expected hourly row count (24, 23 on spring DST, 25 on autumn DST)."""
+    d = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
+    start_local = datetime(d.year, d.month, d.day, 0, 0, tzinfo=LONDON_TZ)
+    next_d = d + timedelta(days=1)
+    end_local = datetime(next_d.year, next_d.month, next_d.day, 0, 0, tzinfo=LONDON_TZ)
+    diff_s = (end_local.astimezone(UTC_TZ) - start_local.astimezone(UTC_TZ)).total_seconds()
+    return int(diff_s / 3600.0)
+
+
+def is_weather_day_complete(local_date: date | str, weather_dir: Path | None = None) -> bool:
+    """Assert whether a local date partition for weather exists and is complete."""
+    d = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
+    target_dir = weather_dir if weather_dir is not None else WEATHER_DIR_DEFAULT
+    p = partition_path(d, base_dir=target_dir)
+    if not p.exists():
+        return False
+    try:
+        df = pd.read_parquet(p)
+        if len(df) != expected_weather_row_count(d):
+            return False
+        if "temperature_2m_previous_day2" not in df.columns:
+            return False
+        return not df["temperature_2m_previous_day2"].isna().any()
+    except Exception:
+        return False
+
+
+def is_mix_day_complete(local_date: date | str, mix_dir: Path | None = None) -> bool:
+    """Assert whether a local date partition for generation mix exists and is complete."""
+    d = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
+    target_dir = mix_dir if mix_dir is not None else MIX_DIR_DEFAULT
+    p = partition_path(d, base_dir=target_dir)
+    if not p.exists():
+        return False
+    try:
+        df = pd.read_parquet(p)
+        if len(df) != dst_row_count(d):
+            return False
+        for fuel in ["wind", "solar", "gas", "coal", "nuclear", "biomass"]:
+            if fuel not in df.columns or df[fuel].isna().all():
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def weather_payload_to_frame(payload: dict) -> pd.DataFrame:
+    """Normalise Open-Meteo previous-runs weather payload to DataFrame."""
+    h = payload.get("hourly", {})
+    times = h.get("time", [])
+    temps = h.get("temperature_2m_previous_day2", [])
+    if not times:
+        empty_df = pd.DataFrame(
+            columns=["period_start_utc", "local_date", "temperature_2m_previous_day2"]
+        )
+        empty_df["period_start_utc"] = pd.to_datetime([], utc=True)
+        empty_df["local_date"] = pd.Series([], dtype="object")
+        empty_df["temperature_2m_previous_day2"] = pd.Series([], dtype="float64")
+        return empty_df
+
+    df = pd.DataFrame({
+        "period_start_utc": pd.to_datetime(times, utc=True),
+        "temperature_2m_previous_day2": pd.Series(temps, dtype="float64"),
+    })
+    df["local_date"] = df["period_start_utc"].dt.tz_convert(LONDON_TZ).dt.date
+    df = (
+        df.sort_values("period_start_utc")
+        .drop_duplicates(subset=["period_start_utc"])
+        .reset_index(drop=True)
+    )
+
+    # Check for null previous-runs temperature at or after 2024-11-01
+    post_cutoff = df["period_start_utc"] >= pd.Timestamp("2024-11-01 00:00:00+00:00")
+    null_temps = post_cutoff & df["temperature_2m_previous_day2"].isna()
+    if null_temps.any():
+        bad_date = df.loc[null_temps, "period_start_utc"].iloc[0]
+        raise ValueError(
+            f"Open-Meteo previous-runs returned null temperature for period {bad_date}. "
+            "Reanalysis fallback is strictly prohibited."
+        )
+
+    return df[["period_start_utc", "local_date", "temperature_2m_previous_day2"]]
+
+
+def mix_payload_to_frame(payload: dict) -> pd.DataFrame:
+    """Normalise NESO generation mix payload to DataFrame."""
+    data_items = payload.get("data", [])
+    if not data_items:
+        empty_df = pd.DataFrame(columns=["period_start_utc", "local_date"])
+        empty_df["period_start_utc"] = pd.to_datetime([], utc=True)
+        empty_df["local_date"] = pd.Series([], dtype="object")
+        return empty_df
+
+    rows = []
+    for item in data_items:
+        start_utc = pd.to_datetime(item["from"], utc=True)
+        row_local_date = start_utc.tz_convert(LONDON_TZ).date()
+        row_dict: dict[str, object] = {
+            "period_start_utc": start_utc,
+            "local_date": row_local_date,
+        }
+        for f in item.get("generationmix", []):
+            fuel_key = str(f["fuel"]).lower().replace(" ", "_")
+            perc_val = f.get("perc")
+            row_dict[fuel_key] = float(perc_val) if perc_val is not None else float("nan")
+        rows.append(row_dict)
+
+    df = pd.DataFrame(rows)
+    df["period_start_utc"] = pd.to_datetime(df["period_start_utc"], utc=True)
+    df = (
+        df.sort_values("period_start_utc")
+        .drop_duplicates(subset=["period_start_utc"])
+        .reset_index(drop=True)
+    )
+    return df
+
+
+def fetch_weather_chunk(
+    client: Client,
+    start_date: date,
+    end_date: date,
+    cache_dir: Path | None = None,
+    force: bool = False,
+) -> dict:
+    """Fetch raw Open-Meteo previous-runs JSON for a date range with raw cache."""
+    c_dir = cache_dir if cache_dir is not None else WEATHER_CACHE_DIR_DEFAULT
+    c_path = c_dir / f"{start_date.isoformat()}_{end_date.isoformat()}.json.gz"
+
+    if c_path.exists() and not force:
+        try:
+            with gzip.open(c_path, "rt", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            logger.warning("Corrupted weather cache %s; refetching", c_path)
+
+    s_fetch = start_date - timedelta(days=1)
+    e_fetch = end_date + timedelta(days=1)
+    payload = client.get_weather_previous_runs(start_date=s_fetch, end_date=e_fetch)
+
+    c_dir.mkdir(parents=True, exist_ok=True)
+    temp_cache = c_dir / f"{c_path.name}.tmp.{os.getpid()}"
+    try:
+        with gzip.open(temp_cache, "wt", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(temp_cache, c_path)
+    finally:
+        if temp_cache.exists():
+            temp_cache.unlink(missing_ok=True)
+
+    return payload
+
+
+def fetch_mix_chunk(
+    client: Client,
+    start_date: date,
+    end_date: date,
+    cache_dir: Path | None = None,
+    force: bool = False,
+) -> dict:
+    """Fetch raw NESO generation mix JSON for a date range with raw cache."""
+    c_dir = cache_dir if cache_dir is not None else MIX_CACHE_DIR_DEFAULT
+    c_path = c_dir / f"{start_date.isoformat()}_{end_date.isoformat()}.json.gz"
+
+    if c_path.exists() and not force:
+        try:
+            with gzip.open(c_path, "rt", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            logger.warning("Corrupted mix cache %s; refetching", c_path)
+
+    start_local = datetime(
+        start_date.year, start_date.month, start_date.day, 0, 0, tzinfo=LONDON_TZ
+    )
+    end_local = datetime(
+        end_date.year, end_date.month, end_date.day, 0, 0, tzinfo=LONDON_TZ
+    ) + timedelta(days=1)
+    start_utc = start_local.astimezone(UTC_TZ)
+    end_utc = end_local.astimezone(UTC_TZ)
+
+    payload = client.get_generation_range(start_utc=start_utc, end_utc=end_utc)
+
+    c_dir.mkdir(parents=True, exist_ok=True)
+    temp_cache = c_dir / f"{c_path.name}.tmp.{os.getpid()}"
+    try:
+        with gzip.open(temp_cache, "wt", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(temp_cache, c_path)
+    finally:
+        if temp_cache.exists():
+            temp_cache.unlink(missing_ok=True)
+
+    return payload
+
+
+def upsert_weather_day(
+    day_df: pd.DataFrame,
+    local_date: date | str,
+    base_dir: Path | None = None,
+) -> UpsertResult:
+    """Upsert hourly weather DataFrame into daily partition atomically."""
+    d = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
+    target_dir = base_dir if base_dir is not None else WEATHER_DIR_DEFAULT
+    p_path = partition_path(d, base_dir=target_dir)
+
+    df_to_write = day_df[day_df["local_date"] == d].copy()
+    df_to_write = df_to_write.sort_values("period_start_utc").reset_index(drop=True)
+
+    incoming_unique = df_to_write["period_start_utc"].nunique()
+    incoming_duplicates = len(df_to_write) - incoming_unique
+
+    if not p_path.exists():
+        write_partition_atomic(df_to_write, d, base_dir=target_dir)
+        return UpsertResult(
+            rows_before=0,
+            rows_after=len(df_to_write),
+            duplicates_dropped=incoming_duplicates,
+        )
+
+    existing = pd.read_parquet(p_path)
+    rows_before = len(existing)
+    existing_duplicates = len(existing) - existing["period_start_utc"].nunique()
+    duplicates_dropped = existing_duplicates + incoming_duplicates
+
+    combined = pd.concat([existing, df_to_write], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["period_start_utc"], keep="last")
+    combined = combined.sort_values("period_start_utc").reset_index(drop=True)
+
+    if len(existing) == len(combined) and existing.equals(combined):
+        return UpsertResult(
+            rows_before=rows_before, rows_after=len(existing), duplicates_dropped=duplicates_dropped
+        )
+
+    write_partition_atomic(combined, d, base_dir=target_dir)
+    return UpsertResult(
+        rows_before=rows_before, rows_after=len(combined), duplicates_dropped=duplicates_dropped
+    )
+
+
+def upsert_mix_day(
+    day_df: pd.DataFrame,
+    local_date: date | str,
+    base_dir: Path | None = None,
+) -> UpsertResult:
+    """Upsert generation mix DataFrame into daily partition atomically."""
+    d = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
+    target_dir = base_dir if base_dir is not None else MIX_DIR_DEFAULT
+    p_path = partition_path(d, base_dir=target_dir)
+
+    df_to_write = day_df[day_df["local_date"] == d].copy()
+    df_to_write = df_to_write.sort_values("period_start_utc").reset_index(drop=True)
+
+    incoming_unique = df_to_write["period_start_utc"].nunique()
+    incoming_duplicates = len(df_to_write) - incoming_unique
+
+    if not p_path.exists():
+        write_partition_atomic(df_to_write, d, base_dir=target_dir)
+        return UpsertResult(
+            rows_before=0,
+            rows_after=len(df_to_write),
+            duplicates_dropped=incoming_duplicates,
+        )
+
+    existing = pd.read_parquet(p_path)
+    rows_before = len(existing)
+    existing_duplicates = len(existing) - existing["period_start_utc"].nunique()
+    duplicates_dropped = existing_duplicates + incoming_duplicates
+
+    combined = pd.concat([existing, df_to_write], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["period_start_utc"], keep="last")
+    combined = combined.sort_values("period_start_utc").reset_index(drop=True)
+
+    if len(existing) == len(combined) and existing.equals(combined):
+        return UpsertResult(
+            rows_before=rows_before, rows_after=len(existing), duplicates_dropped=duplicates_dropped
+        )
+
+    write_partition_atomic(combined, d, base_dir=target_dir)
+    return UpsertResult(
+        rows_before=rows_before, rows_after=len(combined), duplicates_dropped=duplicates_dropped
+    )
+
+
+def ingest_weather_day(
+    local_date: date | str,
+    client: Client | None = None,
+    force: bool = False,
+    cache_dir: Path | None = None,
+    weather_dir: Path | None = None,
+) -> DayIngestResult:
+    """Ingest a single local day of weather data."""
+    d = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
+    w_dir = weather_dir if weather_dir is not None else WEATHER_DIR_DEFAULT
+    if not force and is_weather_day_complete(d, weather_dir=w_dir):
+        existing_p = partition_path(d, base_dir=w_dir)
+        rows = len(pd.read_parquet(existing_p))
+        return DayIngestResult(
+            local_date=d,
+            status="skipped",
+            rows_written=rows,
+            duplicates_dropped=0,
+            gaps_recorded=0,
+        )
+
+    client_inst = client or Client()
+    payload = fetch_weather_chunk(
+        client=client_inst,
+        start_date=d,
+        end_date=d,
+        cache_dir=cache_dir,
+        force=force,
+    )
+    frame = weather_payload_to_frame(payload)
+    day_frame = frame[frame["local_date"] == d]
+    if day_frame.empty:
+        return DayIngestResult(
+            local_date=d,
+            status="no_data",
+            rows_written=0,
+            duplicates_dropped=0,
+            gaps_recorded=0,
+        )
+
+    res = upsert_weather_day(day_frame, d, base_dir=w_dir)
+    return DayIngestResult(
+        local_date=d,
+        status="written",
+        rows_written=res.rows_after,
+        duplicates_dropped=res.duplicates_dropped,
+        gaps_recorded=0,
+    )
+
+
+def ingest_weather_range(
+    start: date,
+    end: date,
+    force: bool = False,
+    client: Client | None = None,
+    cache_dir: Path | None = None,
+    weather_dir: Path | None = None,
+) -> IngestSummary:
+    """Ingest weather forecast data for a range of dates using monthly chunks."""
+    if start > end:
+        raise ValueError(f"Start date {start} must be on or before end date {end}")
+
+    client_inst = client or Client()
+    chunks = generate_monthly_chunks(start, end)
+    w_dir = weather_dir if weather_dir is not None else WEATHER_DIR_DEFAULT
+    c_dir = cache_dir if cache_dir is not None else WEATHER_CACHE_DIR_DEFAULT
+
+    dates_requested = 0
+    dates_written = 0
+    dates_skipped = 0
+    rows_total = 0
+    duplicates_dropped = 0
+    failures = 0
+    initial_request_count = getattr(client_inst, "request_count", 0)
+
+    for c_start, c_end in chunks:
+        chunk_dates = [c_start + timedelta(days=i) for i in range((c_end - c_start).days + 1)]
+        need_fetch = force or any(
+            not is_weather_day_complete(d, weather_dir=w_dir) for d in chunk_dates
+        )
+
+        chunk_df: pd.DataFrame | None = None
+        if need_fetch:
+            try:
+                payload = fetch_weather_chunk(
+                    client=client_inst,
+                    start_date=c_start,
+                    end_date=c_end,
+                    cache_dir=c_dir,
+                    force=force,
+                )
+                chunk_df = weather_payload_to_frame(payload)
+            except Exception as exc:
+                failures += len(chunk_dates)
+                print(f"Weather chunk {c_start} to {c_end}: FAILED ({exc})")
+                logger.error(
+                    "Failed weather chunk %s to %s: %s", c_start, c_end, exc, exc_info=True
+                )
+                continue
+
+        for d in chunk_dates:
+            dates_requested += 1
+            if not force and is_weather_day_complete(d, weather_dir=w_dir):
+                dates_skipped += 1
+                existing_p = partition_path(d, base_dir=w_dir)
+                existing_rows = len(pd.read_parquet(existing_p))
+                rows_total += existing_rows
+                print(f"{d}: skipped (complete, {existing_rows} rows)")
+                continue
+
+            if chunk_df is None:
+                continue
+
+            day_data = chunk_df[chunk_df["local_date"] == d]
+            if day_data.empty:
+                print(f"{d}: no weather data available (0 rows)")
+                continue
+
+            res = upsert_weather_day(day_data, d, base_dir=w_dir)
+            dates_written += 1
+            rows_total += res.rows_after
+            duplicates_dropped += res.duplicates_dropped
+            print(
+                f"{d}: {res.rows_after} weather rows written "
+                f"({res.duplicates_dropped} duplicates dropped)"
+            )
+
+    requests_made = getattr(client_inst, "request_count", 0) - initial_request_count
+
+    print("\nWeather ingest summary:")
+    print(f"  dates requested:    {dates_requested}")
+    print(f"  dates written:      {dates_written}")
+    print(f"  dates skipped:      {dates_skipped}")
+    print(f"  rows total:         {rows_total}")
+    print(f"  duplicates dropped: {duplicates_dropped}")
+    print(f"  requests made:      {requests_made}")
+    if failures > 0:
+        print(f"  failures:           {failures}")
+
+    return IngestSummary(
+        dates_requested=dates_requested,
+        dates_written=dates_written,
+        dates_skipped=dates_skipped,
+        rows_total=rows_total,
+        duplicates_dropped=duplicates_dropped,
+        failures=failures,
+    )
+
+
+def ingest_mix_day(
+    local_date: date | str,
+    client: Client | None = None,
+    force: bool = False,
+    cache_dir: Path | None = None,
+    mix_dir: Path | None = None,
+) -> DayIngestResult:
+    """Ingest a single local day of generation mix data."""
+    d = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
+    m_dir = mix_dir if mix_dir is not None else MIX_DIR_DEFAULT
+    if not force and is_mix_day_complete(d, mix_dir=m_dir):
+        existing_p = partition_path(d, base_dir=m_dir)
+        rows = len(pd.read_parquet(existing_p))
+        return DayIngestResult(
+            local_date=d,
+            status="skipped",
+            rows_written=rows,
+            duplicates_dropped=0,
+            gaps_recorded=0,
+        )
+
+    client_inst = client or Client()
+    payload = fetch_mix_chunk(
+        client=client_inst,
+        start_date=d,
+        end_date=d,
+        cache_dir=cache_dir,
+        force=force,
+    )
+    frame = mix_payload_to_frame(payload)
+    day_frame = frame[frame["local_date"] == d]
+    if day_frame.empty:
+        return DayIngestResult(
+            local_date=d,
+            status="no_data",
+            rows_written=0,
+            duplicates_dropped=0,
+            gaps_recorded=0,
+        )
+
+    res = upsert_mix_day(day_frame, d, base_dir=m_dir)
+    return DayIngestResult(
+        local_date=d,
+        status="written",
+        rows_written=res.rows_after,
+        duplicates_dropped=res.duplicates_dropped,
+        gaps_recorded=0,
+    )
+
+
+def ingest_mix_range(
+    start: date,
+    end: date,
+    force: bool = False,
+    client: Client | None = None,
+    cache_dir: Path | None = None,
+    mix_dir: Path | None = None,
+) -> IngestSummary:
+    """Ingest generation mix data for a range of dates using monthly chunks."""
+    if start > end:
+        raise ValueError(f"Start date {start} must be on or before end date {end}")
+
+    client_inst = client or Client()
+    chunks = generate_monthly_chunks(start, end)
+    m_dir = mix_dir if mix_dir is not None else MIX_DIR_DEFAULT
+    c_dir = cache_dir if cache_dir is not None else MIX_CACHE_DIR_DEFAULT
+
+    dates_requested = 0
+    dates_written = 0
+    dates_skipped = 0
+    rows_total = 0
+    duplicates_dropped = 0
+    failures = 0
+    initial_request_count = getattr(client_inst, "request_count", 0)
+
+    for c_start, c_end in chunks:
+        chunk_dates = [c_start + timedelta(days=i) for i in range((c_end - c_start).days + 1)]
+        need_fetch = force or any(
+            not is_mix_day_complete(d, mix_dir=m_dir) for d in chunk_dates
+        )
+
+        chunk_df: pd.DataFrame | None = None
+        if need_fetch:
+            try:
+                payload = fetch_mix_chunk(
+                    client=client_inst,
+                    start_date=c_start,
+                    end_date=c_end,
+                    cache_dir=c_dir,
+                    force=force,
+                )
+                chunk_df = mix_payload_to_frame(payload)
+            except Exception as exc:
+                failures += len(chunk_dates)
+                print(f"Generation mix chunk {c_start} to {c_end}: FAILED ({exc})")
+                logger.error(
+                    "Failed mix chunk %s to %s: %s", c_start, c_end, exc, exc_info=True
+                )
+                continue
+
+        for d in chunk_dates:
+            dates_requested += 1
+            if not force and is_mix_day_complete(d, mix_dir=m_dir):
+                dates_skipped += 1
+                existing_p = partition_path(d, base_dir=m_dir)
+                existing_rows = len(pd.read_parquet(existing_p))
+                rows_total += existing_rows
+                print(f"{d}: skipped (complete, {existing_rows} rows)")
+                continue
+
+            if chunk_df is None:
+                continue
+
+            day_data = chunk_df[chunk_df["local_date"] == d]
+            if day_data.empty:
+                print(f"{d}: no mix data available (0 rows)")
+                continue
+
+            res = upsert_mix_day(day_data, d, base_dir=m_dir)
+            dates_written += 1
+            rows_total += res.rows_after
+            duplicates_dropped += res.duplicates_dropped
+            print(
+                f"{d}: {res.rows_after} mix rows written "
+                f"({res.duplicates_dropped} duplicates dropped)"
+            )
+
+    requests_made = getattr(client_inst, "request_count", 0) - initial_request_count
+
+    print("\nGeneration mix ingest summary:")
+    print(f"  dates requested:    {dates_requested}")
+    print(f"  dates written:      {dates_written}")
+    print(f"  dates skipped:      {dates_skipped}")
+    print(f"  rows total:         {rows_total}")
+    print(f"  duplicates dropped: {duplicates_dropped}")
+    print(f"  requests made:      {requests_made}")
+    if failures > 0:
+        print(f"  failures:           {failures}")
+
+    return IngestSummary(
+        dates_requested=dates_requested,
+        dates_written=dates_written,
+        dates_skipped=dates_skipped,
+        rows_total=rows_total,
+        duplicates_dropped=duplicates_dropped,
+        failures=failures,
+    )
+
 

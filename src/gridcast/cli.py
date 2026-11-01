@@ -7,7 +7,13 @@ from zoneinfo import ZoneInfo
 
 from gridcast import __version__
 from gridcast._phase import todo
-from gridcast.ingest import ingest_range, prune_cache, reconcile_recent
+from gridcast.ingest import (
+    ingest_mix_range,
+    ingest_range,
+    ingest_weather_range,
+    prune_cache,
+    reconcile_recent,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,6 +27,18 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_parser = subparsers.add_parser(
         "ingest",
         help="Ingest half-hourly carbon intensity data.",
+    )
+    ingest_parser.add_argument(
+        "--weather",
+        action="store_true",
+        default=False,
+        help="Ingest weather forecast data (Open-Meteo previous-runs).",
+    )
+    ingest_parser.add_argument(
+        "--mix",
+        action="store_true",
+        default=False,
+        help="Ingest generation mix data (NESO).",
     )
     ingest_parser.add_argument(
         "--days",
@@ -137,6 +155,14 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             start_date = today - timedelta(days=days - 1)
             end_date = today
+
+        if args.weather:
+            summary = ingest_weather_range(start=start_date, end=end_date, force=args.force)
+            return 1 if summary.failures > 0 else 0
+
+        if args.mix:
+            summary = ingest_mix_range(start=start_date, end=end_date, force=args.force)
+            return 1 if summary.failures > 0 else 0
 
         summary = ingest_range(start=start_date, end=end_date, force=args.force)
 

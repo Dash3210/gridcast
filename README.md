@@ -89,18 +89,33 @@ Today (Phase P2), the working automation targets are:
 Phase P2 provides a bounded, leakage-free feature construction pipeline in `gridcast.features`:
 - **Temporal Integrity**: Enforces that no feature at target period `t` uses any value stamped after `t`. Verified via future-perturbation invariance tests across multiple cutoffs (mid-window, DST transitions, and dataset boundary).
 - **Time-based Keying**: All lags and rolling stats are keyed and sorted by `period_start_utc` timestamp lookup rather than row positions, ensuring correctness across 46-period (spring forward) and 50-period (autumn back) clock changes.
-- **Bounded Feature Set (ADR-006 / D3)**:
+- **Auxiliary Store Requirement**: The real build path (`load_feature_sources()`) loads all three source datasets from `data/curated/`, `data/weather/`, and `data/mix/`. `build_feature_frame(..., require_aux=True)` strictly requires all auxiliary features to be populated, failing if any feature column is entirely null or if previous-runs weather contains nulls within the active window.
+- **Bounded Feature Set (ADR-006 / ADR-008 / D3)**:
   - *Actual Lags*: `actual_lag_1h`, `actual_lag_2h`, `actual_lag_3h`, `actual_lag_24h`, `actual_lag_48h`, `actual_lag_168h`.
   - *Actual Rolling Stats*: 3h, 24h, and 168h rolling mean and std, each window strictly ending at `t-1h`.
   - *Calendar*: `hour_of_day`, `day_of_week`, `month`, `is_weekend`, `is_uk_bank_holiday` (from static 2024-2027 register), plus sin/cos cyclical encodings of hour and day-of-year.
-  - *Weather*: Open-Meteo previous-runs day-2 forecast temperature at `t` (matching the 48-hour issue horizon; reanalysis is forbidden), plus 24h mean and 24h min ending at `t`.
+  - *Weather*: Open-Meteo previous-runs day-2 forecast temperature at `t` (matching the 48-hour issue horizon; reanalysis is forbidden), mapped from hourly forecast to half-hourly period via containing hour `t.floor("h")` (ADR-008), plus 24h mean and 24h min ending at `t`.
   - *Generation Mix*: Observed fuel shares for `wind`, `solar`, `gas`, `coal`, `nuclear`, and `biomass` lagged to `t-48h` to prevent contemporaneous leakage.
 
 ### Ingest
 
-`gridcast` ingests half-hourly GB grid carbon intensity data from the official National Energy System Operator (NESO) Carbon Intensity API (`api.carbonintensity.org.uk`).
+`gridcast` ingests half-hourly GB grid carbon intensity data, generation fuel mix, and previous-runs weather forecasts from official public APIs:
+- **Carbon Intensity**: Official NESO Carbon Intensity API (`api.carbonintensity.org.uk/intensity`)
+- **Generation Mix**: Official NESO Generation Mix API (`api.carbonintensity.org.uk/generation`)
+- **Weather Forecasts**: Open-Meteo previous-runs API (`previous-runs-api.open-meteo.com/v1/forecast`), strictly `temperature_2m_previous_day2` (issued 48 hours prior; reanalysis is rejected)
 
-- **Column Contract**:
+#### Data Layout
+
+```
+data/
+  curated/     # Committed daily carbon intensity partitions (half-hourly)
+  weather/     # Committed daily weather partitions (hourly previous-runs day 2)
+  mix/         # Committed daily generation mix partitions (half-hourly fuel shares)
+  cache/       # Ephemeral raw HTTP caches (http, weather, mix)
+  audit/       # Gaps and conflicts audit logs
+```
+
+- **Curated Intensity Schema Contract**:
   - `period_start_utc` (`datetime64[ns, UTC]`): Half-hour start timestamp in UTC (inclusive). Primary key.
   - `period_end_utc` (`datetime64[ns, UTC]`): Half-hour end timestamp in UTC (`to` exclusive).
   - `utc_date` (`object`, `datetime.date`): Calendar date of `period_start_utc` in UTC.
@@ -110,17 +125,27 @@ Phase P2 provides a bounded, leakage-free feature construction pipeline in `grid
   - `index` (`string`, nullable): Intensity category descriptor (`very low`, `low`, `moderate`, `high`, `very high`).
   - `ingested_at` (`datetime64[ns, UTC]`): Timestamp of ingestion run.
 
+- **Weather Schema Contract (`data/weather/date=YYYY-MM-DD.parquet`)**:
+  - `period_start_utc` (`datetime64[ns, UTC]`): Hourly start timestamp in UTC.
+  - `local_date` (`object`, `datetime.date`): Calendar date in `Europe/London`.
+  - `temperature_2m_previous_day2` (`float64`): Numerical weather prediction 2-meter air temperature (°C) forecasted 48h prior.
+
+- **Generation Mix Schema Contract (`data/mix/date=YYYY-MM-DD.parquet`)**:
+  - `period_start_utc` (`datetime64[ns, UTC]`): Half-hourly start timestamp in UTC.
+  - `local_date` (`object`, `datetime.date`): Calendar date in `Europe/London`.
+  - Fuel share columns (`float64`): `wind`, `solar`, `gas`, `coal`, `nuclear`, `biomass`, `hydro`, `imports`, `other` (percentages summing to 100%).
+
 - **Local-Day Partitioning & DST**:
   Partitions are addressed and partitioned by the `Europe/London` local calendar day (`date=<YYYY-MM-DD>.parquet`). Due to UK Daylight Saving Time (DST):
-  - Normal day: exactly 48 rows (24 hours).
-  - Autumn clock change (clocks go back in October): exactly 50 rows (25 hours).
-  - Spring clock change (clocks go forward in March): exactly 46 rows (23 hours).
+  - Normal day: exactly 48 half-hourly rows / 24 hourly weather rows.
+  - Autumn clock change (clocks go back in October): exactly 50 half-hourly rows / 25 hourly weather rows.
+  - Spring clock change (clocks go forward in March): exactly 46 half-hourly rows / 23 hourly weather rows.
 
 - **Coverage & CLI Usage**:
   The repository maintains historical curated partitions from `2024-11-01` to the present day. Ingest coverage is managed and extended via the CLI:
-  - `gridcast ingest --days N`: Ingest the last N local days, inclusive of today (default: 2 days).
-  - `gridcast ingest --recent N`: Alias for `--days N` used by scheduled automation jobs.
-  - `gridcast ingest --start YYYY-MM-DD --end YYYY-MM-DD`: Ingest a specific inclusive historical range.
+  - `gridcast ingest [--days N | --start YYYY-MM-DD --end YYYY-MM-DD]`: Ingest carbon intensity.
+  - `gridcast ingest --weather [--days N | --start YYYY-MM-DD --end YYYY-MM-DD]`: Ingest hourly weather forecasts.
+  - `gridcast ingest --mix [--days N | --start YYYY-MM-DD --end YYYY-MM-DD]`: Ingest half-hourly generation mix.
   - `gridcast ingest --force`: Re-fetch and re-evaluate partitions that look complete.
   - `gridcast ingest --prune-cache`: Manually prune raw HTTP cache files older than 90 days.
 

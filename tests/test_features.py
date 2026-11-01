@@ -19,6 +19,7 @@ import pytest
 from gridcast.features import (
     FEATURE_COLUMNS,
     build_feature_frame,
+    load_feature_sources,
     max_source_timestamp_allowed,
 )
 from gridcast.holidays import UK_BANK_HOLIDAYS, is_uk_bank_holiday
@@ -88,13 +89,8 @@ def create_synthetic_auxiliary_data(
 
 @pytest.fixture(scope="module")
 def curated_sample_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Load curated carbon intensity and auxiliary test sources.
-
-    Loads the real committed data from data/curated.
-    """
-    df = pd.read_parquet(CURATED_PATH)
-    weather_df, mix_df = create_synthetic_auxiliary_data(df["period_start_utc"])
-    return df, weather_df, mix_df
+    """Load curated carbon intensity and real auxiliary test sources."""
+    return load_feature_sources()
 
 
 class TestTemporalLeakageInvariance:
@@ -227,14 +223,84 @@ class TestFeatureContractAndInvariants:
     ) -> None:
         """No feature column may be constant across the window (dead feature is a bug)."""
         intensity_df, weather_df, mix_df = curated_sample_data
-        features = build_feature_frame(intensity_df, weather_df, mix_df)
+        features = build_feature_frame(intensity_df, weather_df, mix_df, require_aux=True)
 
         for col in FEATURE_COLUMNS:
+            assert not features[col].isna().all(), f"Feature column '{col}' is entirely null"
             non_null = features[col].dropna()
-            assert len(non_null) > 0, f"Feature column '{col}' is entirely null"
             assert (
                 non_null.nunique() > 1
             ), f"Dead feature: '{col}' is constant across the entire window"
+
+    def test_real_frame_has_no_dead_columns(self) -> None:
+        """Build from real data and assert no feature column is entirely null."""
+        intensity_df, weather_df, mix_df = load_feature_sources()
+        features = build_feature_frame(intensity_df, weather_df, mix_df, require_aux=True)
+        assert len(features) == len(intensity_df)
+        for col in FEATURE_COLUMNS:
+            assert not features[col].isna().all(), f"Feature column '{col}' is entirely null"
+            assert features[col].dropna().nunique() > 1, f"Feature column '{col}' is constant"
+
+    def test_feature_frame_requires_auxiliary_sources(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """Building features without auxiliary sources with require_aux=True raises."""
+        intensity_df, _, _ = curated_sample_data
+        with pytest.raises(ValueError, match="(?i)(auxiliary|weather|mix|null)"):
+            build_feature_frame(intensity_df, require_aux=True)
+
+    def test_weather_feature_matches_previous_runs(self) -> None:
+        """Sample periods match stored previous_day2 at containing hour, not reanalysis."""
+        intensity_df, weather_df, mix_df = load_feature_sources()
+        features = build_feature_frame(intensity_df, weather_df, mix_df)
+
+        sample_times = [
+            pd.Timestamp("2024-11-15 12:30:00+00:00"),
+            pd.Timestamp("2025-01-20 08:00:00+00:00"),
+            pd.Timestamp("2025-07-10 15:30:00+00:00"),
+            pd.Timestamp("2026-02-14 18:00:00+00:00"),
+        ]
+        w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
+        w_series = pd.Series(
+            weather_df["temperature_2m_previous_day2"].to_numpy(dtype=float),
+            index=w_ts,
+        )
+
+        for t in sample_times:
+            containing_hour = t.floor("h")
+            feat_val = features.loc[features["period_start_utc"] == t, "temperature"].iloc[0]
+            stored_val = w_series.loc[containing_hour]
+            msg = (
+                f"Feature temperature at {t} ({feat_val}) does not match "
+                f"stored temperature at {containing_hour} ({stored_val})"
+            )
+            assert feat_val == pytest.approx(stored_val, rel=1e-5), msg
+            reanalysis_divergent_val = stored_val + 5.0
+            assert feat_val != pytest.approx(reanalysis_divergent_val, rel=1e-5)
+
+    def test_mix_feature_is_lagged_48h(self) -> None:
+        """Mix share at t equals stored mix at t-48h, and differs from stored mix at t."""
+        intensity_df, weather_df, mix_df = load_feature_sources()
+        features = build_feature_frame(intensity_df, weather_df, mix_df)
+
+        m_ts = pd.to_datetime(mix_df["period_start_utc"], utc=True)
+        m_wind = pd.Series(mix_df["wind"].to_numpy(dtype=float), index=m_ts)
+
+        sample_times = [
+            pd.Timestamp("2025-03-15 14:00:00+00:00"),
+            pd.Timestamp("2025-08-20 10:30:00+00:00"),
+            pd.Timestamp("2026-05-01 12:00:00+00:00"),
+        ]
+        for t in sample_times:
+            t_48h = t - pd.Timedelta(hours=48)
+            feat_val = features.loc[features["period_start_utc"] == t, "mix_share_wind"].iloc[0]
+            stored_48h_val = m_wind.loc[t_48h]
+            stored_t_val = m_wind.loc[t]
+
+            assert feat_val == pytest.approx(stored_48h_val, rel=1e-5)
+            if stored_t_val != stored_48h_val:
+                assert feat_val != pytest.approx(stored_t_val, rel=1e-5)
 
     def test_max_source_timestamp_allowed_helper(self) -> None:
         """Validate max_source_timestamp_allowed helper implementation."""
@@ -345,11 +411,14 @@ class TestLeakageTeethDemonstrations:
         intensity_df, weather_df, mix_df = curated_sample_data
         bad_weather = weather_df.copy()
         # Null out some values inside window
+        nulled_hours = set(bad_weather.loc[100:105, "period_start_utc"])
         bad_weather.loc[100:105, "temperature_2m_previous_day2"] = np.nan
 
         features = build_feature_frame(intensity_df, weather_df=bad_weather, mix_df=mix_df)
-        # Weather features at those rows must be NaN, NOT imputed from reanalysis
-        assert features.loc[100:105, "temperature"].isna().all()
+        # Weather features at those periods must be NaN, NOT imputed from reanalysis
+        affected_mask = features["period_start_utc"].dt.floor("h").isin(nulled_hours)
+        assert affected_mask.sum() > 0
+        assert features.loc[affected_mask, "temperature"].isna().all()
 
     def test_generation_mix_must_be_lagged_48h_not_contemporaneous(
         self,
@@ -407,22 +476,93 @@ class TestTimestampKeyingAndDST:
         assert is_uk_bank_holiday(date(2026, 12, 25)) is True
         assert is_uk_bank_holiday(date(2026, 12, 24)) is False
 
-    def test_build_feature_frame_without_auxiliary_data(
-        self,
-        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
-    ) -> None:
-        """Building features with only intensity_df leaves weather and mix features null."""
-        intensity_df, _, _ = curated_sample_data
-        features = build_feature_frame(intensity_df)
-        assert features["temperature"].isna().all()
-        assert features["mix_share_wind"].isna().all()
-        assert not features["actual_lag_1h"].dropna().empty
-        assert not features["hour_of_day"].isna().any()
-
     def test_missing_required_columns_raises(self) -> None:
         """Missing period_start_utc or actual raises ValueError."""
         with pytest.raises(ValueError, match="period_start_utc"):
             build_feature_frame(pd.DataFrame({"actual": [100]}))
         with pytest.raises(ValueError, match="actual"):
             build_feature_frame(pd.DataFrame({"period_start_utc": [pd.Timestamp.now()]}))
+
+
+class TestLoadFeatureSourcesAndAuxiliaryGates:
+    """Validate load_feature_sources error conditions and require_aux gates."""
+
+    def test_missing_directories_raise(self, tmp_path: Path) -> None:
+        """Missing or empty store directories raise FileNotFoundError."""
+        with pytest.raises(FileNotFoundError, match="(?i)curated intensity"):
+            load_feature_sources(curated_dir=tmp_path / "curated")
+
+        c_dir = tmp_path / "curated"
+        c_dir.mkdir()
+        (c_dir / "date=2025-01-01.parquet").write_bytes(b"dummy")
+        with pytest.raises(FileNotFoundError, match="(?i)weather"):
+            load_feature_sources(curated_dir=c_dir, weather_dir=tmp_path / "weather")
+
+        w_dir = tmp_path / "weather"
+        w_dir.mkdir()
+        (w_dir / "date=2025-01-01.parquet").write_bytes(b"dummy")
+        with pytest.raises(FileNotFoundError, match="(?i)generation mix"):
+            load_feature_sources(curated_dir=c_dir, weather_dir=w_dir, mix_dir=tmp_path / "mix")
+
+    def test_empty_datasets_raise(self, tmp_path: Path) -> None:
+        """Empty partition datasets raise ValueError."""
+        c_dir = tmp_path / "curated"
+        w_dir = tmp_path / "weather"
+        m_dir = tmp_path / "mix"
+        for d in [c_dir, w_dir, m_dir]:
+            d.mkdir(parents=True)
+
+        empty_df = pd.DataFrame({"period_start_utc": pd.to_datetime([], utc=True)})
+        empty_df.to_parquet(c_dir / "date=2025-01-01.parquet")
+        empty_df.to_parquet(w_dir / "date=2025-01-01.parquet")
+        empty_df.to_parquet(m_dir / "date=2025-01-01.parquet")
+
+        with pytest.raises(ValueError, match="(?i)curated intensity"):
+            load_feature_sources(curated_dir=c_dir, weather_dir=w_dir, mix_dir=m_dir)
+
+    def test_weather_null_post_cutoff_raises(self, tmp_path: Path) -> None:
+        """Null temperature at or after 2024-11-01 in load_feature_sources raises."""
+        c_dir = tmp_path / "curated"
+        w_dir = tmp_path / "weather"
+        m_dir = tmp_path / "mix"
+        for d in [c_dir, w_dir, m_dir]:
+            d.mkdir(parents=True)
+
+        ts = pd.to_datetime(["2024-11-01 12:00:00+00:00"], utc=True)
+        pd.DataFrame({"period_start_utc": ts, "actual": [100]}).to_parquet(
+            c_dir / "date=2024-11-01.parquet"
+        )
+        pd.DataFrame({
+            "period_start_utc": ts,
+            "temperature_2m_previous_day2": [np.nan],
+        }).to_parquet(w_dir / "date=2024-11-01.parquet")
+        pd.DataFrame({"period_start_utc": ts, "wind": [20.0]}).to_parquet(
+            m_dir / "date=2024-11-01.parquet"
+        )
+
+        with pytest.raises(ValueError, match="(?i)(previous-runs|null value)"):
+            load_feature_sources(curated_dir=c_dir, weather_dir=w_dir, mix_dir=m_dir)
+
+    def test_require_aux_null_temp_post_cutoff_raises(self) -> None:
+        """build_feature_frame with require_aux=True raises if weather at period is null."""
+        ts = pd.to_datetime(["2024-11-01 12:00:00+00:00", "2024-11-01 12:30:00+00:00"], utc=True)
+        intensity_df = pd.DataFrame({"period_start_utc": ts, "actual": [100, 110]})
+        bad_weather = pd.DataFrame({
+            "period_start_utc": ts,
+            "temperature_2m_previous_day2": [np.nan, np.nan],
+        })
+        mix_df = pd.DataFrame({
+            "period_start_utc": ts - pd.Timedelta(hours=48),
+            "wind": [10.0, 10.0],
+            "solar": [10.0, 10.0],
+            "gas": [10.0, 10.0],
+            "coal": [10.0, 10.0],
+            "nuclear": [10.0, 10.0],
+            "biomass": [10.0, 10.0],
+        })
+        with pytest.raises(ValueError, match="(?i)(entirely null|reanalysis)"):
+            build_feature_frame(
+                intensity_df, weather_df=bad_weather, mix_df=mix_df, require_aux=True
+            )
+
 

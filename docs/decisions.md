@@ -133,3 +133,21 @@
   - Wiring an uncalibrated evaluation gate into CI at P2 (rejected: violates honest phase gating; backtest arrives in P3).
   - Iteratively tuning model thresholds against the test split (rejected: classic test-set contamination and data leakage).
 
+## ADR-008 — Weather joining rule: containing hour for hourly-to-half-hourly alignment
+- Status: accepted
+- Date: 2026-11-01
+- Context:
+  Open-Meteo previous-runs day-2 forecasts (`temperature_2m_previous_day2`) are emitted hourly, whereas Great Britain electricity settlement periods and the target feature frame are half-hourly (every 30 minutes). When joining the hourly forecast series to half-hourly settlement periods, an alignment rule is required to map period `t` to a forecast value without temporal leakage or boundary artifacts.
+- Decision:
+  1. For each half-hourly period starting at UTC timestamp `t`, map to the discrete hourly forecast value of the containing hour `t.floor("h")`.
+  2. Both half-hours within an hour (e.g. `12:00:00` and `12:30:00`) receive the identical forecast value issued at `t-48h`. Because the entire previous-runs issue run was published 48 hours prior to `t`, neither half-hour utilizes any future information.
+  3. 24-hour rolling mean (`temperature_24h_mean`) and 24-hour rolling min (`temperature_24h_min`) are computed strictly over the hourly forecast history ending at the containing hour.
+- Consequences:
+  - Preserves exact Numerical Weather Prediction (NWP) model values without synthesizing artificial intermediate temperatures.
+  - Guarantees future-perturbation invariance across all cutoff boundaries (including half-hour boundaries).
+  - Eliminates end-of-partition boundary edge cases (such as period `23:30` requiring an uningested `00:00` hour from the next day).
+- Alternatives rejected:
+  - Linear interpolation between bracketing hours `t.floor("h")` and `t.ceil("h")`: rejected because it synthesizes artificial intermediate temperatures not emitted by the NWP model, introduces an artificial dependency across day boundaries at `23:30`, and risks leaking post-cutoff values when a perturbation cutoff falls on a half-hour.
+  - Forward-looking or nearest-hour rounding: rejected because rounding up looks forward into the subsequent hour.
+
+

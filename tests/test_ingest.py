@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import pytest
 import requests
@@ -17,9 +18,20 @@ from gridcast.ingest import (
     Client,
     dst_row_count,
     expected_row_count,
+    expected_weather_row_count,
     fetch_day,
+    fetch_mix_chunk,
+    fetch_weather_chunk,
+    generate_monthly_chunks,
     ingest_day,
+    ingest_mix_day,
+    ingest_mix_range,
     ingest_range,
+    ingest_weather_day,
+    ingest_weather_range,
+    is_mix_day_complete,
+    is_weather_day_complete,
+    mix_payload_to_frame,
     partition_path,
     payload_to_frame,
     prune_cache,
@@ -27,6 +39,9 @@ from gridcast.ingest import (
     reconcile_recent,
     record_gaps,
     upsert_day,
+    upsert_mix_day,
+    upsert_weather_day,
+    weather_payload_to_frame,
     write_partition_atomic,
 )
 
@@ -2008,6 +2023,383 @@ class TestReconcileRecent:
         code = cli.main(["ingest", "--reconcile-recent", "--window-days", "4"])
         assert code == 0
         assert called_kwargs.get("window_days") == 4
+
+
+def test_weather_ingest_is_idempotent(tmp_path: Path) -> None:
+    """Weather ingest run twice produces identical row count, no duplicates, identical parquet."""
+    target_date = date(2025, 5, 1)
+    # 24 hourly rows
+    hours = pd.date_range("2025-05-01 00:00:00", periods=24, freq="h", tz="UTC")
+    df = pd.DataFrame({
+        "period_start_utc": hours,
+        "local_date": target_date,
+        "temperature_2m_previous_day2": [12.5 + i * 0.1 for i in range(24)],
+    })
+
+    res1 = upsert_weather_day(df, target_date, base_dir=tmp_path)
+    p_path = tmp_path / f"date={target_date}.parquet"
+    assert p_path.exists()
+    bytes1 = p_path.read_bytes()
+
+    res2 = upsert_weather_day(df, target_date, base_dir=tmp_path)
+    bytes2 = p_path.read_bytes()
+
+    assert res1.rows_after == 24
+    assert res2.rows_after == 24
+    assert res2.duplicates_dropped == 0
+    assert bytes1 == bytes2
+
+
+def test_mix_ingest_is_idempotent(tmp_path: Path) -> None:
+    """Generation mix ingest run twice produces identical rows, no duplicates, identical parquet."""
+    target_date = date(2025, 5, 1)
+    # 48 half-hourly rows
+    half_hours = pd.date_range("2025-05-01 00:00:00", periods=48, freq="30min", tz="UTC")
+    df = pd.DataFrame({
+        "period_start_utc": half_hours,
+        "local_date": target_date,
+        "wind": [30.0] * 48,
+        "solar": [10.0] * 48,
+        "gas": [25.0] * 48,
+        "coal": [1.0] * 48,
+        "nuclear": [15.0] * 48,
+        "biomass": [5.0] * 48,
+        "hydro": [2.0] * 48,
+        "imports": [10.0] * 48,
+        "other": [2.0] * 48,
+    })
+
+    res1 = upsert_mix_day(df, target_date, base_dir=tmp_path)
+    p_path = tmp_path / f"date={target_date}.parquet"
+    assert p_path.exists()
+    bytes1 = p_path.read_bytes()
+
+    res2 = upsert_mix_day(df, target_date, base_dir=tmp_path)
+    bytes2 = p_path.read_bytes()
+
+    assert res1.rows_after == 48
+    assert res2.rows_after == 48
+    assert res2.duplicates_dropped == 0
+    assert bytes1 == bytes2
+
+
+def test_generate_monthly_chunks() -> None:
+    """Test splitting dates into monthly chunks."""
+    # Single month
+    chunks = generate_monthly_chunks(date(2025, 3, 10), date(2025, 3, 25))
+    assert chunks == [(date(2025, 3, 10), date(2025, 3, 25))]
+
+    # Multi-month across years
+    chunks2 = generate_monthly_chunks(date(2024, 11, 15), date(2025, 1, 10))
+    assert chunks2 == [
+        (date(2024, 11, 15), date(2024, 11, 30)),
+        (date(2024, 12, 1), date(2024, 12, 31)),
+        (date(2025, 1, 1), date(2025, 1, 10)),
+    ]
+
+    with pytest.raises(ValueError, match="must be on or before"):
+        generate_monthly_chunks(date(2025, 1, 2), date(2025, 1, 1))
+
+
+def test_expected_weather_row_count() -> None:
+    """Verify expected hourly row counts across normal and DST transition days."""
+    assert expected_weather_row_count(date(2026, 6, 1)) == 24
+    assert expected_weather_row_count(date(2026, 3, 29)) == 23  # Spring forward
+    assert expected_weather_row_count(date(2026, 10, 25)) == 25  # Autumn back
+
+
+def test_is_weather_day_complete(tmp_path: Path) -> None:
+    """Test is_weather_day_complete validation."""
+    target_date = date(2026, 6, 1)
+    # 1. Missing file
+    assert is_weather_day_complete(target_date, weather_dir=tmp_path) is False
+
+    # 2. Incomplete rows
+    hours_20 = pd.date_range("2026-06-01 00:00:00", periods=20, freq="h", tz="UTC")
+    df_incomplete = pd.DataFrame({
+        "period_start_utc": hours_20,
+        "local_date": target_date,
+        "temperature_2m_previous_day2": [15.0] * 20,
+    })
+    upsert_weather_day(df_incomplete, target_date, base_dir=tmp_path)
+    assert is_weather_day_complete(target_date, weather_dir=tmp_path) is False
+
+    # 3. Complete rows but with NaN
+    hours_24 = pd.date_range("2026-06-01 00:00:00", periods=24, freq="h", tz="UTC")
+    temps_nan = [15.0] * 23 + [np.nan]
+    df_nan = pd.DataFrame({
+        "period_start_utc": hours_24,
+        "local_date": target_date,
+        "temperature_2m_previous_day2": temps_nan,
+    })
+    upsert_weather_day(df_nan, target_date, base_dir=tmp_path)
+    assert is_weather_day_complete(target_date, weather_dir=tmp_path) is False
+
+    # 4. Complete non-null
+    df_valid = pd.DataFrame({
+        "period_start_utc": hours_24,
+        "local_date": target_date,
+        "temperature_2m_previous_day2": [15.0] * 24,
+    })
+    upsert_weather_day(df_valid, target_date, base_dir=tmp_path)
+    assert is_weather_day_complete(target_date, weather_dir=tmp_path) is True
+
+
+def test_is_mix_day_complete(tmp_path: Path) -> None:
+    """Test is_mix_day_complete validation."""
+    target_date = date(2026, 6, 1)
+    assert is_mix_day_complete(target_date, mix_dir=tmp_path) is False
+
+    half_hours = pd.date_range("2026-06-01 00:00:00", periods=48, freq="30min", tz="UTC")
+    df_missing_fuel = pd.DataFrame({
+        "period_start_utc": half_hours,
+        "local_date": target_date,
+        "wind": [30.0] * 48,
+    })
+    upsert_mix_day(df_missing_fuel, target_date, base_dir=tmp_path)
+    assert is_mix_day_complete(target_date, mix_dir=tmp_path) is False
+
+    df_full = pd.DataFrame({
+        "period_start_utc": half_hours,
+        "local_date": target_date,
+        "wind": [30.0] * 48,
+        "solar": [10.0] * 48,
+        "gas": [25.0] * 48,
+        "coal": [1.0] * 48,
+        "nuclear": [15.0] * 48,
+        "biomass": [5.0] * 48,
+    })
+    upsert_mix_day(df_full, target_date, base_dir=tmp_path)
+    assert is_mix_day_complete(target_date, mix_dir=tmp_path) is True
+
+
+def test_weather_payload_to_frame() -> None:
+    """Test weather_payload_to_frame conversion and validation."""
+    empty = weather_payload_to_frame({})
+    assert empty.empty
+    assert list(empty.columns) == [
+        "period_start_utc",
+        "local_date",
+        "temperature_2m_previous_day2",
+    ]
+
+    valid_payload = {
+        "hourly": {
+            "time": ["2025-05-01T00:00", "2025-05-01T01:00"],
+            "temperature_2m_previous_day2": [12.0, 12.5],
+        }
+    }
+    df = weather_payload_to_frame(valid_payload)
+    assert len(df) == 2
+    assert df["temperature_2m_previous_day2"].iloc[0] == 12.0
+
+    bad_payload = {
+        "hourly": {
+            "time": ["2025-05-01T00:00"],
+            "temperature_2m_previous_day2": [None],
+        }
+    }
+    with pytest.raises(ValueError, match="null temperature"):
+        weather_payload_to_frame(bad_payload)
+
+
+def test_mix_payload_to_frame() -> None:
+    """Test mix_payload_to_frame conversion."""
+    empty = mix_payload_to_frame({})
+    assert empty.empty
+    assert "period_start_utc" in empty.columns
+
+    valid_payload = {
+        "data": [
+            {
+                "from": "2025-05-01T00:00Z",
+                "to": "2025-05-01T00:30Z",
+                "generationmix": [
+                    {"fuel": "Wind", "perc": 35.5},
+                    {"fuel": "Solar", "perc": 0.0},
+                ],
+            }
+        ]
+    }
+    df = mix_payload_to_frame(valid_payload)
+    assert len(df) == 1
+    assert df["wind"].iloc[0] == 35.5
+    assert df["solar"].iloc[0] == 0.0
+
+
+def test_fetch_weather_and_mix_chunk_cache(tmp_path: Path) -> None:
+    """Test caching behavior for weather and generation mix chunks."""
+    cache_weather = tmp_path / "cache_w"
+    cache_mix = tmp_path / "cache_m"
+
+    mock_client = MagicMock()
+    mock_client.get_weather_previous_runs.return_value = {
+        "hourly": {
+            "time": ["2025-05-01T00:00"],
+            "temperature_2m_previous_day2": [15.0],
+        }
+    }
+    mock_client.get_generation_range.return_value = {
+        "data": [
+            {
+                "from": "2025-05-01T00:00Z",
+                "to": "2025-05-01T00:30Z",
+                "generationmix": [{"fuel": "wind", "perc": 40}],
+            }
+        ]
+    }
+
+    # 1. First fetch writes cache
+    d1 = date(2025, 5, 1)
+    d2 = date(2025, 5, 2)
+    p_w1 = fetch_weather_chunk(mock_client, d1, d2, cache_dir=cache_weather)
+    assert mock_client.get_weather_previous_runs.call_count == 1
+    assert (cache_weather / f"{d1}_{d2}.json.gz").exists()
+
+    # 2. Second fetch reads cache without calling client
+    p_w2 = fetch_weather_chunk(mock_client, d1, d2, cache_dir=cache_weather)
+    assert mock_client.get_weather_previous_runs.call_count == 1
+    assert p_w1 == p_w2
+
+    # Repeat for mix
+    p_m1 = fetch_mix_chunk(mock_client, d1, d2, cache_dir=cache_mix)
+    assert mock_client.get_generation_range.call_count == 1
+    p_m2 = fetch_mix_chunk(mock_client, d1, d2, cache_dir=cache_mix)
+    assert mock_client.get_generation_range.call_count == 1
+    assert p_m1 == p_m2
+
+
+def test_ingest_weather_and_mix_day(tmp_path: Path) -> None:
+    """Test ingest_weather_day and ingest_mix_day behavior."""
+    w_dir = tmp_path / "weather"
+    m_dir = tmp_path / "mix"
+    target_date = date(2025, 1, 15)
+
+    mock_client = MagicMock()
+    # 24 hours of weather
+    hours = [f"2025-01-15T{h:02d}:00" for h in range(24)]
+    mock_client.get_weather_previous_runs.return_value = {
+        "hourly": {
+            "time": hours,
+            "temperature_2m_previous_day2": [14.0] * 24,
+        }
+    }
+    # 48 periods of mix
+    half_hours = [f"2025-01-15T{h:02d}:{m:02d}Z" for h in range(24) for m in (0, 30)]
+    mock_client.get_generation_range.return_value = {
+        "data": [
+            {
+                "from": ts,
+                "to": ts,
+                "generationmix": [
+                    {"fuel": "wind", "perc": 30},
+                    {"fuel": "solar", "perc": 10},
+                    {"fuel": "gas", "perc": 25},
+                    {"fuel": "coal", "perc": 1},
+                    {"fuel": "nuclear", "perc": 15},
+                    {"fuel": "biomass", "perc": 5},
+                ],
+            }
+            for ts in half_hours
+        ]
+    }
+
+    res_w = ingest_weather_day(target_date, client=mock_client, weather_dir=w_dir)
+    assert res_w.status == "written"
+    assert res_w.rows_written == 24
+
+    # Run again: should skip
+    res_w_skip = ingest_weather_day(target_date, client=mock_client, weather_dir=w_dir)
+    assert res_w_skip.status == "skipped"
+
+    res_m = ingest_mix_day(target_date, client=mock_client, mix_dir=m_dir)
+    assert res_m.status == "written"
+    assert res_m.rows_written == 48
+
+    res_m_skip = ingest_mix_day(target_date, client=mock_client, mix_dir=m_dir)
+    assert res_m_skip.status == "skipped"
+
+
+def test_ingest_weather_and_mix_range_validation_and_failures(tmp_path: Path) -> None:
+    """Test range validation and error handling in weather/mix ingest ranges."""
+    with pytest.raises(ValueError, match="must be on or before"):
+        ingest_weather_range(date(2025, 5, 2), date(2025, 5, 1))
+
+    with pytest.raises(ValueError, match="must be on or before"):
+        ingest_mix_range(date(2025, 5, 2), date(2025, 5, 1))
+
+    # Test error handling when client raises
+    failing_client = MagicMock()
+    failing_client.get_weather_previous_runs.side_effect = RuntimeError("API down")
+    failing_client.get_generation_range.side_effect = RuntimeError("API down")
+
+    summary_w = ingest_weather_range(
+        date(2025, 5, 1),
+        date(2025, 5, 2),
+        client=failing_client,
+        weather_dir=tmp_path / "w",
+        cache_dir=tmp_path / "cw",
+    )
+    assert summary_w.failures == 2
+
+    summary_m = ingest_mix_range(
+        date(2025, 5, 1),
+        date(2025, 5, 2),
+        client=failing_client,
+        mix_dir=tmp_path / "m",
+        cache_dir=tmp_path / "cm",
+    )
+    assert summary_m.failures == 2
+
+
+def test_client_weather_and_mix_methods() -> None:
+    """Test Client helper methods invoke correct URLs."""
+    session_mock = MagicMock()
+    resp_mock = MagicMock()
+    resp_mock.status_code = 200
+    resp_mock.json.return_value = {"ok": True}
+    session_mock.get.return_value = resp_mock
+
+    client = Client(session=session_mock, min_request_interval=0.0)
+
+    client.get_generation_range("2025-05-01T00:00Z", "2025-05-02T00:00Z")
+    assert "/generation/2025-05-01T00:00Z/2025-05-02T00:00Z" in session_mock.get.call_args[0][0]
+
+    client.get_weather_previous_runs(date(2025, 5, 1), date(2025, 5, 2))
+    called_url = session_mock.get.call_args[0][0]
+    assert "previous-runs-api.open-meteo.com" in called_url
+    assert "hourly=temperature_2m_previous_day2" in called_url
+    assert "start_date=2025-05-01" in called_url
+
+
+def test_cli_weather_and_mix_subcommand(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test CLI routing for gridcast ingest --weather and --mix."""
+    from gridcast import cli
+
+    weather_called = False
+    mix_called = False
+
+    def fake_weather_range(*args: object, **kwargs: object) -> object:
+        nonlocal weather_called
+        weather_called = True
+        return MagicMock(failures=0)
+
+    def fake_mix_range(*args: object, **kwargs: object) -> object:
+        nonlocal mix_called
+        mix_called = True
+        return MagicMock(failures=0)
+
+    monkeypatch.setattr("gridcast.cli.ingest_weather_range", fake_weather_range)
+    monkeypatch.setattr("gridcast.cli.ingest_mix_range", fake_mix_range)
+
+    code_w = cli.main(["ingest", "--weather", "--days", "2"])
+    assert code_w == 0
+    assert weather_called is True
+
+    code_m = cli.main(["ingest", "--mix", "--days", "2"])
+    assert code_m == 0
+    assert mix_called is True
+
 
 
 

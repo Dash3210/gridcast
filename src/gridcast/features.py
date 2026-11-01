@@ -16,6 +16,7 @@ Bounded Feature Set (ADR-006 / D3):
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Final
 from zoneinfo import ZoneInfo
 
@@ -28,6 +29,69 @@ from gridcast.holidays import UK_BANK_HOLIDAYS
 __all__: list[str] = []
 
 LONDON_TZ: Final[ZoneInfo] = ZoneInfo("Europe/London")
+
+CURATED_DIR_DEFAULT: Final[Path] = Path("data/curated")
+WEATHER_DIR_DEFAULT: Final[Path] = Path("data/weather")
+MIX_DIR_DEFAULT: Final[Path] = Path("data/mix")
+
+
+def load_feature_sources(
+    curated_dir: Path | str = CURATED_DIR_DEFAULT,
+    weather_dir: Path | str = WEATHER_DIR_DEFAULT,
+    mix_dir: Path | str = MIX_DIR_DEFAULT,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load curated carbon intensity, weather, and generation mix DataFrames.
+
+    Args:
+        curated_dir: Directory containing curated carbon intensity partitions.
+        weather_dir: Directory containing weather partitions.
+        mix_dir: Directory containing generation mix partitions.
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: (intensity_df, weather_df, mix_df)
+
+    Raises:
+        FileNotFoundError: If any directory does not exist or contains no parquet partitions.
+        ValueError: If any dataset is empty or if previous-runs weather contains nulls
+                    for periods at or after 2024-11-01.
+    """
+    c_path = Path(curated_dir)
+    w_path = Path(weather_dir)
+    m_path = Path(mix_dir)
+
+    for p, name in [
+        (c_path, "curated intensity"),
+        (w_path, "weather"),
+        (m_path, "generation mix"),
+    ]:
+        if not p.exists() or not any(p.glob("date=*.parquet")):
+            raise FileNotFoundError(
+                f"Source store '{name}' at '{p}' is missing or has no partition files."
+            )
+
+    intensity_df = pd.read_parquet(c_path)
+    weather_df = pd.read_parquet(w_path)
+    mix_df = pd.read_parquet(m_path)
+
+    if intensity_df.empty:
+        raise ValueError(f"Curated intensity dataset at '{c_path}' is empty.")
+    if weather_df.empty:
+        raise ValueError(f"Weather dataset at '{w_path}' is empty.")
+    if mix_df.empty:
+        raise ValueError(f"Generation mix dataset at '{m_path}' is empty.")
+
+    w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
+    post_cutoff = w_ts >= pd.Timestamp("2024-11-01 00:00:00+00:00")
+    if "temperature_2m_previous_day2" in weather_df.columns:
+        null_mask = post_cutoff & weather_df["temperature_2m_previous_day2"].isna()
+        if null_mask.any():
+            bad_date = weather_df.loc[null_mask, "period_start_utc"].iloc[0]
+            raise ValueError(
+                f"Previous-runs weather has null value at or after 2024-11-01 (date: {bad_date}). "
+                "Silent reanalysis fallback is strictly prohibited."
+            )
+
+    return intensity_df, weather_df, mix_df
 
 FEATURE_COLUMNS: Final[list[str]] = [
     # Lags of actual
@@ -123,6 +187,7 @@ def build_feature_frame(
     intensity_df: pd.DataFrame,
     weather_df: pd.DataFrame | None = None,
     mix_df: pd.DataFrame | None = None,
+    require_aux: bool = False,
 ) -> pd.DataFrame:
     """Build the bounded feature frame from source DataFrames without temporal leakage.
 
@@ -133,6 +198,8 @@ def build_feature_frame(
                     'temperature_2m_previous_day2'. Reanalysis weather is strictly rejected.
         mix_df: Generation mix DataFrame containing 'period_start_utc' and fuel shares
                 ('wind', 'solar', 'gas', 'coal', 'nuclear', 'biomass').
+        require_aux: If True, raises ValueError if any weather or mix column is entirely null
+                     or if any previous-runs temperature is null at or after 2024-11-01.
 
     Returns:
         pd.DataFrame sorted by 'period_start_utc' with exactly the bounded feature columns.
@@ -234,16 +301,23 @@ def build_feature_frame(
             index=w_ts,
         ).sort_index()
 
-        # Temperature at t from previous-runs day 2
-        result["temperature"] = timestamps.map(w_series).to_numpy(dtype=float)
+        # ADR-008: Weather joining rule.
+        # Open-Meteo previous-runs forecast is issued hourly, while GB electricity
+        # settlement operates on 30-minute periods. For each period start t, we map
+        # to the containing hour t.floor("h"). Both half-hours within an hour share
+        # the identical previous-runs forecast issued at t-48h, so using the containing
+        # hour introduces zero future leakage and avoids synthesizing non-physical
+        # interpolated temperatures.
+        containing_hours = timestamps.dt.floor("h")
+        result["temperature"] = containing_hours.map(w_series).to_numpy(dtype=float)
 
         # 24h mean and 24h min of D1 temperatures ending at t
         w_roll_24h = w_series.rolling("24h", min_periods=1)
         w_24h_mean = w_roll_24h.mean()
         w_24h_min = w_roll_24h.min()
 
-        result["temperature_24h_mean"] = timestamps.map(w_24h_mean).to_numpy(dtype=float)
-        result["temperature_24h_min"] = timestamps.map(w_24h_min).to_numpy(dtype=float)
+        result["temperature_24h_mean"] = containing_hours.map(w_24h_mean).to_numpy(dtype=float)
+        result["temperature_24h_min"] = containing_hours.map(w_24h_min).to_numpy(dtype=float)
     else:
         # If no previous-runs weather provided, weather features remain null
         result["temperature"] = np.nan
@@ -272,6 +346,28 @@ def build_feature_frame(
             result[feature_name] = t_minus_48h.map(fuel_series).to_numpy(dtype=float)
         else:
             result[feature_name] = np.nan
+
+    if require_aux:
+        for col in ["temperature", "temperature_24h_mean", "temperature_24h_min"]:
+            if result[col].isna().all():
+                raise ValueError(
+                    f"Weather feature column '{col}' is entirely null with require_aux=True."
+                )
+        for fuel in MIX_FUELS:
+            col_name = f"mix_share_{fuel}"
+            if result[col_name].isna().all():
+                raise ValueError(
+                    f"Mix feature column '{col_name}' is entirely null with require_aux=True."
+                )
+
+        post_cutoff = timestamps >= pd.Timestamp("2024-11-01 00:00:00+00:00")
+        null_temps = post_cutoff & result["temperature"].isna()
+        if null_temps.any():
+            bad_ts = timestamps[null_temps].iloc[0]
+            raise ValueError(
+                f"Previous-runs temperature is null at or after 2024-11-01 for period {bad_ts}. "
+                "Silent reanalysis fallback is strictly prohibited."
+            )
 
     # Enforce exact column order: period_start_utc + FEATURE_COLUMNS
     final_cols = ["period_start_utc"] + FEATURE_COLUMNS
