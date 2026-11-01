@@ -42,6 +42,7 @@ CACHE_DIR_DEFAULT = Path("data/cache/http")
 WEATHER_CACHE_DIR_DEFAULT = Path("data/cache/weather")
 MIX_CACHE_DIR_DEFAULT = Path("data/cache/mix")
 AUDIT_DIR_DEFAULT = Path("data/audit")
+SOURCE_GAPS_PATH_DEFAULT = AUDIT_DIR_DEFAULT / "source-gaps.csv"
 
 OPEN_METEO_BASE_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 
@@ -59,9 +60,13 @@ __all__: list[str] = [
     "MIX_CACHE_DIR_DEFAULT",
     "MIX_DIR_DEFAULT",
     "OPEN_METEO_BASE_URL",
+    "SOURCE_GAPS_PATH_DEFAULT",
+    "SourceGap",
     "UpsertResult",
     "WEATHER_CACHE_DIR_DEFAULT",
     "WEATHER_DIR_DEFAULT",
+    "check_mix_coverage_and_retry",
+    "check_weather_coverage_and_retry",
     "dst_row_count",
     "expected_row_count",
     "expected_weather_row_count",
@@ -88,6 +93,7 @@ __all__: list[str] = [
     "reconcile_recent",
     "record_conflicts",
     "record_gaps",
+    "record_source_gaps",
     "upsert_day",
     "upsert_mix_day",
     "upsert_weather_day",
@@ -110,6 +116,16 @@ class UpsertResult:
 class Gap:
     """An audited data gap (missing actual intensity or omitted period withheld by upstream)."""
 
+    local_date: str
+    period_start_utc: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class SourceGap:
+    """An audited source gap (missing data in upstream source store like weather or mix)."""
+
+    store: str
     local_date: str
     period_start_utc: str
     reason: str
@@ -148,6 +164,7 @@ class IngestSummary:
     used_fallback: int = 0
     nulls_forecast: int = 0
     missing_periods: int = 0
+    periods_recovered: int = 0
 
 
 class Client:
@@ -1545,7 +1562,12 @@ def expected_weather_row_count(local_date: date | str) -> int:
     return int(diff_s / 3600.0)
 
 
-def is_weather_day_complete(local_date: date | str, weather_dir: Path | None = None) -> bool:
+def is_weather_day_complete(
+    local_date: date | str,
+    weather_dir: Path | None = None,
+    audit_dir: Path | None = None,
+    source_gaps_path: Path | None = None,
+) -> bool:
     """Assert whether a local date partition for weather exists and is complete."""
     d = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
     target_dir = weather_dir if weather_dir is not None else WEATHER_DIR_DEFAULT
@@ -1554,7 +1576,32 @@ def is_weather_day_complete(local_date: date | str, weather_dir: Path | None = N
         return False
     try:
         df = pd.read_parquet(p)
-        if len(df) != expected_weather_row_count(d):
+        rows = len(df)
+        gaps_count = 0
+        target_gaps = (
+            source_gaps_path
+            if source_gaps_path is not None
+            else (
+                audit_dir / "source-gaps.csv"
+                if audit_dir is not None
+                else (
+                    target_dir.parent / "audit" / "source-gaps.csv"
+                    if target_dir != WEATHER_DIR_DEFAULT
+                    else AUDIT_DIR_DEFAULT / "source-gaps.csv"
+                )
+            )
+        )
+        if target_gaps.exists():
+            g_df = pd.read_csv(target_gaps)
+            if not g_df.empty and "store" in g_df.columns:
+                gaps_count = len(
+                    g_df[
+                        (g_df["store"] == "weather")
+                        & (g_df["local_date"].astype(str) == str(d))
+                    ]
+                )
+
+        if rows + gaps_count != expected_weather_row_count(d):
             return False
         if "temperature_2m_previous_day2" not in df.columns:
             return False
@@ -1563,7 +1610,12 @@ def is_weather_day_complete(local_date: date | str, weather_dir: Path | None = N
         return False
 
 
-def is_mix_day_complete(local_date: date | str, mix_dir: Path | None = None) -> bool:
+def is_mix_day_complete(
+    local_date: date | str,
+    mix_dir: Path | None = None,
+    audit_dir: Path | None = None,
+    source_gaps_path: Path | None = None,
+) -> bool:
     """Assert whether a local date partition for generation mix exists and is complete."""
     d = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
     target_dir = mix_dir if mix_dir is not None else MIX_DIR_DEFAULT
@@ -1572,7 +1624,32 @@ def is_mix_day_complete(local_date: date | str, mix_dir: Path | None = None) -> 
         return False
     try:
         df = pd.read_parquet(p)
-        if len(df) != dst_row_count(d):
+        rows = len(df)
+        gaps_count = 0
+        target_gaps = (
+            source_gaps_path
+            if source_gaps_path is not None
+            else (
+                audit_dir / "source-gaps.csv"
+                if audit_dir is not None
+                else (
+                    target_dir.parent / "audit" / "source-gaps.csv"
+                    if target_dir != MIX_DIR_DEFAULT
+                    else AUDIT_DIR_DEFAULT / "source-gaps.csv"
+                )
+            )
+        )
+        if target_gaps.exists():
+            g_df = pd.read_csv(target_gaps)
+            if not g_df.empty and "store" in g_df.columns:
+                gaps_count = len(
+                    g_df[
+                        (g_df["store"] == "mix")
+                        & (g_df["local_date"].astype(str) == str(d))
+                    ]
+                )
+
+        if rows + gaps_count != dst_row_count(d):
             return False
         for fuel in ["wind", "solar", "gas", "coal", "nuclear", "biomass"]:
             if fuel not in df.columns or df[fuel].isna().all():
@@ -1818,17 +1895,353 @@ def upsert_mix_day(
     )
 
 
+def record_source_gaps(
+    store: str,
+    missing_periods: list[tuple[date, pd.Timestamp]] | list[tuple[str, str]],
+    present_periods: set[pd.Timestamp] | None = None,
+    audit_dir: Path | None = None,
+    source_gaps_path: Path | None = None,
+    reason: str = "upstream_empty",
+) -> list[SourceGap]:
+    """Record unrecoverable source gaps in data/audit/source-gaps.csv with reconciliation.
+
+    - Write one row per period that remains missing after the retry, with store in
+      weather|mix and reason describing the cause (upstream_empty).
+    - Created lazily and deleted when empty, exactly like gaps.csv.
+    - Reconciliation applies: if a later fetch fills a recorded gap, drop the row.
+    - Preserves unique (store, period_start_utc).
+    """
+    if source_gaps_path is not None:
+        target_path = source_gaps_path
+    elif audit_dir is not None:
+        target_path = audit_dir / "source-gaps.csv"
+    else:
+        target_path = AUDIT_DIR_DEFAULT / "source-gaps.csv"
+
+    existing_rows: list[dict[str, str]] = []
+    if target_path.exists():
+        with open(target_path, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header:
+                for row in reader:
+                    if len(row) >= 4:
+                        try:
+                            ts_norm = pd.Timestamp(row[2]).isoformat()
+                        except Exception:
+                            ts_norm = row[2]
+                        existing_rows.append({
+                            "store": row[0],
+                            "local_date": row[1],
+                            "period_start_utc": ts_norm,
+                            "reason": row[3],
+                        })
+
+    # Reconcile existing rows for this store against present_periods
+    kept_rows: list[dict[str, str]] = []
+    reconciled_any = False
+    present_ts_set: set[str] = set()
+    if present_periods:
+        for p in present_periods:
+            try:
+                present_ts_set.add(pd.Timestamp(p).isoformat())
+            except Exception:
+                present_ts_set.add(str(p))
+
+    for r in existing_rows:
+        if r["store"] == store and r["period_start_utc"] in present_ts_set:
+            reconciled_any = True
+            continue
+        kept_rows.append(r)
+
+    kept_keys = {(r["store"], r["period_start_utc"]) for r in kept_rows}
+    new_gaps: list[SourceGap] = []
+
+    for item in missing_periods:
+        l_date, p_start = item
+        l_date_str = str(l_date)
+        try:
+            start_str = pd.Timestamp(p_start).isoformat()
+        except Exception:
+            start_str = str(p_start)
+
+        if (store, start_str) not in kept_keys:
+            gap = SourceGap(
+                store=store,
+                local_date=l_date_str,
+                period_start_utc=start_str,
+                reason=reason,
+            )
+            new_gaps.append(gap)
+            kept_keys.add((store, start_str))
+
+    final_rows = kept_rows + [
+        {
+            "store": g.store,
+            "local_date": g.local_date,
+            "period_start_utc": g.period_start_utc,
+            "reason": g.reason,
+        }
+        for g in new_gaps
+    ]
+
+    # Sort final rows for deterministic output: store, local_date, period_start_utc
+    final_rows.sort(key=lambda r: (r["store"], r["local_date"], r["period_start_utc"]))
+
+    if not final_rows:
+        if target_path.exists():
+            target_path.unlink(missing_ok=True)
+    elif new_gaps or reconciled_any or not target_path.exists():
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = target_path.parent / f"{target_path.name}.tmp.{os.getpid()}"
+        try:
+            with open(temp_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["store", "local_date", "period_start_utc", "reason"])
+                for r in final_rows:
+                    writer.writerow(
+                        [r["store"], r["local_date"], r["period_start_utc"], r["reason"]]
+                    )
+            os.replace(temp_file, target_path)
+        finally:
+            if temp_file.exists():
+                temp_file.unlink(missing_ok=True)
+
+    return new_gaps
+
+
+def check_mix_coverage_and_retry(
+    start_date: date,
+    end_date: date,
+    client: Client | None = None,
+    mix_dir: Path | None = None,
+    curated_dir: Path | None = None,
+    audit_dir: Path | None = None,
+    source_gaps_path: Path | None = None,
+    force: bool = False,
+) -> tuple[int, int]:
+    """Post-fetch coverage check with targeted retry for generation mix.
+
+    - Compares fetched period starts against curated grid for those dates (exact half hour).
+    - For each missing period, re-requests window beginning at period_start_utc + 30min
+      (which includes the period as a straddling period before 'from').
+    - Dedupes and keeps whatever lands.
+    - Records unrecoverable gaps into source-gaps.csv.
+
+    Returns (periods_recovered, gaps_recorded).
+    """
+    client_inst = client or Client()
+    m_dir = mix_dir if mix_dir is not None else MIX_DIR_DEFAULT
+    c_dir = curated_dir if curated_dir is not None else (
+        m_dir.parent / "curated" if m_dir != MIX_DIR_DEFAULT else CURATED_DIR_DEFAULT
+    )
+    a_dir = audit_dir if audit_dir is not None else (
+        m_dir.parent / "audit" if m_dir != MIX_DIR_DEFAULT else AUDIT_DIR_DEFAULT
+    )
+
+    all_curated_periods: list[tuple[date, pd.Timestamp]] = []
+    all_present_starts: set[pd.Timestamp] = set()
+
+    curr = start_date
+    while curr <= end_date:
+        c_p = partition_path(curr, base_dir=c_dir)
+        if c_p.exists():
+            c_df = pd.read_parquet(c_p)
+            for ts in pd.to_datetime(c_df["period_start_utc"], utc=True):
+                all_curated_periods.append((curr, ts))
+        else:
+            count = dst_row_count(curr)
+            start_local = datetime(curr.year, curr.month, curr.day, 0, 0, tzinfo=LONDON_TZ)
+            start_utc = start_local.astimezone(UTC_TZ)
+            for i in range(count):
+                period_ts = pd.Timestamp(start_utc + timedelta(minutes=30 * i))
+                all_curated_periods.append((curr, period_ts))
+
+        m_p = partition_path(curr, base_dir=m_dir)
+        if m_p.exists():
+            m_df = pd.read_parquet(m_p)
+            all_present_starts.update(pd.to_datetime(m_df["period_start_utc"], utc=True))
+
+        curr += timedelta(days=1)
+
+    missing = [(d, ts) for d, ts in all_curated_periods if ts not in all_present_starts]
+
+    if not missing:
+        record_source_gaps(
+            store="mix",
+            missing_periods=[],
+            present_periods=all_present_starts,
+            audit_dir=a_dir,
+            source_gaps_path=source_gaps_path,
+        )
+        return 0, 0
+
+    periods_recovered = 0
+    for _d, p_start in missing:
+        s_dt = p_start.astimezone(UTC_TZ) + timedelta(minutes=30)
+        e_dt = s_dt + timedelta(minutes=30)
+        retry_start = s_dt.strftime("%Y-%m-%dT%H:%MZ")
+        retry_end = e_dt.strftime("%Y-%m-%dT%H:%MZ")
+        try:
+            payload = client_inst.get_generation_range(start_utc=retry_start, end_utc=retry_end)
+            frame = mix_payload_to_frame(payload)
+            if not frame.empty:
+                for ret_date, grp in frame.groupby("local_date"):
+                    upsert_mix_day(grp, ret_date, base_dir=m_dir)
+        except Exception as exc:
+            logger.warning("Targeted retry for %s failed: %s", p_start, exc)
+
+    recovered_present: set[pd.Timestamp] = set()
+    curr = start_date
+    while curr <= end_date:
+        m_p = partition_path(curr, base_dir=m_dir)
+        if m_p.exists():
+            m_df = pd.read_parquet(m_p)
+            recovered_present.update(pd.to_datetime(m_df["period_start_utc"], utc=True))
+        curr += timedelta(days=1)
+
+    still_missing: list[tuple[date, pd.Timestamp]] = []
+    for d, ts in missing:
+        if ts in recovered_present:
+            periods_recovered += 1
+        else:
+            still_missing.append((d, ts))
+
+    record_source_gaps(
+        store="mix",
+        missing_periods=still_missing,
+        present_periods=recovered_present,
+        audit_dir=a_dir,
+        source_gaps_path=source_gaps_path,
+        reason="upstream_empty",
+    )
+
+    return periods_recovered, len(still_missing)
+
+
+def check_weather_coverage_and_retry(
+    start_date: date,
+    end_date: date,
+    client: Client | None = None,
+    weather_dir: Path | None = None,
+    curated_dir: Path | None = None,
+    audit_dir: Path | None = None,
+    source_gaps_path: Path | None = None,
+    force: bool = False,
+) -> tuple[int, int]:
+    """Post-fetch coverage check with targeted retry for weather.
+
+    - Compares fetched period starts against curated grid for those dates (containing hour).
+    - For each missing hour, re-requests Open-Meteo previous-runs for that date.
+    - Dedupes and keeps whatever lands.
+    - Records unrecoverable gaps into source-gaps.csv.
+
+    Returns (hours_recovered, gaps_recorded).
+    """
+    client_inst = client or Client()
+    w_dir = weather_dir if weather_dir is not None else WEATHER_DIR_DEFAULT
+    c_dir = curated_dir if curated_dir is not None else (
+        w_dir.parent / "curated" if w_dir != WEATHER_DIR_DEFAULT else CURATED_DIR_DEFAULT
+    )
+    a_dir = audit_dir if audit_dir is not None else (
+        w_dir.parent / "audit" if w_dir != WEATHER_DIR_DEFAULT else AUDIT_DIR_DEFAULT
+    )
+
+    all_curated_hours: list[tuple[date, pd.Timestamp]] = []
+    all_present_starts: set[pd.Timestamp] = set()
+
+    curr = start_date
+    while curr <= end_date:
+        c_p = partition_path(curr, base_dir=c_dir)
+        if c_p.exists():
+            c_df = pd.read_parquet(c_p)
+            p_starts = pd.to_datetime(c_df["period_start_utc"], utc=True)
+            unique_hours = sorted({ts.floor("h") for ts in p_starts})
+            for h in unique_hours:
+                all_curated_hours.append((curr, h))
+        else:
+            count = expected_weather_row_count(curr)
+            start_local = datetime(curr.year, curr.month, curr.day, 0, 0, tzinfo=LONDON_TZ)
+            start_utc = start_local.astimezone(UTC_TZ)
+            for i in range(count):
+                hour_ts = pd.Timestamp(start_utc + timedelta(hours=i))
+                all_curated_hours.append((curr, hour_ts))
+
+        w_p = partition_path(curr, base_dir=w_dir)
+        if w_p.exists():
+            w_df = pd.read_parquet(w_p)
+            all_present_starts.update(pd.to_datetime(w_df["period_start_utc"], utc=True))
+
+        curr += timedelta(days=1)
+
+    missing = [(d, h) for d, h in all_curated_hours if h not in all_present_starts]
+
+    if not missing:
+        record_source_gaps(
+            store="weather",
+            missing_periods=[],
+            present_periods=all_present_starts,
+            audit_dir=a_dir,
+            source_gaps_path=source_gaps_path,
+        )
+        return 0, 0
+
+    hours_recovered = 0
+    missing_dates = sorted({d for d, _ in missing})
+    for d in missing_dates:
+        try:
+            payload = client_inst.get_weather_previous_runs(start_date=d, end_date=d)
+            frame = weather_payload_to_frame(payload)
+            day_data = frame[frame["local_date"] == d]
+            if not day_data.empty:
+                upsert_weather_day(day_data, d, base_dir=w_dir)
+        except Exception as exc:
+            logger.warning("Targeted weather retry for %s failed: %s", d, exc)
+
+    recovered_present: set[pd.Timestamp] = set()
+    curr = start_date
+    while curr <= end_date:
+        w_p = partition_path(curr, base_dir=w_dir)
+        if w_p.exists():
+            w_df = pd.read_parquet(w_p)
+            recovered_present.update(pd.to_datetime(w_df["period_start_utc"], utc=True))
+        curr += timedelta(days=1)
+
+    still_missing: list[tuple[date, pd.Timestamp]] = []
+    for d, h in missing:
+        if h in recovered_present:
+            hours_recovered += 1
+        else:
+            still_missing.append((d, h))
+
+    record_source_gaps(
+        store="weather",
+        missing_periods=still_missing,
+        present_periods=recovered_present,
+        audit_dir=a_dir,
+        source_gaps_path=source_gaps_path,
+        reason="upstream_empty",
+    )
+
+    return hours_recovered, len(still_missing)
+
+
 def ingest_weather_day(
     local_date: date | str,
     client: Client | None = None,
     force: bool = False,
     cache_dir: Path | None = None,
     weather_dir: Path | None = None,
+    curated_dir: Path | None = None,
+    audit_dir: Path | None = None,
+    source_gaps_path: Path | None = None,
 ) -> DayIngestResult:
     """Ingest a single local day of weather data."""
     d = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
     w_dir = weather_dir if weather_dir is not None else WEATHER_DIR_DEFAULT
-    if not force and is_weather_day_complete(d, weather_dir=w_dir):
+    if not force and is_weather_day_complete(
+        d, weather_dir=w_dir, audit_dir=audit_dir, source_gaps_path=source_gaps_path
+    ):
         existing_p = partition_path(d, base_dir=w_dir)
         rows = len(pd.read_parquet(existing_p))
         return DayIngestResult(
@@ -1850,6 +2263,16 @@ def ingest_weather_day(
     frame = weather_payload_to_frame(payload)
     day_frame = frame[frame["local_date"] == d]
     if day_frame.empty:
+        check_weather_coverage_and_retry(
+            start_date=d,
+            end_date=d,
+            client=client_inst,
+            weather_dir=w_dir,
+            curated_dir=curated_dir,
+            audit_dir=audit_dir,
+            source_gaps_path=source_gaps_path,
+            force=force,
+        )
         return DayIngestResult(
             local_date=d,
             status="no_data",
@@ -1859,12 +2282,22 @@ def ingest_weather_day(
         )
 
     res = upsert_weather_day(day_frame, d, base_dir=w_dir)
+    recovered, gaps_recorded = check_weather_coverage_and_retry(
+        start_date=d,
+        end_date=d,
+        client=client_inst,
+        weather_dir=w_dir,
+        curated_dir=curated_dir,
+        audit_dir=audit_dir,
+        source_gaps_path=source_gaps_path,
+        force=force,
+    )
     return DayIngestResult(
         local_date=d,
         status="written",
-        rows_written=res.rows_after,
+        rows_written=res.rows_after + recovered,
         duplicates_dropped=res.duplicates_dropped,
-        gaps_recorded=0,
+        gaps_recorded=gaps_recorded,
     )
 
 
@@ -1875,6 +2308,9 @@ def ingest_weather_range(
     client: Client | None = None,
     cache_dir: Path | None = None,
     weather_dir: Path | None = None,
+    curated_dir: Path | None = None,
+    audit_dir: Path | None = None,
+    source_gaps_path: Path | None = None,
 ) -> IngestSummary:
     """Ingest weather forecast data for a range of dates using monthly chunks."""
     if start > end:
@@ -1896,7 +2332,10 @@ def ingest_weather_range(
     for c_start, c_end in chunks:
         chunk_dates = [c_start + timedelta(days=i) for i in range((c_end - c_start).days + 1)]
         need_fetch = force or any(
-            not is_weather_day_complete(d, weather_dir=w_dir) for d in chunk_dates
+            not is_weather_day_complete(
+                d, weather_dir=w_dir, audit_dir=audit_dir, source_gaps_path=source_gaps_path
+            )
+            for d in chunk_dates
         )
 
         chunk_df: pd.DataFrame | None = None
@@ -1920,7 +2359,9 @@ def ingest_weather_range(
 
         for d in chunk_dates:
             dates_requested += 1
-            if not force and is_weather_day_complete(d, weather_dir=w_dir):
+            if not force and is_weather_day_complete(
+                d, weather_dir=w_dir, audit_dir=audit_dir, source_gaps_path=source_gaps_path
+            ):
                 dates_skipped += 1
                 existing_p = partition_path(d, base_dir=w_dir)
                 existing_rows = len(pd.read_parquet(existing_p))
@@ -1945,14 +2386,27 @@ def ingest_weather_range(
                 f"({res.duplicates_dropped} duplicates dropped)"
             )
 
+    recovered, source_gaps_count = check_weather_coverage_and_retry(
+        start_date=start,
+        end_date=end,
+        client=client_inst,
+        weather_dir=w_dir,
+        curated_dir=curated_dir,
+        audit_dir=audit_dir,
+        source_gaps_path=source_gaps_path,
+        force=force,
+    )
+
     requests_made = getattr(client_inst, "request_count", 0) - initial_request_count
 
     print("\nWeather ingest summary:")
     print(f"  dates requested:    {dates_requested}")
     print(f"  dates written:      {dates_written}")
     print(f"  dates skipped:      {dates_skipped}")
-    print(f"  rows total:         {rows_total}")
+    print(f"  rows total:         {rows_total + recovered}")
     print(f"  duplicates dropped: {duplicates_dropped}")
+    print(f"  hours recovered:    {recovered}")
+    print(f"  source gaps:        {source_gaps_count}")
     print(f"  requests made:      {requests_made}")
     if failures > 0:
         print(f"  failures:           {failures}")
@@ -1961,9 +2415,11 @@ def ingest_weather_range(
         dates_requested=dates_requested,
         dates_written=dates_written,
         dates_skipped=dates_skipped,
-        rows_total=rows_total,
+        rows_total=rows_total + recovered,
         duplicates_dropped=duplicates_dropped,
         failures=failures,
+        periods_recovered=recovered,
+        gaps_recorded=source_gaps_count,
     )
 
 
@@ -1973,11 +2429,16 @@ def ingest_mix_day(
     force: bool = False,
     cache_dir: Path | None = None,
     mix_dir: Path | None = None,
+    curated_dir: Path | None = None,
+    audit_dir: Path | None = None,
+    source_gaps_path: Path | None = None,
 ) -> DayIngestResult:
     """Ingest a single local day of generation mix data."""
     d = date.fromisoformat(local_date) if isinstance(local_date, str) else local_date
     m_dir = mix_dir if mix_dir is not None else MIX_DIR_DEFAULT
-    if not force and is_mix_day_complete(d, mix_dir=m_dir):
+    if not force and is_mix_day_complete(
+        d, mix_dir=m_dir, audit_dir=audit_dir, source_gaps_path=source_gaps_path
+    ):
         existing_p = partition_path(d, base_dir=m_dir)
         rows = len(pd.read_parquet(existing_p))
         return DayIngestResult(
@@ -1999,6 +2460,16 @@ def ingest_mix_day(
     frame = mix_payload_to_frame(payload)
     day_frame = frame[frame["local_date"] == d]
     if day_frame.empty:
+        check_mix_coverage_and_retry(
+            start_date=d,
+            end_date=d,
+            client=client_inst,
+            mix_dir=m_dir,
+            curated_dir=curated_dir,
+            audit_dir=audit_dir,
+            source_gaps_path=source_gaps_path,
+            force=force,
+        )
         return DayIngestResult(
             local_date=d,
             status="no_data",
@@ -2008,12 +2479,22 @@ def ingest_mix_day(
         )
 
     res = upsert_mix_day(day_frame, d, base_dir=m_dir)
+    recovered, gaps_recorded = check_mix_coverage_and_retry(
+        start_date=d,
+        end_date=d,
+        client=client_inst,
+        mix_dir=m_dir,
+        curated_dir=curated_dir,
+        audit_dir=audit_dir,
+        source_gaps_path=source_gaps_path,
+        force=force,
+    )
     return DayIngestResult(
         local_date=d,
         status="written",
-        rows_written=res.rows_after,
+        rows_written=res.rows_after + recovered,
         duplicates_dropped=res.duplicates_dropped,
-        gaps_recorded=0,
+        gaps_recorded=gaps_recorded,
     )
 
 
@@ -2024,6 +2505,9 @@ def ingest_mix_range(
     client: Client | None = None,
     cache_dir: Path | None = None,
     mix_dir: Path | None = None,
+    curated_dir: Path | None = None,
+    audit_dir: Path | None = None,
+    source_gaps_path: Path | None = None,
 ) -> IngestSummary:
     """Ingest generation mix data for a range of dates using monthly chunks."""
     if start > end:
@@ -2045,7 +2529,10 @@ def ingest_mix_range(
     for c_start, c_end in chunks:
         chunk_dates = [c_start + timedelta(days=i) for i in range((c_end - c_start).days + 1)]
         need_fetch = force or any(
-            not is_mix_day_complete(d, mix_dir=m_dir) for d in chunk_dates
+            not is_mix_day_complete(
+                d, mix_dir=m_dir, audit_dir=audit_dir, source_gaps_path=source_gaps_path
+            )
+            for d in chunk_dates
         )
 
         chunk_df: pd.DataFrame | None = None
@@ -2069,7 +2556,9 @@ def ingest_mix_range(
 
         for d in chunk_dates:
             dates_requested += 1
-            if not force and is_mix_day_complete(d, mix_dir=m_dir):
+            if not force and is_mix_day_complete(
+                d, mix_dir=m_dir, audit_dir=audit_dir, source_gaps_path=source_gaps_path
+            ):
                 dates_skipped += 1
                 existing_p = partition_path(d, base_dir=m_dir)
                 existing_rows = len(pd.read_parquet(existing_p))
@@ -2094,14 +2583,27 @@ def ingest_mix_range(
                 f"({res.duplicates_dropped} duplicates dropped)"
             )
 
+    recovered, source_gaps_count = check_mix_coverage_and_retry(
+        start_date=start,
+        end_date=end,
+        client=client_inst,
+        mix_dir=m_dir,
+        curated_dir=curated_dir,
+        audit_dir=audit_dir,
+        source_gaps_path=source_gaps_path,
+        force=force,
+    )
+
     requests_made = getattr(client_inst, "request_count", 0) - initial_request_count
 
     print("\nGeneration mix ingest summary:")
     print(f"  dates requested:    {dates_requested}")
     print(f"  dates written:      {dates_written}")
     print(f"  dates skipped:      {dates_skipped}")
-    print(f"  rows total:         {rows_total}")
+    print(f"  rows total:         {rows_total + recovered}")
     print(f"  duplicates dropped: {duplicates_dropped}")
+    print(f"  periods recovered:  {recovered}")
+    print(f"  source gaps:        {source_gaps_count}")
     print(f"  requests made:      {requests_made}")
     if failures > 0:
         print(f"  failures:           {failures}")
@@ -2110,9 +2612,12 @@ def ingest_mix_range(
         dates_requested=dates_requested,
         dates_written=dates_written,
         dates_skipped=dates_skipped,
-        rows_total=rows_total,
+        rows_total=rows_total + recovered,
         duplicates_dropped=duplicates_dropped,
         failures=failures,
+        periods_recovered=recovered,
+        gaps_recorded=source_gaps_count,
     )
+
 
 

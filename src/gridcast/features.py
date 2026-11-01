@@ -33,12 +33,14 @@ LONDON_TZ: Final[ZoneInfo] = ZoneInfo("Europe/London")
 CURATED_DIR_DEFAULT: Final[Path] = Path("data/curated")
 WEATHER_DIR_DEFAULT: Final[Path] = Path("data/weather")
 MIX_DIR_DEFAULT: Final[Path] = Path("data/mix")
+AUDIT_DIR_DEFAULT: Final[Path] = Path("data/audit")
 
 
 def load_feature_sources(
     curated_dir: Path | str = CURATED_DIR_DEFAULT,
     weather_dir: Path | str = WEATHER_DIR_DEFAULT,
     mix_dir: Path | str = MIX_DIR_DEFAULT,
+    audit_dir: Path | str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load curated carbon intensity, weather, and generation mix DataFrames.
 
@@ -46,6 +48,7 @@ def load_feature_sources(
         curated_dir: Directory containing curated carbon intensity partitions.
         weather_dir: Directory containing weather partitions.
         mix_dir: Directory containing generation mix partitions.
+        audit_dir: Directory containing audit files (such as source-gaps.csv).
 
     Returns:
         tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: (intensity_df, weather_df, mix_df)
@@ -90,6 +93,34 @@ def load_feature_sources(
                 f"Previous-runs weather has null value at or after 2024-11-01 (date: {bad_date}). "
                 "Silent reanalysis fallback is strictly prohibited."
             )
+
+    # Report source gaps if recorded
+    a_path = (
+        Path(audit_dir)
+        if audit_dir is not None
+        else (
+            c_path.parent / "audit"
+            if (c_path.parent / "audit").exists()
+            else AUDIT_DIR_DEFAULT
+        )
+    )
+    sg_path = a_path / "source-gaps.csv"
+    if sg_path.exists():
+        try:
+            sg_df = pd.read_csv(sg_path)
+            if not sg_df.empty and "store" in sg_df.columns:
+                mix_g = sg_df[sg_df["store"] == "mix"]
+                weather_g = sg_df[sg_df["store"] == "weather"]
+                if not mix_g.empty or not weather_g.empty:
+                    print("\nFeature sources coverage audit:")
+                    if not mix_g.empty:
+                        reasons = ", ".join(mix_g["reason"].unique())
+                        print(f"  mix source gaps:     {len(mix_g)} periods affected ({reasons})")
+                    if not weather_g.empty:
+                        reasons = ", ".join(weather_g["reason"].unique())
+                        print(f"  weather source gaps: {len(weather_g)} hours affected ({reasons})")
+        except Exception:
+            pass
 
     return intensity_df, weather_df, mix_df
 
@@ -367,6 +398,26 @@ def build_feature_frame(
             raise ValueError(
                 f"Previous-runs temperature is null at or after 2024-11-01 for period {bad_ts}. "
                 "Silent reanalysis fallback is strictly prohibited."
+            )
+
+    # Make mix nulls explainable at point of use without imputation
+    if "mix_share_wind" in result.columns:
+        null_count = int(result["mix_share_wind"].isna().sum())
+        if null_count > 0:
+            sg_path = AUDIT_DIR_DEFAULT / "source-gaps.csv"
+            mix_gaps_count = 0
+            if sg_path.exists():
+                try:
+                    sg_df = pd.read_csv(sg_path)
+                    if not sg_df.empty and "store" in sg_df.columns:
+                        mix_gaps_count = len(sg_df[sg_df["store"] == "mix"])
+                except Exception:
+                    pass
+            warmup = null_count - mix_gaps_count
+            print(
+                f"Generation mix features: {null_count} null periods "
+                f"({mix_gaps_count} source gaps: upstream_empty, "
+                f"{warmup} warmup periods at t-48h; unimputed)"
             )
 
     # Enforce exact column order: period_start_utc + FEATURE_COLUMNS

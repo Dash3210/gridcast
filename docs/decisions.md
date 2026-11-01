@@ -150,4 +150,31 @@
   - Linear interpolation between bracketing hours `t.floor("h")` and `t.ceil("h")`: rejected because it synthesizes artificial intermediate temperatures not emitted by the NWP model, introduces an artificial dependency across day boundaries at `23:30`, and risks leaking post-cutoff values when a perturbation cutoff falls on a half-hour.
   - Forward-looking or nearest-hour rounding: rejected because rounding up looks forward into the subsequent hour.
 
+## ADR-009 — Store coverage is audited the same way the archive is
+- Status: accepted
+- Date: 2026-11-01
+- Context:
+  The curated carbon intensity archive enforces a strict completeness invariant: every settlement period is either present in daily Parquet partitions or recorded in `data/audit/gaps.csv`. Auxiliary feature stores (`data/weather/` and `data/mix/`) initially lacked post-fetch coverage checking, which permitted 27 half-hourly generation mix periods to be silently omitted across the two-year window (resulting in 123 null values across all mix feature columns without an audit trail).
+  Investigation revealed two distinct root causes:
+  1. Chunk-boundary straddling behaviour (2 periods): The NESO generation endpoint (`/generation/{from}/{to}`) emits the half-hour period straddling before `{from}`. When fetching in monthly chunks bounded by midnight, `2024-12-31T23:30Z` and `2025-12-31T23:30Z` were excluded from the December partition and dropped during January ingestion because January's date filter only retained January dates. Re-requesting with `period_start_utc + 30min` recovers both periods.
+  2. Upstream absent data (25 periods): Across `2025-01-12` (2 periods), `2025-01-13` (15 periods), `2025-08-10` (2 periods), and `2025-08-11` (6 periods) — identical to the dates where upstream intensity payloads returned malformed JSON — the generation mix endpoint returns `data: []`. These periods are genuinely absent upstream and unrecoverable.
+- Decision:
+  1. Auxiliary stores must be audited under the same standards as the curated intensity archive: no period may be silently absent.
+  2. Implement a post-fetch coverage check with targeted retries (`check_mix_coverage_and_retry`, `check_weather_coverage_and_retry`):
+     - After fetching, compare ingested period starts against the curated settlement grid.
+     - For missing periods, re-request targeted windows (e.g. `period_start_utc + 30min` for mix) to recover straddling boundary periods.
+  3. Record unrecoverable missing periods in `data/audit/source-gaps.csv` with columns `store,local_date,period_start_utc,reason` (`upstream_empty`).
+  4. Manage `source-gaps.csv` lazily (created only when gaps exist, unlinked when empty) and automatically reconcile recorded gaps if subsequent ingest runs acquire the data.
+  5. Add strict coverage verification in `make data-check` (`tests/test_data_integrity.py`):
+     - Every curated period must have a store row or a corresponding `source-gaps.csv` row.
+     - `source-gaps.csv` must contain no duplicate `(store, period_start_utc)` pairs.
+     - No recorded gap may overlap with an existing row in the store.
+  6. Feature generation must report source gaps and null counts transparently at the point of use (`load_feature_sources()`) without synthesising or imputing artificial values.
+- Consequences:
+  Auxiliary stores provide full auditability and coverage guarantees identical to the primary curated dataset. Boundary periods are recovered automatically, and upstream source gaps are explicitly recorded and tracked in git rather than producing silent null features.
+- Alternatives rejected:
+  - Silently imputing missing mix periods via forward-fill or mean fuel shares: rejected because it fabricates generation fuel mix observations and masks upstream outages.
+  - Ignoring auxiliary store holes because intensity actuals are complete: rejected because downstream models depend on auxiliary feature stores, and unrecorded holes violate data integrity standards.
+
+
 

@@ -2339,6 +2339,8 @@ def test_ingest_weather_and_mix_range_validation_and_failures(tmp_path: Path) ->
         client=failing_client,
         weather_dir=tmp_path / "w",
         cache_dir=tmp_path / "cw",
+        curated_dir=tmp_path / "c",
+        audit_dir=tmp_path / "a",
     )
     assert summary_w.failures == 2
 
@@ -2348,6 +2350,8 @@ def test_ingest_weather_and_mix_range_validation_and_failures(tmp_path: Path) ->
         client=failing_client,
         mix_dir=tmp_path / "m",
         cache_dir=tmp_path / "cm",
+        curated_dir=tmp_path / "c",
+        audit_dir=tmp_path / "a",
     )
     assert summary_m.failures == 2
 
@@ -2399,6 +2403,292 @@ def test_cli_weather_and_mix_subcommand(monkeypatch: pytest.MonkeyPatch) -> None
     code_m = cli.main(["ingest", "--mix", "--days", "2"])
     assert code_m == 0
     assert mix_called is True
+
+
+def test_mix_coverage_check_recovers_boundary_period(tmp_path: Path) -> None:
+    """A stubbed endpoint drops straddling period; retry must recover it."""
+    from gridcast.ingest import (
+        Client,
+        ingest_mix_range,
+        partition_path,
+        upsert_day,
+    )
+
+    curated_dir = tmp_path / "curated"
+    mix_dir = tmp_path / "mix"
+    audit_dir = tmp_path / "audit"
+    cache_dir = tmp_path / "cache"
+
+    d = date(2024, 12, 31)
+    # Populate curated partition for 2024-12-31 with all 48 periods
+    start_utc = datetime(2024, 12, 31, 0, 0, tzinfo=timezone.utc)
+    periods = [start_utc + timedelta(minutes=30 * i) for i in range(48)]
+    c_df = pd.DataFrame([
+        {
+            "period_start_utc": p,
+            "period_end_utc": p + timedelta(minutes=30),
+            "utc_date": p.date(),
+            "local_date": d,
+            "forecast": 100,
+            "actual": 100,
+            "index": "low",
+            "ingested_at": start_utc,
+        }
+        for p in periods
+    ])
+    c_df["period_start_utc"] = pd.to_datetime(c_df["period_start_utc"], utc=True)
+    c_df["period_end_utc"] = pd.to_datetime(c_df["period_end_utc"], utc=True)
+    c_df["ingested_at"] = pd.to_datetime(c_df["ingested_at"], utc=True)
+    c_df["forecast"] = c_df["forecast"].astype("Int32")
+    c_df["actual"] = c_df["actual"].astype("Int32")
+    c_df["index"] = c_df["index"].astype("string")
+    upsert_day(c_df, d, base_dir=curated_dir)
+
+    # Stub client: initial chunk drops 2024-12-31T23:30Z (returns 47 periods).
+    # Retry window beginning at following midnight (2025-01-01T00:00Z) returns 2024-12-31T23:30Z!
+    class StubClient(Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.retry_called = False
+
+        def get_generation_range(self, start_utc: datetime | str, end_utc: datetime | str) -> dict:
+            s_str = str(start_utc)
+            if "2025-01-01T00:00" in s_str:
+                self.retry_called = True
+                # Retry returns the straddling period
+                return {
+                    "data": [
+                        {
+                            "from": "2024-12-31T23:30Z",
+                            "to": "2025-01-01T00:00Z",
+                            "generationmix": [{"fuel": "wind", "perc": 40.0}],
+                        }
+                    ]
+                }
+            # Initial chunk returns 47 periods (drops the last period 23:30Z)
+            items = []
+            for p in periods[:-1]:
+                p_str = p.strftime("%Y-%m-%dT%H:%MZ")
+                p_end_str = (p + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%MZ")
+                items.append({
+                    "from": p_str,
+                    "to": p_end_str,
+                    "generationmix": [{"fuel": "wind", "perc": 30.0}],
+                })
+            return {"data": items}
+
+    client = StubClient()
+    summary = ingest_mix_range(
+        start=d,
+        end=d,
+        client=client,
+        mix_dir=mix_dir,
+        cache_dir=cache_dir,
+        curated_dir=curated_dir,
+        audit_dir=audit_dir,
+    )
+
+    assert client.retry_called is True
+    assert summary.periods_recovered == 1
+    assert summary.gaps_recorded == 0
+
+    p_mix = partition_path(d, base_dir=mix_dir)
+    assert p_mix.exists()
+    mix_df = pd.read_parquet(p_mix)
+    assert len(mix_df) == 48
+    assert pd.Timestamp("2024-12-31 23:30:00+00:00") in set(
+        pd.to_datetime(mix_df["period_start_utc"], utc=True)
+    )
+    assert not (audit_dir / "source-gaps.csv").exists()
+
+
+def test_unrecoverable_mix_period_recorded_as_source_gap(tmp_path: Path) -> None:
+    """An empty upstream response yields exactly one source gap row across two runs."""
+    from gridcast.ingest import (
+        Client,
+        ingest_mix_range,
+        upsert_day,
+    )
+
+    curated_dir = tmp_path / "curated"
+    mix_dir = tmp_path / "mix"
+    audit_dir = tmp_path / "audit"
+    cache_dir = tmp_path / "cache"
+
+    d = date(2025, 1, 13)
+    start_utc = datetime(2025, 1, 13, 0, 0, tzinfo=timezone.utc)
+    periods = [start_utc + timedelta(minutes=30 * i) for i in range(48)]
+    c_df = pd.DataFrame([
+        {
+            "period_start_utc": p,
+            "period_end_utc": p + timedelta(minutes=30),
+            "utc_date": p.date(),
+            "local_date": d,
+            "forecast": 100,
+            "actual": 100,
+            "index": "low",
+            "ingested_at": start_utc,
+        }
+        for p in periods
+    ])
+    c_df["period_start_utc"] = pd.to_datetime(c_df["period_start_utc"], utc=True)
+    c_df["period_end_utc"] = pd.to_datetime(c_df["period_end_utc"], utc=True)
+    c_df["ingested_at"] = pd.to_datetime(c_df["ingested_at"], utc=True)
+    c_df["forecast"] = c_df["forecast"].astype("Int32")
+    c_df["actual"] = c_df["actual"].astype("Int32")
+    c_df["index"] = c_df["index"].astype("string")
+    upsert_day(c_df, d, base_dir=curated_dir)
+
+    # Client returns 47 periods initially and empty on retry
+    class EmptyRetryClient(Client):
+        def get_generation_range(self, start_utc: datetime | str, end_utc: datetime | str) -> dict:
+            # Retry for missing period 0 starts at 00:30Z -> return empty
+            if "00:30" in str(start_utc):
+                return {"data": []}
+            # Initial chunk returns periods 1 through 47 (drops period 0: 00:00Z)
+            items = []
+            for p in periods[1:]:
+                p_str = p.strftime("%Y-%m-%dT%H:%MZ")
+                p_end_str = (p + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%MZ")
+                items.append({
+                    "from": p_str,
+                    "to": p_end_str,
+                    "generationmix": [{"fuel": "wind", "perc": 30.0}],
+                })
+            return {"data": items}
+
+    client = EmptyRetryClient()
+    # First run
+    s1 = ingest_mix_range(
+        start=d,
+        end=d,
+        client=client,
+        mix_dir=mix_dir,
+        cache_dir=cache_dir,
+        curated_dir=curated_dir,
+        audit_dir=audit_dir,
+    )
+    assert s1.gaps_recorded == 1
+    assert s1.periods_recovered == 0
+
+    gaps_file = audit_dir / "source-gaps.csv"
+    assert gaps_file.exists()
+    gaps_df1 = pd.read_csv(gaps_file)
+    assert len(gaps_df1) == 1
+    assert gaps_df1.iloc[0]["store"] == "mix"
+    assert gaps_df1.iloc[0]["reason"] == "upstream_empty"
+
+    # Second run: should remain exactly 1 row, no duplicates
+    s2 = ingest_mix_range(
+        start=d,
+        end=d,
+        client=client,
+        mix_dir=mix_dir,
+        cache_dir=cache_dir,
+        curated_dir=curated_dir,
+        audit_dir=audit_dir,
+        force=True,
+    )
+    assert s2.dates_requested == 1
+    assert gaps_file.exists()
+    gaps_df2 = pd.read_csv(gaps_file)
+    assert len(gaps_df2) == 1
+
+
+def test_source_gap_reconciled_when_data_appears(tmp_path: Path) -> None:
+    """A later successful fetch removes the recorded gap."""
+    from gridcast.ingest import (
+        Client,
+        ingest_mix_range,
+        upsert_day,
+    )
+
+    curated_dir = tmp_path / "curated"
+    mix_dir = tmp_path / "mix"
+    audit_dir = tmp_path / "audit"
+    cache_dir = tmp_path / "cache"
+
+    d = date(2025, 1, 13)
+    start_utc = datetime(2025, 1, 13, 0, 0, tzinfo=timezone.utc)
+    periods = [start_utc + timedelta(minutes=30 * i) for i in range(48)]
+    c_df = pd.DataFrame([
+        {
+            "period_start_utc": p,
+            "period_end_utc": p + timedelta(minutes=30),
+            "utc_date": p.date(),
+            "local_date": d,
+            "forecast": 100,
+            "actual": 100,
+            "index": "low",
+            "ingested_at": start_utc,
+        }
+        for p in periods
+    ])
+    c_df["period_start_utc"] = pd.to_datetime(c_df["period_start_utc"], utc=True)
+    c_df["period_end_utc"] = pd.to_datetime(c_df["period_end_utc"], utc=True)
+    c_df["ingested_at"] = pd.to_datetime(c_df["ingested_at"], utc=True)
+    c_df["forecast"] = c_df["forecast"].astype("Int32")
+    c_df["actual"] = c_df["actual"].astype("Int32")
+    c_df["index"] = c_df["index"].astype("string")
+    upsert_day(c_df, d, base_dir=curated_dir)
+
+    # Pre-record a gap in source-gaps.csv for period 0
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    gaps_file = audit_dir / "source-gaps.csv"
+    p0_str = pd.Timestamp(periods[0]).isoformat()
+    gaps_file.write_text(
+        f"store,local_date,period_start_utc,reason\nmix,{d.isoformat()},{p0_str},upstream_empty\n",
+        encoding="utf-8",
+    )
+
+    # Now a client returns all 48 periods
+    class FullClient(Client):
+        def get_generation_range(self, start_utc: datetime | str, end_utc: datetime | str) -> dict:
+            items = []
+            for p in periods:
+                p_str = p.strftime("%Y-%m-%dT%H:%MZ")
+                p_end_str = (p + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%MZ")
+                items.append({
+                    "from": p_str,
+                    "to": p_end_str,
+                    "generationmix": [{"fuel": "wind", "perc": 30.0}],
+                })
+            return {"data": items}
+
+    client = FullClient()
+    ingest_mix_range(
+        start=d,
+        end=d,
+        client=client,
+        mix_dir=mix_dir,
+        cache_dir=cache_dir,
+        curated_dir=curated_dir,
+        audit_dir=audit_dir,
+        force=True,
+    )
+
+    # File should be deleted when empty
+    assert not gaps_file.exists()
+
+
+def test_weather_coverage_is_complete() -> None:
+    """Zero missing hours across the window, no gaps file for weather."""
+    curated = pd.read_parquet("data/curated")
+    weather = pd.read_parquet("data/weather")
+
+    c_starts = pd.to_datetime(curated["period_start_utc"], utc=True)
+    w_starts = set(pd.to_datetime(weather["period_start_utc"], utc=True))
+
+    c_hours = set(c_starts.dt.floor("h"))
+    missing_hours = c_hours - w_starts
+    assert len(missing_hours) == 0, f"Found missing weather hours: {missing_hours}"
+
+    source_gaps = Path("data/audit/source-gaps.csv")
+    if source_gaps.exists():
+        gaps_df = pd.read_csv(source_gaps)
+        weather_gaps = gaps_df[gaps_df["store"] == "weather"]
+        assert len(weather_gaps) == 0, f"Found recorded weather gaps: {weather_gaps}"
+
 
 
 

@@ -112,7 +112,7 @@ data/
   weather/     # Committed daily weather partitions (hourly previous-runs day 2)
   mix/         # Committed daily generation mix partitions (half-hourly fuel shares)
   cache/       # Ephemeral raw HTTP caches (http, weather, mix)
-  audit/       # Gaps and conflicts audit logs
+  audit/       # Gaps, source-gaps, and conflicts audit logs
 ```
 
 - **Curated Intensity Schema Contract**:
@@ -155,6 +155,12 @@ data/
   - A `null` forecast also occurs in the dataset (43 rows across three historical dates: `2025-01-12`, `2025-01-13`, and `2025-08-11`). On these dates, the upstream date endpoint (`/intensity/date`) emitted malformed/invalid JSON, and the `/intensity/{from}/{to}` range fallback endpoint had genuinely absent forecast values. These absent values are preserved as null rather than synthesised.
   - `data/audit/gaps.csv` is created only when a gap exists, which is why it may be absent in clean runs. When actuals publish downstream and a date is re-ingested with `--force`, stale `missing_actual` records are reconciled and removed, and the file is deleted if empty.
 
+- **Auxiliary Store Coverage and Source Gaps (ADR-009)**:
+  - Both auxiliary stores (`data/mix/` and `data/weather/`) are subject to the same strict completeness invariant as the curated intensity archive: every period is either present in storage or recorded in `data/audit/source-gaps.csv`.
+  - Ingestion performs an automated post-fetch coverage check against the curated grid (`check_mix_coverage_and_retry`, `check_weather_coverage_and_retry`). For missing periods, targeted retries recover boundary straddling periods (e.g. `2024-12-31T23:30Z` and `2025-12-31T23:30Z` on month boundaries).
+  - Periods that remain missing after retries because upstream returns empty payloads (`data: []`) are audited in `data/audit/source-gaps.csv` (`store,local_date,period_start_utc,reason`). In the current window, 25 generation mix periods across `2025-01-12`, `2025-01-13`, `2025-08-10`, and `2025-08-11` are documented source gaps (`upstream_empty`), while weather coverage is 100% complete.
+  - At the point of use in feature extraction, mix feature columns reflect these 25 unrecoverable periods as nulls alongside the initial 96 warmup periods (at `t-48h`). These are reported transparently in `load_feature_sources()` and are never artificially imputed.
+
 - **Upstream Retractions and Conflict Audit**:
   - When an incoming payload offers a null where a non-null observation already exists in storage, this indicates an upstream disagreement or retraction. Gridcast treats `actual` and `index` as an atomic observation, never overwriting existing non-null observations with incoming nulls.
   - Disagreements between upstream responses are logged once in `data/audit/conflicts.csv` (`local_date,period_start_utc,field,stored_value`) to keep retractions visible rather than silent.
@@ -187,6 +193,7 @@ print(f"Loaded {len(df):,} rows successfully across {df['local_date'].nunique()}
 **Audit Files**:
 Audit logs are stored in `data/audit/` and created lazily only when anomalies occur:
 - `data/audit/gaps.csv`: Records genuinely missing observations (`missing_actual` when an actual remains unpublished >2 hours post period end) or omitted periods withheld by upstream (`missing_period`). When downstream actuals publish and a date is re-ingested with `--force`, stale `missing_actual` entries are automatically reconciled and dropped, and the file is deleted if no gaps remain.
+- `data/audit/source-gaps.csv`: Records settlement periods genuinely absent from auxiliary stores (`mix` or `weather`) where the upstream API returned empty responses (`upstream_empty`) after targeted boundary retries. Created lazily, automatically reconciled if data appears on subsequent re-ingestion, and strictly verified by `make data-check`.
 - `data/audit/conflicts.csv`: Records upstream retractions where an incoming payload presents a null value for a period where a non-null observation is already stored in curated partitions.
 
 Everything else fails on purpose:
@@ -219,8 +226,10 @@ gridcast/
 |   |-- test_ingest.py    # Unit and integration tests for ingest pipeline and schema
 |   `-- test_data_integrity.py # Invariant assertions for committed curated partitions
 `-- data/
-    |-- audit/            # Audited anomalies: gaps.csv and conflicts.csv (created lazily)
+    |-- audit/            # Audited anomalies: gaps.csv, source-gaps.csv, conflicts.csv (created lazily)
     |-- cache/
     |   `-- http/         # Raw gzipped HTTP cache replay buffer (gitignored, 90-day retention)
-    `-- curated/          # Committed append-only daily Parquet partitions (pure Parquet dataset)
+    |-- curated/          # Committed append-only daily Parquet partitions (pure Parquet dataset)
+    |-- mix/              # Committed daily generation mix Parquet partitions
+    `-- weather/          # Committed daily weather forecast Parquet partitions
 ```
