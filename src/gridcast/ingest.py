@@ -63,6 +63,7 @@ __all__: list[str] = [
     "payload_to_frame",
     "prune_cache",
     "read_partition",
+    "reconcile_recent",
     "record_conflicts",
     "record_gaps",
     "upsert_day",
@@ -1340,3 +1341,106 @@ def prune_cache(
             logger.warning("Error pruning cache file %s: %s", entry, exc)
 
     return pruned
+
+
+def reconcile_recent(
+    window_days: int = 3,
+    client: Client | None = None,
+    cache_dir: Path | None = None,
+    curated_dir: Path | None = None,
+    audit_dir: Path | None = None,
+    today: date | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Reconcile recent partitions that contain pending null actuals or gaps.
+
+    Selects dates in [today - (window_days - 1), today] whose partition contains
+    a null actual, OR which appear in data/audit/gaps.csv.
+    For each qualifying date, bypasses the cache and fetches live (at most one request
+    per date per run), coalescing observations into the curated partition.
+
+    Returns the count of dates reconciled.
+    """
+    if window_days < 1:
+        raise ValueError(f"window_days must be at least 1, got {window_days}")
+
+    target_curated = curated_dir if curated_dir is not None else CURATED_DIR_DEFAULT
+    if audit_dir is not None:
+        target_audit = audit_dir
+    elif target_curated.name == "curated":
+        target_audit = target_curated.parent / "audit"
+    else:
+        target_audit = target_curated
+    gaps_file = target_audit / "gaps.csv"
+
+    eval_today = today if today is not None else datetime.now(LONDON_TZ).date()
+    start_date = eval_today - timedelta(days=window_days - 1)
+
+    # 1. Read dates recorded in gaps.csv
+    gap_dates: set[str] = set()
+    if gaps_file.exists():
+        try:
+            with open(gaps_file, newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header:
+                    for row in reader:
+                        if row:
+                            gap_dates.add(row[0])
+        except Exception as exc:
+            logger.warning("Error reading gaps file %s: %s", gaps_file, exc)
+
+    # 2. Identify qualifying dates in [start_date, eval_today]
+    qualifying_dates: list[date] = []
+    curr = start_date
+    while curr <= eval_today:
+        d_str = str(curr)
+        qualifies = False
+
+        if d_str in gap_dates:
+            qualifies = True
+        else:
+            p_path = partition_path(curr, target_curated)
+            if p_path.exists():
+                part = read_partition(curr, target_curated)
+                if part is not None and "actual" in part.columns and part["actual"].isna().any():
+                    qualifies = True
+
+        if qualifies:
+            qualifying_dates.append(curr)
+
+        curr += timedelta(days=1)
+
+    # 3. If nothing qualifies, make no requests at all
+    if not qualifying_dates:
+        print("reconciled: 0 date(s)")
+        return 0
+
+    client_inst = client or Client()
+    now_ts = now or datetime.now(UTC_TZ)
+
+    reconciled_count = 0
+    for d in qualifying_dates:
+        try:
+            res = ingest_day(
+                local_date=d,
+                client=client_inst,
+                force=True,  # Bypass cache and fetch live
+                cache_dir=cache_dir,
+                curated_dir=target_curated,
+                audit_dir=target_audit,
+                today=eval_today,
+                ingested_at=now_ts,
+            )
+            reconciled_count += 1
+            print(
+                f"{d}: reconciled ({res.rows_refreshed} rows refreshed, "
+                f"{res.nulls_remaining} actuals pending)"
+            )
+        except Exception as exc:
+            print(f"{d}: reconcile FAILED ({exc})")
+            logger.error("Failed to reconcile date %s: %s", d, exc, exc_info=True)
+
+    print(f"reconciled: {reconciled_count} date(s)")
+    return reconciled_count
+

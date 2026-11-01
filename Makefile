@@ -41,6 +41,7 @@ clean:
 
 ingest:
 	"$(PY)" -m gridcast ingest --days 2
+	"$(PY)" -m gridcast ingest --reconcile-recent
 
 train:
 	"$(PY)" -m gridcast.cli train

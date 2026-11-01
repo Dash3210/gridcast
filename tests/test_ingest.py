@@ -7,6 +7,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -14,6 +15,7 @@ import requests
 
 from gridcast.ingest import (
     Client,
+    dst_row_count,
     expected_row_count,
     fetch_day,
     ingest_day,
@@ -22,6 +24,7 @@ from gridcast.ingest import (
     payload_to_frame,
     prune_cache,
     read_partition,
+    reconcile_recent,
     record_gaps,
     upsert_day,
     write_partition_atomic,
@@ -1849,6 +1852,163 @@ def test_gap_reconciled_when_actual_arrives(normal_payload: dict, tmp_path: Path
 
     # gaps.csv reconciled: missing_actual dropped; file absent when empty
     assert not gaps_file.exists()
+
+
+def _make_payload_for_date(d: date, actual: int | None = 150) -> dict:
+    count = dst_row_count(d)
+    start_local = datetime(d.year, d.month, d.day, 0, 0, tzinfo=ZoneInfo("Europe/London"))
+    start_utc = start_local.astimezone(timezone.utc)
+    data = []
+    for i in range(count):
+        p_from = start_utc + timedelta(minutes=30 * i)
+        p_to = p_from + timedelta(minutes=30)
+        data.append({
+            "from": p_from.strftime("%Y-%m-%dT%H:%MZ"),
+            "to": p_to.strftime("%Y-%m-%dT%H:%MZ"),
+            "intensity": {
+                "forecast": 140,
+                "actual": actual,
+                "index": "moderate",
+            },
+        })
+    return {"data": data}
+
+
+class TestReconcileRecent:
+    """Test suite for gridcast ingest --reconcile-recent functionality."""
+
+    def test_reconcile_recent_qualifying_and_non_qualifying(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Verify:
+        - recent date with null is refetched
+        - settled recent date with no nulls and no gap record is not fetched
+        - date outside the window is never touched
+        - call count is exactly one per qualifying date.
+        """
+        curated_dir = tmp_path / "curated"
+        audit_dir = tmp_path / "audit"
+        cache_dir = tmp_path / "cache"
+
+        curated_dir.mkdir(parents=True)
+        audit_dir.mkdir(parents=True)
+        cache_dir.mkdir(parents=True)
+
+        today = date(2026, 11, 1)
+        # Window of 3 days: [2026-10-30, 2026-10-31, 2026-11-01]
+        # Outside window: 2026-10-29
+
+        d_outside = date(2026, 10, 29)
+        d_recent_null = date(2026, 10, 30)
+        d_recent_settled = date(2026, 10, 31)
+        d_today_gaps = date(2026, 11, 1)
+
+        # 1. Create partition outside window with a null (should NOT be touched)
+        p_outside = _make_payload_for_date(d_outside, actual=None)
+        frame_outside = payload_to_frame(p_outside, d_outside)
+        write_partition_atomic(frame_outside, d_outside, curated_dir)
+
+        # 2. Create partition inside window with a null (qualifies and MUST be refetched)
+        p_null = _make_payload_for_date(d_recent_null, actual=None)
+        frame_null = payload_to_frame(p_null, d_recent_null)
+        write_partition_atomic(frame_null, d_recent_null, curated_dir)
+
+        # 3. Partition inside window with NO nulls / gaps (settled, MUST NOT be refetched)
+        p_settled = _make_payload_for_date(d_recent_settled, actual=150)
+        frame_settled = payload_to_frame(p_settled, d_recent_settled)
+        write_partition_atomic(frame_settled, d_recent_settled, curated_dir)
+
+        # 4. Create today partition with a gap record in gaps.csv (qualifies and MUST be refetched)
+        p_today = _make_payload_for_date(d_today_gaps, actual=150)
+        frame_today = payload_to_frame(p_today, d_today_gaps)
+        write_partition_atomic(frame_today, d_today_gaps, curated_dir)
+        gaps_file = audit_dir / "gaps.csv"
+        gaps_file.write_text(
+            f"local_date,period_start_utc,reason\n{d_today_gaps},2026-11-01T00:00:00Z,missing_actual\n",
+            encoding="utf-8",
+        )
+
+        mock_client = MagicMock()
+        mock_client.get_day.side_effect = lambda d: _make_payload_for_date(d, actual=160)
+
+        # Run reconcile_recent with window_days=3
+        reconciled_count = reconcile_recent(
+            window_days=3,
+            client=mock_client,
+            cache_dir=cache_dir,
+            curated_dir=curated_dir,
+            audit_dir=audit_dir,
+            today=today,
+        )
+
+        # Exactly 2 dates qualified: d_recent_null and d_today_gaps
+        assert reconciled_count == 2
+
+        # The call count is exactly one per qualifying date
+        assert mock_client.get_day.call_count == 2
+        called_dates = [call.args[0] for call in mock_client.get_day.call_args_list]
+        assert called_dates == [d_recent_null, d_today_gaps]
+
+        # Outside date was never touched
+        assert d_outside not in called_dates
+
+        # Settled date with no nulls was never touched
+        assert d_recent_settled not in called_dates
+
+    def test_reconcile_recent_zero_qualifying_makes_no_requests(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When no date qualifies, make no requests at all and report reconciled: 0."""
+        curated_dir = tmp_path / "curated"
+        audit_dir = tmp_path / "audit"
+        curated_dir.mkdir(parents=True)
+        audit_dir.mkdir(parents=True)
+
+        today = date(2026, 11, 1)
+        # Create complete partitions with no nulls
+        for offset in range(3):
+            d = today - timedelta(days=offset)
+            frame = payload_to_frame(_make_payload_for_date(d, actual=150), d)
+            write_partition_atomic(frame, d, curated_dir)
+
+        mock_client = MagicMock()
+
+        count = reconcile_recent(
+            window_days=3,
+            client=mock_client,
+            curated_dir=curated_dir,
+            audit_dir=audit_dir,
+            today=today,
+        )
+
+        assert count == 0
+        assert mock_client.get_day.call_count == 0
+        captured = capsys.readouterr()
+        assert "reconciled: 0 date(s)" in captured.out
+
+    def test_cli_reconcile_recent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Test CLI routing for gridcast ingest --reconcile-recent [--window-days 3]."""
+        from gridcast import cli
+
+        called_kwargs: dict[str, object] = {}
+
+        def fake_reconcile(window_days: int = 3, **kwargs: object) -> int:
+            called_kwargs["window_days"] = window_days
+            called_kwargs.update(kwargs)
+            return 1
+
+        monkeypatch.setattr("gridcast.cli.reconcile_recent", fake_reconcile)
+
+        code = cli.main(["ingest", "--reconcile-recent", "--window-days", "4"])
+        assert code == 0
+        assert called_kwargs.get("window_days") == 4
+
 
 
 

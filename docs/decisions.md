@@ -97,3 +97,39 @@
 - Alternatives rejected:
   - Overriding the reviewer's verdict on the operator's authority (rejected: it makes the verdict meaningless and hides the circularity instead of removing it).
   - Letting reviewers block on publication (rejected: it creates a deadlock in which a phase can never ship because it is not yet shipped).
+
+## ADR-006 — Weather source: previous-runs forecast issued 48 hours earlier (D1)
+- Status: accepted
+- Date: 2026-11-01
+- Context:
+  Weather is a primary driver of space heating and electricity demand across Great Britain. However, historical weather providers present a critical train/serve trap:
+  - Open-Meteo reanalysis (`archive-api.open-meteo.com`) reconstructs what weather *was* with full hindsight. It was not available to a forecaster at issue time.
+  - Open-Meteo historical-forecast (`historical-forecast-api.open-meteo.com`) emits a blended series that overwrites prior predictions and conceals forecast issue time.
+  - Open-Meteo previous-runs (`previous-runs-api.open-meteo.com/v1/forecast`) provides explicit run-lagged outputs (`temperature_2m_previous_day1`, `temperature_2m_previous_day2`, `temperature_2m_previous_day3`), exposing what was actually predicted one, two, and three days prior.
+  Reanalysis and day-ahead forecast differ by up to 5 °C on heating-critical winter days. Substituting reanalysis creates severe target leakage and train/serve skew.
+- Decision:
+  1. The weather feature for target period `t` is strictly `temperature_2m_previous_day2` evaluated at `t`. This matches the operational 48-hour day-ahead forecast horizon honestly.
+  2. Never use `archive-api` reanalysis anywhere in gridcast.
+  3. Never mix reanalysis and forecast series in one feature set.
+  4. If previous-runs emits null for a period within the window, the feature remains null; do not silently impute or fall back to reanalysis. Tests fail loudly on any violation.
+- Consequences:
+  The feature layer reproduces the exact information set available to an operational model at issue time `t-48h`. Reanalysis leakage is prevented by contract.
+- Alternatives rejected:
+  - ERA5/Open-Meteo reanalysis (rejected: severe retrospective leakage; what was observed is not what was forecasted).
+  - Blended historical forecast API (rejected: hides issue time and mutates historical forecasts retroactively).
+
+## ADR-007 — Evaluation gate policy: validation-fixed accuracy threshold and single-score test split
+- Status: accepted
+- Date: 2026-11-01
+- Context:
+  `make eval` executes the backtesting benchmark against the National Energy System Operator (NESO) official baseline forecast. To avoid data snooping and threshold p-hacking, the accuracy gate policy must be codified before model training (P3) and containerised CI (P5) are implemented. `make eval` is deliberately not wired into CI at P2 or P5 until P3 establishes a validated backtest.
+- Decision:
+  1. The evaluation accuracy gate threshold is fixed exclusively from the **validation** split, prior to scoring the test split.
+  2. The held-out test split is scored exactly once per model candidate and is never used to tune hyperparameters, select features, or adjust the accuracy gate threshold.
+  3. The evaluation threshold, split partition dates, and NESO operator baseline comparison metrics must be permanently documented in the model card upon determination.
+- Consequences:
+  Prevents overfitting to the test split and guarantees unbiased model verification when CI gating is activated. Binding on Phases P3 and P5.
+- Alternatives rejected:
+  - Wiring an uncalibrated evaluation gate into CI at P2 (rejected: violates honest phase gating; backtest arrives in P3).
+  - Iteratively tuning model thresholds against the test split (rejected: classic test-set contamination and data leakage).
+

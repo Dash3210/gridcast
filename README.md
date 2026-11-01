@@ -2,7 +2,7 @@
 
 **Target.** gridcast is a containerised forecasting service for Great Britain's half-hourly grid carbon intensity, forecasting 48 hours ahead and gated in CI on forecast accuracy. It aims to answer whether a solo open-source model can beat the National Energy System Operator's (NESO) official day-ahead forecast on a permanent, public scoreboard.
 
-> Phase P1 complete: half-hourly API data ingest to append-only daily Parquet partitions is operational; downstream modeling and service phases arrive in subsequent milestones. The status table below is the honest state.
+> Phase P2 complete: feature extraction layer and temporal leakage test suite are operational; downstream modeling and service phases arrive in subsequent milestones. The status table below is the honest state.
 
 > Note: Upon completion of Phase P7, this README will open with the live forecast-vs-actual scoreboard table comparing gridcast models against the NESO day-ahead baseline, positioned directly above the Quickstart.
 
@@ -12,8 +12,8 @@
 |---|---|---|
 | P0 | Setup: repository skeleton, environment, CLI gating, and smoke tests | done |
 | P1 | Ingest: half-hourly API fetch to append-only Parquet daily partitions | done |
-| P2 | Features: feature extraction and temporal leakage test suite | next |
-| P3 | Models: baseline models, backtesting engine, and accuracy gate vs NESO | not started |
+| P2 | Features: feature extraction and temporal leakage test suite | done |
+| P3 | Models: baseline models, backtesting engine, and accuracy gate vs NESO | next |
 | P4 | Service: FastAPI prediction API and Prometheus metrics endpoint | not started |
 | P5 | Packaging: Docker containerisation and GitHub Actions CI workflow | not started |
 | P6 | Verification: deliberately failing pull request demonstrating accuracy gate | not started |
@@ -75,13 +75,26 @@ python -m gridcast version
 
 ## What works today
 
-Today (Phase P1), the working automation targets are:
+Today (Phase P2), the working automation targets are:
 - `make install` — creates the virtual environment and installs dependencies in editable mode
-- `make test` — runs the test suite with coverage enforcement (>= 85%)
+- `make test` — runs the test suite with coverage enforcement (>= 85%) and temporal leakage validation
 - `make lint` — checks codebase formatting and linting rules with ruff
 - `make typecheck` — validates static typing with mypy across `src` and `tests`
 - `make clean` — removes virtual environment, caches, and build artefacts
-- `make ingest` — runs the nightly half-hourly ingest CLI (`gridcast ingest --days 2`)
+- `make ingest` — runs the nightly half-hourly ingest CLI (`gridcast ingest --days 2` followed by `gridcast ingest --reconcile-recent`)
+- `make data-check` — asserts integrity and completeness of the committed curated dataset
+
+### Features
+
+Phase P2 provides a bounded, leakage-free feature construction pipeline in `gridcast.features`:
+- **Temporal Integrity**: Enforces that no feature at target period `t` uses any value stamped after `t`. Verified via future-perturbation invariance tests across multiple cutoffs (mid-window, DST transitions, and dataset boundary).
+- **Time-based Keying**: All lags and rolling stats are keyed and sorted by `period_start_utc` timestamp lookup rather than row positions, ensuring correctness across 46-period (spring forward) and 50-period (autumn back) clock changes.
+- **Bounded Feature Set (ADR-006 / D3)**:
+  - *Actual Lags*: `actual_lag_1h`, `actual_lag_2h`, `actual_lag_3h`, `actual_lag_24h`, `actual_lag_48h`, `actual_lag_168h`.
+  - *Actual Rolling Stats*: 3h, 24h, and 168h rolling mean and std, each window strictly ending at `t-1h`.
+  - *Calendar*: `hour_of_day`, `day_of_week`, `month`, `is_weekend`, `is_uk_bank_holiday` (from static 2024-2027 register), plus sin/cos cyclical encodings of hour and day-of-year.
+  - *Weather*: Open-Meteo previous-runs day-2 forecast temperature at `t` (matching the 48-hour issue horizon; reanalysis is forbidden), plus 24h mean and 24h min ending at `t`.
+  - *Generation Mix*: Observed fuel shares for `wind`, `solar`, `gas`, `coal`, `nuclear`, and `biomass` lagged to `t-48h` to prevent contemporaneous leakage.
 
 ### Ingest
 

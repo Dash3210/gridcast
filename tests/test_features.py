@@ -8,7 +8,7 @@ and proves that leaks in actuals, weather, or generation mix fail loudly.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,7 +21,7 @@ from gridcast.features import (
     build_feature_frame,
     max_source_timestamp_allowed,
 )
-from gridcast.holidays import UK_BANK_HOLIDAYS
+from gridcast.holidays import UK_BANK_HOLIDAYS, is_uk_bank_holiday
 
 LONDON_TZ = ZoneInfo("Europe/London")
 UTC_TZ = timezone.utc
@@ -40,7 +40,8 @@ def create_synthetic_auxiliary_data(
     hours = (ts_sorted - ts_sorted.iloc[0]).dt.total_seconds() / 3600.0
     day_of_year = ts_sorted.dt.dayofyear
     seasonal_temp = 12.0 + 8.0 * np.sin(2 * np.pi * (day_of_year - 100) / 365.25)
-    diurnal_temp = 3.0 * np.sin(2 * np.pi * (ts_sorted.dt.hour + ts_sorted.dt.minute / 60.0 - 9) / 24.0)
+    minute_frac = ts_sorted.dt.minute / 60.0
+    diurnal_temp = 3.0 * np.sin(2 * np.pi * (ts_sorted.dt.hour + minute_frac - 9) / 24.0)
     temps = seasonal_temp + diurnal_temp + np.sin(hours / 17.0) * 1.5
 
     weather_df = pd.DataFrame({
@@ -51,15 +52,23 @@ def create_synthetic_auxiliary_data(
     # Generation mix: shares of 9 fuels summing to 100%
     base_wind = 25.0 + 10.0 * np.sin(hours / 23.0)
     base_solar = np.maximum(0.0, 15.0 * np.sin(np.pi * (ts_sorted.dt.hour - 6) / 12.0))
-    base_nuclear = np.full(len(ts_sorted), 15.0)
-    base_biomass = np.full(len(ts_sorted), 6.0)
-    base_coal = np.full(len(ts_sorted), 1.5)
-    base_hydro = np.full(len(ts_sorted), 2.0)
-    base_imports = np.full(len(ts_sorted), 8.0)
-    base_other = np.full(len(ts_sorted), 1.5)
-    base_gas = 100.0 - (
-        base_wind + base_solar + base_nuclear + base_biomass + base_coal + base_hydro + base_imports + base_other
+    base_nuclear = 15.0 + 2.0 * np.sin(hours / 73.0)
+    base_biomass = 6.0 + 1.5 * np.cos(hours / 41.0)
+    base_coal = np.maximum(0.1, 1.5 + 0.8 * np.sin(hours / 67.0))
+    base_hydro = 2.0 + 0.5 * np.sin(hours / 19.0)
+    base_imports = 8.0 + 2.0 * np.cos(hours / 29.0)
+    base_other = 1.5 + 0.3 * np.sin(hours / 13.0)
+    non_gas = (
+        base_wind
+        + base_solar
+        + base_nuclear
+        + base_biomass
+        + base_coal
+        + base_hydro
+        + base_imports
+        + base_other
     )
+    base_gas = 100.0 - non_gas
 
     mix_df = pd.DataFrame({
         "period_start_utc": ts_sorted,
@@ -150,11 +159,16 @@ class TestTemporalLeakageInvariance:
         )
 
         # 4. Assert rows <= T are strictly identical
-        orig_subset = orig_features[orig_features["period_start_utc"] <= cutoff_time].reset_index(drop=True)
-        rebuilt_subset = rebuilt_features[rebuilt_features["period_start_utc"] <= cutoff_time].reset_index(drop=True)
+        orig_subset = orig_features[
+            orig_features["period_start_utc"] <= cutoff_time
+        ].reset_index(drop=True)
+        rebuilt_subset = rebuilt_features[
+            rebuilt_features["period_start_utc"] <= cutoff_time
+        ].reset_index(drop=True)
 
         assert len(orig_subset) == len(rebuilt_subset), (
-            f"Row count mismatch at cutoff {cutoff_desc}: {len(orig_subset)} vs {len(rebuilt_subset)}"
+            f"Row count mismatch at cutoff {cutoff_desc}: "
+            f"{len(orig_subset)} vs {len(rebuilt_subset)}"
         )
 
         # Check each column individually to identify leaking column by name if any
@@ -171,9 +185,9 @@ class TestTemporalLeakageInvariance:
                 orig_val = orig_subset.loc[first_diff_idx, col]
                 rebuilt_val = rebuilt_subset.loc[first_diff_idx, col]
                 pytest.fail(
-                    f"Temporal leakage detected in feature '{col}' at cutoff {cutoff_desc} ({cutoff_time})!\n"
-                    f"Mismatched rows: {mismatches} / {len(orig_subset)}\n"
-                    f"First difference at period_start_utc={bad_ts}: original={orig_val}, rebuilt={rebuilt_val}"
+                    f"Temporal leakage in '{col}' at {cutoff_desc} ({cutoff_time})!\n"
+                    f"Mismatches: {mismatches} / {len(orig_subset)}\n"
+                    f"Diff at {bad_ts}: orig={orig_val}, rebuilt={rebuilt_val}"
                 )
 
 
@@ -218,7 +232,9 @@ class TestFeatureContractAndInvariants:
         for col in FEATURE_COLUMNS:
             non_null = features[col].dropna()
             assert len(non_null) > 0, f"Feature column '{col}' is entirely null"
-            assert non_null.nunique() > 1, f"Dead feature: '{col}' is constant across the entire window"
+            assert (
+                non_null.nunique() > 1
+            ), f"Dead feature: '{col}' is constant across the entire window"
 
     def test_max_source_timestamp_allowed_helper(self) -> None:
         """Validate max_source_timestamp_allowed helper implementation."""
@@ -233,10 +249,18 @@ class TestFeatureContractAndInvariants:
         assert max_source_timestamp_allowed("actual_lag_168h", t) == t - pd.Timedelta(hours=168)
 
         # Rolling of actual: windows end at t-1h
-        assert max_source_timestamp_allowed("actual_rolling_3h_mean", t) == t - pd.Timedelta(hours=1)
-        assert max_source_timestamp_allowed("actual_rolling_3h_std", t) == t - pd.Timedelta(hours=1)
-        assert max_source_timestamp_allowed("actual_rolling_24h_mean", t) == t - pd.Timedelta(hours=1)
-        assert max_source_timestamp_allowed("actual_rolling_168h_mean", t) == t - pd.Timedelta(hours=1)
+        assert max_source_timestamp_allowed("actual_rolling_3h_mean", t) == t - pd.Timedelta(
+            hours=1
+        )
+        assert max_source_timestamp_allowed("actual_rolling_3h_std", t) == t - pd.Timedelta(
+            hours=1
+        )
+        assert max_source_timestamp_allowed("actual_rolling_24h_mean", t) == t - pd.Timedelta(
+            hours=1
+        )
+        assert max_source_timestamp_allowed("actual_rolling_168h_mean", t) == t - pd.Timedelta(
+            hours=1
+        )
 
         # Weather: previous_day2 forecast issued at t-48h
         assert max_source_timestamp_allowed("temperature", t) == t - pd.Timedelta(hours=48)
@@ -263,7 +287,8 @@ class TestFeatureContractAndInvariants:
 
         for feat in FEATURE_COLUMNS:
             cutoff = max_source_timestamp_allowed(feat, t_sample)
-            # The cutoff must be strictly before or at t for calendar, and <= t-1h for actual, <= t-48h for mix/weather
+            # The cutoff must be strictly before or at t for calendar,
+            # and <= t-1h for actual, <= t-48h for mix/weather
             if feat.startswith("actual_"):
                 assert cutoff <= t_sample - pd.Timedelta(hours=1), (
                     f"Feature '{feat}' allowed cutoff {cutoff} violates <= t-1h"
@@ -297,7 +322,7 @@ class TestLeakageTeethDemonstrations:
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ) -> None:
-        """Leak 2: archive-api reanalysis weather must be rejected; null previous-runs fails loudly."""
+        """Leak 2: archive-api reanalysis weather must be rejected."""
         intensity_df, _, mix_df = curated_sample_data
 
         # Providing reanalysis weather frame instead of previous_runs
@@ -306,14 +331,17 @@ class TestLeakageTeethDemonstrations:
             "temperature_reanalysis": [15.0] * len(intensity_df),
         })
 
-        with pytest.raises((ValueError, KeyError), match="(?i)(previous_day2|previous-runs|reanalysis)"):
+        with pytest.raises(
+            (ValueError, KeyError),
+            match="(?i)(previous_day2|previous-runs|reanalysis)",
+        ):
             build_feature_frame(intensity_df, weather_df=bad_weather, mix_df=mix_df)
 
     def test_weather_null_in_window_fails_loudly_without_reanalysis_fallback(
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ) -> None:
-        """D1: If previous-runs returns null in window, weather feature is null; fail loudly if fallback."""
+        """D1: If previous-runs is null in window, weather feature is null."""
         intensity_df, weather_df, mix_df = curated_sample_data
         bad_weather = weather_df.copy()
         # Null out some values inside window
@@ -376,3 +404,25 @@ class TestTimestampKeyingAndDST:
         assert date(2024, 12, 25) in UK_BANK_HOLIDAYS
         assert date(2025, 12, 25) in UK_BANK_HOLIDAYS
         assert date(2026, 12, 25) in UK_BANK_HOLIDAYS
+        assert is_uk_bank_holiday(date(2026, 12, 25)) is True
+        assert is_uk_bank_holiday(date(2026, 12, 24)) is False
+
+    def test_build_feature_frame_without_auxiliary_data(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """Building features with only intensity_df leaves weather and mix features null."""
+        intensity_df, _, _ = curated_sample_data
+        features = build_feature_frame(intensity_df)
+        assert features["temperature"].isna().all()
+        assert features["mix_share_wind"].isna().all()
+        assert not features["actual_lag_1h"].dropna().empty
+        assert not features["hour_of_day"].isna().any()
+
+    def test_missing_required_columns_raises(self) -> None:
+        """Missing period_start_utc or actual raises ValueError."""
+        with pytest.raises(ValueError, match="period_start_utc"):
+            build_feature_frame(pd.DataFrame({"actual": [100]}))
+        with pytest.raises(ValueError, match="actual"):
+            build_feature_frame(pd.DataFrame({"period_start_utc": [pd.Timestamp.now()]}))
+

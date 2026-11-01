@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from gridcast import __version__
 from gridcast._phase import todo
-from gridcast.ingest import ingest_range, prune_cache
+from gridcast.ingest import ingest_range, prune_cache, reconcile_recent
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,6 +58,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Drop raw cache older than 90 days, then exit.",
     )
+    ingest_parser.add_argument(
+        "--reconcile-recent",
+        action="store_true",
+        default=False,
+        help="Reconcile recent dates with pending null actuals or recorded gaps.",
+    )
+    ingest_parser.add_argument(
+        "--window-days",
+        type=int,
+        default=3,
+        help="Window size in days for --reconcile-recent (default: 3).",
+    )
 
     subparsers.add_parser("train", help="Train carbon intensity forecast models.")
     subparsers.add_parser("backtest", help="Run backtest against NESO baseline.")
@@ -83,6 +95,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         today = datetime.now(ZoneInfo("Europe/London")).date()
+
+        if (
+            args.reconcile_recent
+            and args.days is None
+            and args.recent is None
+            and args.start is None
+            and args.end is None
+        ):
+            reconcile_recent(window_days=args.window_days, today=today)
+            return 0
 
         if args.start is not None or args.end is not None:
             if args.start is None or args.end is None:
@@ -117,6 +139,10 @@ def main(argv: list[str] | None = None) -> int:
             end_date = today
 
         summary = ingest_range(start=start_date, end=end_date, force=args.force)
+
+        if args.reconcile_recent:
+            reconcile_recent(window_days=args.window_days, today=today)
+
         return 1 if summary.failures > 0 else 0
 
     if args.subcommand == "train":
