@@ -176,5 +176,19 @@
   - Silently imputing missing mix periods via forward-fill or mean fuel shares: rejected because it fabricates generation fuel mix observations and masks upstream outages.
   - Ignoring auxiliary store holes because intensity actuals are complete: rejected because downstream models depend on auxiliary feature stores, and unrecorded holes violate data integrity standards.
 
+## ADR-010 — A verification must assert worth, not only shape
+- Status: accepted
+- Date: 2026-11-01
+- Context: Three defects escaped a green suite during phases P1 and P2, each in the same form. A feature frame with nine of twenty-five columns entirely null passed, because the "no constant column" check filtered out null values before counting. A column that was 100% null is constant by any useful definition, and the suite asserted only that the frame had the right shape. A partition missing a period passed a row-count check nobody had written. An audit file that asserted the weather features were null made the gap look intended. In every case the check tested the presence of a thing rather than whether the thing carried information.
+- Decision:
+  1. A check on a dataset or a feature frame must assert a content property, not only row counts, column names or dtypes.
+  2. Specifically: no feature column may be entirely null; every period must be accounted for either by a stored value or by a recorded audit row; every reported metric must be reported beside the baseline it is compared with.
+  3. Shape assertions remain necessary and are never sufficient on their own.
+  4. A test that would pass equally well if the feature, store or metric were empty is a bug in the test, and is treated as a defect of the same severity as the code it was meant to guard.
+- Consequences: A green suite means the data carries information and the gaps are enumerated, rather than that the columns exist. It is slower to write such checks and they fail more often, which is the point.
+- Alternatives rejected:
+  - Relying on coverage percentages to indicate thoroughness (rejected: both escaped defects were found under 89% and 96% coverage).
+  - Relying on the generator's own test output as evidence (rejected: in each case the output was green and described the defect as normal behaviour).
+
 
 
