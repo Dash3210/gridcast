@@ -113,6 +113,7 @@ __all__: list[str] = [
     "load_feature_sources",
     "max_source_timestamp_allowed",
     "select_model_inputs",
+    "select_training_arrays",
     "split_by_issue_date",
 ]
 
@@ -224,6 +225,43 @@ def select_model_inputs(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Frame carries undeclared columns: {sorted(extra)}")
 
     return frame[FEATURE_COLUMNS].copy()
+
+
+def select_training_arrays(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Extract model feature matrix X and target y for training, safely dropping unsettled targets.
+
+    Drops all rows where label y is null, asserts no null remains in y (raising ValueError if
+    any does), and returns (X, y) with X positively selected via select_model_inputs.
+
+    LightGBM casts a null label to 0.0, which would teach the model fabricated zero-carbon
+    labels. Dropping null targets and verifying the resulting series is non-null prevents
+    this failure mode. select_model_inputs remains for inference where no label is involved.
+
+    Args:
+        frame: DataFrame produced by build_example_frame or split_by_issue_date.
+
+    Returns:
+        tuple[pd.DataFrame, pd.Series]: (X, y) where X contains exactly FEATURE_COLUMNS
+                                       and y contains strictly non-null float values.
+
+    Raises:
+        ValueError: If y is not in frame, if no valid training rows remain, or if any null
+                    remains in y.
+    """
+    if "y" not in frame.columns:
+        raise ValueError("frame must contain target column 'y'")
+
+    clean_frame = frame[frame["y"].notna()].copy()
+    if clean_frame.empty:
+        raise ValueError("No valid training rows remain after dropping null target 'y'")
+
+    y = clean_frame["y"].astype(float)
+    if y.isna().any():
+        raise ValueError("Target array 'y' contains null values after dropping unsettled rows")
+    assert not y.isna().any()
+
+    X = select_model_inputs(clean_frame)
+    return X, y
 
 
 def load_feature_sources(
@@ -684,7 +722,7 @@ def build_example_frame(
                 f"({mix_gaps_count} source gaps: upstream_empty; unimputed)"
             )
 
-    # 13. Drop incomplete leading issue dates from warmup (Section 5)
+    # 13. Drop incomplete leading issue dates from warmup
     should_trim = (issue_times is None) if trim_leading is None else trim_leading
     if should_trim and not result.empty:
         sg_path = AUDIT_DIR_DEFAULT / "source-gaps.csv"

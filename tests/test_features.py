@@ -27,6 +27,7 @@ from gridcast.features import (
     load_feature_sources,
     max_source_timestamp_allowed,
     select_model_inputs,
+    select_training_arrays,
     split_by_issue_date,
 )
 from gridcast.holidays import UK_BANK_HOLIDAYS, is_uk_bank_holiday
@@ -43,180 +44,154 @@ def curated_sample_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return load_feature_sources()
 
 
-# At least 25 (issue_time, horizon) pairs deliberately including:
-# - first issue time (2024-11-01)
-# - last issue time (2026-11-01)
-# - both DST spring-forward days (2025-03-30, 2026-03-29)
-# - both DST autumn-back days (2025-10-26, 2026-10-25)
-# - both ends of horizon range (h=1 and h=96)
-# - issue times adjacent to recorded source gaps in data/audit/source-gaps.csv
-#   (2025-01-12..14, 2025-08-10..12)
-SAMPLED_TEST_PAIRS: list[tuple[pd.Timestamp, int]] = [
-    # 1-2. First issue time (h=1, h=96)
-    (pd.Timestamp("2024-11-01 00:00:00+00:00"), 1),
-    (pd.Timestamp("2024-11-01 00:00:00+00:00"), 96),
-    # 3-4. Last issue time (h=1, h=96)
-    (pd.Timestamp("2026-11-01 00:00:00+00:00"), 1),
-    (pd.Timestamp("2026-11-01 00:00:00+00:00"), 96),
-    # 5-7. DST spring-forward 2025 (2025-03-30)
-    (pd.Timestamp("2025-03-30 00:00:00+00:00"), 1),
-    (pd.Timestamp("2025-03-30 00:00:00+00:00"), 48),
-    (pd.Timestamp("2025-03-30 00:00:00+00:00"), 96),
-    # 8-10. DST autumn-back 2025 (2025-10-26)
-    (pd.Timestamp("2025-10-26 00:00:00+00:00"), 1),
-    (pd.Timestamp("2025-10-26 00:00:00+00:00"), 48),
-    (pd.Timestamp("2025-10-26 00:00:00+00:00"), 96),
-    # 11-13. DST spring-forward 2026 (2026-03-29)
-    (pd.Timestamp("2026-03-29 00:00:00+00:00"), 1),
-    (pd.Timestamp("2026-03-29 00:00:00+00:00"), 48),
-    (pd.Timestamp("2026-03-29 00:00:00+00:00"), 96),
-    # 14-16. DST autumn-back 2026 (2026-10-25)
-    (pd.Timestamp("2026-10-25 00:00:00+00:00"), 1),
-    (pd.Timestamp("2026-10-25 00:00:00+00:00"), 48),
-    (pd.Timestamp("2026-10-25 00:00:00+00:00"), 96),
-    # 17-21. Adjacent to source gaps (2025-01-12, 2025-01-13)
-    (pd.Timestamp("2025-01-12 00:00:00+00:00"), 1),
-    (pd.Timestamp("2025-01-12 00:00:00+00:00"), 96),
-    (pd.Timestamp("2025-01-13 00:00:00+00:00"), 48),
-    (pd.Timestamp("2025-01-14 00:00:00+00:00"), 1),
-    (pd.Timestamp("2025-01-14 00:00:00+00:00"), 96),
-    # 22-26. Adjacent to source gaps (2025-08-11)
-    (pd.Timestamp("2025-08-10 00:00:00+00:00"), 1),
-    (pd.Timestamp("2025-08-10 00:00:00+00:00"), 96),
-    (pd.Timestamp("2025-08-11 00:00:00+00:00"), 48),
-    (pd.Timestamp("2025-08-12 00:00:00+00:00"), 1),
-    (pd.Timestamp("2025-08-12 00:00:00+00:00"), 96),
-    # 27-31. Mid-window samples with varied horizons
-    (pd.Timestamp("2025-06-01 00:00:00+00:00"), 1),
-    (pd.Timestamp("2025-06-01 00:00:00+00:00"), 24),
-    (pd.Timestamp("2025-06-01 00:00:00+00:00"), 72),
-    (pd.Timestamp("2025-06-01 00:00:00+00:00"), 96),
-    (pd.Timestamp("2026-01-15 00:00:00+00:00"), 10),
-    (pd.Timestamp("2026-01-15 00:00:00+00:00"), 96),
+# Realistic multi-issue frame test windows (at least 7 consecutive issue dates x 96 horizons)
+REALISTIC_INVARIANCE_WINDOWS: list[tuple[str, str, str]] = [
+    # Standard summer week
+    ("2025-06-01", "2025-06-07", "summer_week"),
+    # DST spring-forward week (contains 2025-03-30)
+    ("2025-03-27", "2025-04-02", "dst_spring_forward_week"),
+    # DST autumn-back week (contains 2025-10-26)
+    ("2025-10-23", "2025-10-29", "dst_autumn_back_week"),
+    # Source-gap adjacent week
+    ("2025-08-08", "2025-08-14", "gap_adjacent_week"),
 ]
 
 
 class TestTemporalLeakageInvariance:
-    """Core per-row future-perturbation invariance property (Section 4)."""
+    """Core future-perturbation invariance property across realistic multi-issue frames."""
 
     @pytest.mark.parametrize(
-        ("issue_time", "horizon"),
-        SAMPLED_TEST_PAIRS,
-        ids=[f"{t.strftime('%Y-%m-%d')}_h{h}" for t, h in SAMPLED_TEST_PAIRS],
+        ("start_date", "end_date", "window_name"),
+        REALISTIC_INVARIANCE_WINDOWS,
+        ids=[w[2] for w in REALISTIC_INVARIANCE_WINDOWS],
     )
-    def test_future_perturbation_invariance_per_pair(
+    def test_future_perturbation_invariance_on_realistic_frame(
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
-        issue_time: pd.Timestamp,
-        horizon: int,
+        start_date: str,
+        end_date: str,
+        window_name: str,
     ) -> None:
-        """The row for (issue_time, h) must be unchanged when sources > issue_time are altered."""
+        """Multi-issue frame of at least 7 consecutive dates x 96 horizons must be invariant."""
         intensity_df, weather_df, mix_df = curated_sample_data
+        schedule = default_issue_schedule(start_date, end_date)
+        assert len(schedule) == 7
 
-        # 1. Build original unperturbed row for (issue_time, horizon)
+        # 1. Build original unperturbed multi-issue frame (7 dates x 96 horizons)
         orig_frame = build_example_frame(
             intensity_df=intensity_df,
             weather_df=weather_df,
             mix_df=mix_df,
-            issue_times=[issue_time],
-            horizons=[horizon],
+            issue_times=schedule,
+            horizons=range(1, 97),
             require_aux=False,
         )
-        assert len(orig_frame) == 1, f"Expected 1 row for single pair, got {len(orig_frame)}"
+        assert orig_frame["issue_time"].nunique() == 7 and len(orig_frame) == 7 * 96
 
-        # 2. Perturb every source row timestamped after issue_time
-        perturbed_intensity = intensity_df.copy()
-        perturbed_weather = weather_df.copy()
-        perturbed_mix = mix_df.copy()
+        # 2. Test one perturbation per issue inside the frame
+        for issue_time in schedule:
+            perturbed_intensity = intensity_df.copy()
+            perturbed_weather = weather_df.copy()
+            perturbed_mix = mix_df.copy()
 
-        # Intensity actuals and forecasts after issue_time
-        mask_int = pd.to_datetime(perturbed_intensity["period_start_utc"], utc=True) > issue_time
-        perturbed_intensity.loc[mask_int, "actual"] = (
-            perturbed_intensity.loc[mask_int, "actual"].fillna(100) + 1000
-        )
-        if "forecast" in perturbed_intensity.columns:
-            perturbed_intensity.loc[mask_int, "forecast"] = (
-                perturbed_intensity.loc[mask_int, "forecast"].fillna(100) * 2
+            # Intensity actuals and forecasts after issue_time
+            mask_int = (
+                pd.to_datetime(perturbed_intensity["period_start_utc"], utc=True) > issue_time
             )
-
-        # Mix fuel shares after issue_time
-        mask_mix = pd.to_datetime(perturbed_mix["period_start_utc"], utc=True) > issue_time
-        for fuel in MIX_FUELS:
-            if fuel in perturbed_mix.columns:
-                perturbed_mix.loc[mask_mix, fuel] = np.roll(
-                    perturbed_mix.loc[mask_mix, fuel].to_numpy(), shift=1
+            perturbed_intensity.loc[mask_int, "actual"] = (
+                perturbed_intensity.loc[mask_int, "actual"].fillna(100) + 1000
+            )
+            if "forecast" in perturbed_intensity.columns:
+                perturbed_intensity.loc[mask_int, "forecast"] = (
+                    perturbed_intensity.loc[mask_int, "forecast"].fillna(100) * 2
                 )
 
-        # Weather previous-runs forecasts:
-        # Day 1 forecast was issued at period_start_utc - 24h.
-        # Day 2 forecast was issued at period_start_utc - 48h.
-        w_ts = pd.to_datetime(perturbed_weather["period_start_utc"], utc=True)
-        mask_wth_d1 = (w_ts - pd.Timedelta(hours=24)) > issue_time
-        if "temperature_2m_previous_day1" in perturbed_weather.columns:
-            perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"] = (
-                perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"] + 40.0
-            )
+            # Mix fuel shares after issue_time
+            mask_mix = pd.to_datetime(perturbed_mix["period_start_utc"], utc=True) > issue_time
+            for fuel in MIX_FUELS:
+                if fuel in perturbed_mix.columns:
+                    perturbed_mix.loc[mask_mix, fuel] = np.roll(
+                        perturbed_mix.loc[mask_mix, fuel].to_numpy(), shift=1
+                    )
 
-        mask_wth_d2 = (w_ts - pd.Timedelta(hours=48)) > issue_time
-        if "temperature_2m_previous_day2" in perturbed_weather.columns:
-            perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"] = (
-                perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"] + 40.0
-            )
+            # Weather previous-runs forecasts:
+            # Day 1 forecast was issued at period_start_utc - 24h.
+            # Day 2 forecast was issued at period_start_utc - 48h.
+            w_ts = pd.to_datetime(perturbed_weather["period_start_utc"], utc=True)
+            mask_wth_d1 = (w_ts - pd.Timedelta(hours=24)) > issue_time
+            if "temperature_2m_previous_day1" in perturbed_weather.columns:
+                perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"] = (
+                    perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"] + 40.0
+                )
 
-        # Also perturb any contemporaneous weather columns if injected
-        for col in perturbed_weather.columns:
-            if col not in (
-                "period_start_utc",
-                "local_date",
-                "temperature_2m_previous_day1",
-                "temperature_2m_previous_day2",
-            ):
-                perturbed_weather.loc[w_ts > issue_time, col] = 999.0
+            mask_wth_d2 = (w_ts - pd.Timedelta(hours=48)) > issue_time
+            if "temperature_2m_previous_day2" in perturbed_weather.columns:
+                perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"] = (
+                    perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"] + 40.0
+                )
 
-        # Prove the injection landed (ADR-015): assert mutations actually took effect
-        assert mask_int.any(), "Precondition failed: intensity mutation mask must not be empty"
-        assert (
-            perturbed_intensity.loc[mask_int, "actual"] != intensity_df.loc[mask_int, "actual"]
-        ).any(), "Precondition failed: intensity actuals must be modified"
-        assert mask_mix.any(), "Precondition failed: mix mutation mask must not be empty"
-        if "temperature_2m_previous_day1" in perturbed_weather.columns and mask_wth_d1.any():
+            for col in perturbed_weather.columns:
+                if col not in (
+                    "period_start_utc",
+                    "local_date",
+                    "temperature_2m_previous_day1",
+                    "temperature_2m_previous_day2",
+                ):
+                    perturbed_weather.loc[w_ts > issue_time, col] = 999.0
+
+            # Prove the injection landed (ADR-015): assert mutations actually took effect
+            assert mask_int.any(), "Precondition failed: intensity mutation mask must not be empty"
             assert (
-                perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"]
-                != weather_df.loc[mask_wth_d1, "temperature_2m_previous_day1"]
-            ).any(), "Precondition failed: weather day 1 values must be modified"
-        if "temperature_2m_previous_day2" in perturbed_weather.columns and mask_wth_d2.any():
-            assert (
-                perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"]
-                != weather_df.loc[mask_wth_d2, "temperature_2m_previous_day2"]
-            ).any(), "Precondition failed: weather day 2 values must be modified"
+                perturbed_intensity.loc[mask_int, "actual"] != intensity_df.loc[mask_int, "actual"]
+            ).any(), "Precondition failed: intensity actuals must be modified"
+            assert mask_mix.any(), "Precondition failed: mix mutation mask must not be empty"
+            if "temperature_2m_previous_day1" in perturbed_weather.columns and mask_wth_d1.any():
+                assert (
+                    perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"]
+                    != weather_df.loc[mask_wth_d1, "temperature_2m_previous_day1"]
+                ).any(), "Precondition failed: weather day 1 values must be modified"
+            if "temperature_2m_previous_day2" in perturbed_weather.columns and mask_wth_d2.any():
+                assert (
+                    perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"]
+                    != weather_df.loc[mask_wth_d2, "temperature_2m_previous_day2"]
+                ).any(), "Precondition failed: weather day 2 values must be modified"
 
-        # 3. Rebuild feature row for (issue_time, horizon)
-        rebuilt_frame = build_example_frame(
-            intensity_df=perturbed_intensity,
-            weather_df=perturbed_weather,
-            mix_df=perturbed_mix,
-            issue_times=[issue_time],
-            horizons=[horizon],
-            require_aux=False,
-        )
-        assert len(rebuilt_frame) == 1
-
-        # 4. Assert feature values are strictly identical
-        for col in FEATURE_COLUMNS:
-            orig_val = orig_frame[col].iloc[0]
-            rebuilt_val = rebuilt_frame[col].iloc[0]
-
-            if pd.isna(orig_val) and pd.isna(rebuilt_val):
-                continue
-
-            matches = (orig_val == rebuilt_val) or (
-                isinstance(orig_val, (int, float, np.floating))
-                and orig_val == pytest.approx(rebuilt_val, rel=1e-5)
+            # 3. Rebuild full multi-issue frame (7 dates x 96 horizons) from perturbed sources
+            rebuilt_frame = build_example_frame(
+                intensity_df=perturbed_intensity,
+                weather_df=perturbed_weather,
+                mix_df=perturbed_mix,
+                issue_times=schedule,
+                horizons=range(1, 97),
+                require_aux=False,
             )
-            assert matches, (
-                f"Temporal leakage in '{col}' at issue_time {issue_time}, horizon {horizon}!\n"
-                f"orig={orig_val}, rebuilt={rebuilt_val}"
-            )
+            assert rebuilt_frame["issue_time"].nunique() == 7 and len(rebuilt_frame) == 7 * 96
+
+            # 4. Assert all 96 horizons for the perturbed issue are strictly invariant
+            orig_slice = orig_frame[orig_frame["issue_time"] == issue_time]
+            rebuilt_slice = rebuilt_frame[rebuilt_frame["issue_time"] == issue_time]
+            assert len(orig_slice) == 96
+            assert len(rebuilt_slice) == 96
+
+            for h in range(1, 97):
+                orig_row = orig_slice[orig_slice["horizon"] == h].iloc[0]
+                rebuilt_row = rebuilt_slice[rebuilt_slice["horizon"] == h].iloc[0]
+
+                for col in FEATURE_COLUMNS:
+                    orig_val = orig_row[col]
+                    rebuilt_val = rebuilt_row[col]
+
+                    if pd.isna(orig_val) and pd.isna(rebuilt_val):
+                        continue
+
+                    matches = (orig_val == rebuilt_val) or (
+                        isinstance(orig_val, (int, float, np.floating))
+                        and orig_val == pytest.approx(rebuilt_val, rel=1e-5)
+                    )
+                    assert matches, (
+                        f"Temporal leakage in '{col}' at issue_time {issue_time}, horizon {h}!\n"
+                        f"orig={orig_val}, rebuilt={rebuilt_val}"
+                    )
 
 
 class TestFeatureContractAndInvariants:
@@ -660,7 +635,7 @@ class TestFeatureContractAndInvariants:
 
 
 class TestIssueAnchorEuropeLondon:
-    """Validate 00:00 Europe/London issue anchor invariants (Section 1)."""
+    """Validate 00:00 Europe/London issue anchor invariants."""
 
     def test_issue_instants_bst_and_gmt(self) -> None:
         """In BST the instant is 23:00Z of the previous UTC date; in GMT it is 00:00Z."""
@@ -703,7 +678,7 @@ class TestIssueAnchorEuropeLondon:
 
 
 class TestHorizonAbsoluteOffsetDST:
-    """Validate that horizon is an absolute offset spanning 48 hours across DST days (Section 2)."""
+    """Validate that horizon is an absolute offset spanning 48 hours across DST days."""
 
     @pytest.mark.parametrize(
         ("dst_date", "expected_local_periods"),
@@ -764,7 +739,7 @@ class TestHorizonAbsoluteOffsetDST:
 
 
 class TestSplitByIssueDate:
-    """Validate split_by_issue_date with embargo gap preventing target leakage (Section 3)."""
+    """Validate split_by_issue_date with embargo gap preventing target leakage."""
 
     def test_split_by_issue_date_embargo_and_target_overlap(self) -> None:
         """Synthetic frame split must drop embargo_days, be disjoint, and avoid target overlap."""
@@ -846,7 +821,7 @@ class TestSplitByIssueDate:
 
 
 class TestPositiveModelInputSelection:
-    """Validate select_model_inputs as the only positive selection of X (Section 4)."""
+    """Validate select_model_inputs and select_training_arrays as positive selections."""
 
     def test_select_model_inputs_exact_columns_and_order(
         self,
@@ -870,6 +845,60 @@ class TestPositiveModelInputSelection:
         assert "y" not in X.columns
         assert "issue_time" not in X.columns
         assert "target_time" not in X.columns
+
+    def test_select_training_arrays_drops_null_y_and_asserts_non_null(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """select_training_arrays drops rows with null y and returns strictly non-null (X, y)."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        sample_issues = [pd.Timestamp("2025-01-01 00:00:00+00:00")]
+        frame = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=sample_issues,
+            horizons=[1, 2, 3, 4],
+            require_aux=True,
+        )
+        # Deliberately inject a null y in one row
+        frame_with_null = frame.copy()
+        frame_with_null.loc[1, "y"] = np.nan
+
+        # Prove the injection landed (ADR-015)
+        assert frame_with_null["y"].isna().sum() == 1, "Precondition failed: 1 null y injected"
+
+        X, y = select_training_arrays(frame_with_null)
+        assert len(X) == 3
+        assert len(y) == 3
+        assert not y.isna().any(), "Invariant violated: null label in training y"
+        assert list(X.columns) == FEATURE_COLUMNS
+        assert (X.index == y.index).all()
+
+    def test_select_training_arrays_raises_on_missing_or_all_null_y(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """select_training_arrays raises ValueError when y is missing or entirely null."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        frame = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=[pd.Timestamp("2025-01-01 00:00:00+00:00")],
+            horizons=[1, 2],
+            require_aux=True,
+        )
+
+        frame_no_y = frame.drop(columns=["y"])
+        assert "y" not in frame_no_y.columns
+        with pytest.raises(ValueError, match="y"):
+            select_training_arrays(frame_no_y)
+
+        frame_all_null = frame.copy()
+        frame_all_null["y"] = np.nan
+        with pytest.raises(ValueError, match="(?i)(valid.*training.*rows|null)"):
+            select_training_arrays(frame_all_null)
 
     def test_model_feature_columns_is_subset_of_feature_columns(self) -> None:
         """The model feature list must be a subset of FEATURE_COLUMNS for P3 compatibility."""
@@ -925,7 +954,7 @@ class TestPositiveModelInputSelection:
 
 
 class TestLeadingDateTrimming:
-    """Validate that incomplete leading issue dates from warmup are dropped (Section 5)."""
+    """Validate that incomplete leading issue dates from warmup are dropped."""
 
     def test_leading_issue_dates_dropped_and_first_date_has_zero_null_features(
         self,

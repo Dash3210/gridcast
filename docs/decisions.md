@@ -304,3 +304,22 @@
   - Allowing horizons to observe different freshness of actuals (rejected: one issue produces all 96 horizons from a single information set).
   - Forward-imputing stale values under the old lag names (rejected: dishonest naming conceals data drift).
 
+## ADR-017 — Independent test oracles: separate naive computation paths for contract guards
+- Status: accepted
+- Date: 2026-11-02
+- Context:
+  A guard whose expected value is computed by the same code it guards cannot catch a bug that lies about its own bound. In this system, contract test assertions previously validated declarations by comparing them against the output of the declaration function itself (`max_source_timestamp_allowed`). When a faulty declaration (such as `issue - 23h` on autumn-back dates) was tested, the entire test suite remained green because the guard validated the declaration against itself. An effective test oracle must be completely decoupled from the production builder.
+- Decision:
+  1. No guard may take its expected value from the code it guards.
+  2. Test oracles must recompute expected feature values directly from raw stores through an independent, separate, deliberately naive path (such as explicit, slow pandas lookups: `store.loc[store["period_start_utc"] == expected_ts, ...]`).
+  3. Feature builders must be verified against this independent oracle across dense value grids covering all operational boundaries (including all DST transition days and source-gap adjacent dates across all 96 horizons).
+- Review Rubric:
+  This structural rule and the rule that an injection test must prove it landed (ADR-015) form mandatory review rubric criteria for any defensive guard or invariant in the repository:
+  - *Rule 1 (Proof of Landing, ADR-015)*: Every injection or perturbation test must assert its mutation preconditions (that source values were genuinely modified) before asserting the guard verdict or invariance.
+  - *Rule 2 (Independent Oracle, ADR-017)*: No guard or contract test may take its expected value from the code it guards; the oracle must recompute from the raw store via a separate, deliberately naive path.
+- Consequences:
+  Guarantees that subtle algorithmic errors, position-dependent indexing defects, or self-fulfilling contract declarations are detected immediately.
+- Alternatives rejected:
+  - Validating contract functions against their own declared return values (rejected: permits false green test suites when declarations lie about their bounds).
+
+
