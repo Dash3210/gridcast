@@ -1,4 +1,4 @@
-"""Temporal leakage tests and feature engineering invariants for Phase P2.
+"""Temporal leakage tests and feature engineering invariants.
 
 Validates that no feature at issue_time uses any value stamped after issue_time.
 Tests future-perturbation invariance across 25+ sampled (issue_time, horizon) pairs
@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import pytest
+from helpers import assert_injection_changed
 
 from gridcast.features import (
     ACTUAL_AVAILABILITY_LAG,
@@ -139,22 +140,34 @@ class TestTemporalLeakageInvariance:
                 ):
                     perturbed_weather.loc[w_ts > issue_time, col] = 999.0
 
-            # Prove the injection landed (ADR-015): assert mutations actually took effect
-            assert mask_int.any(), "Precondition failed: intensity mutation mask must not be empty"
-            assert (
-                perturbed_intensity.loc[mask_int, "actual"] != intensity_df.loc[mask_int, "actual"]
-            ).any(), "Precondition failed: intensity actuals must be modified"
+            assert mask_int.any(), (
+                "Precondition failed: intensity mutation mask must not be empty"
+            )
+            assert_injection_changed(
+                intensity_df.loc[mask_int, "actual"],
+                perturbed_intensity.loc[mask_int, "actual"],
+                label="intensity actuals future perturbation",
+            )
             assert mask_mix.any(), "Precondition failed: mix mutation mask must not be empty"
+            for fuel in MIX_FUELS:
+                if fuel in perturbed_mix.columns:
+                    assert_injection_changed(
+                        mix_df.loc[mask_mix, fuel],
+                        perturbed_mix.loc[mask_mix, fuel],
+                        label=f"mix fuel {fuel} future perturbation",
+                    )
             if "temperature_2m_previous_day1" in perturbed_weather.columns and mask_wth_d1.any():
-                assert (
-                    perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"]
-                    != weather_df.loc[mask_wth_d1, "temperature_2m_previous_day1"]
-                ).any(), "Precondition failed: weather day 1 values must be modified"
+                assert_injection_changed(
+                    weather_df.loc[mask_wth_d1, "temperature_2m_previous_day1"],
+                    perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"],
+                    label="weather previous_day1 future perturbation",
+                )
             if "temperature_2m_previous_day2" in perturbed_weather.columns and mask_wth_d2.any():
-                assert (
-                    perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"]
-                    != weather_df.loc[mask_wth_d2, "temperature_2m_previous_day2"]
-                ).any(), "Precondition failed: weather day 2 values must be modified"
+                assert_injection_changed(
+                    weather_df.loc[mask_wth_d2, "temperature_2m_previous_day2"],
+                    perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"],
+                    label="weather previous_day2 future perturbation",
+                )
 
             # 3. Rebuild full multi-issue frame (7 dates x 96 horizons) from perturbed sources
             rebuilt_frame = build_example_frame(
@@ -340,9 +353,10 @@ class TestFeatureContractAndInvariants:
             ~pd.to_datetime(intensity_df["period_start_utc"], utc=True).isin(drop_range)
         ].copy()
 
-        # Prove the injection landed (ADR-015): assert rows were actually dropped
-        assert len(gapped_intensity) == len(intensity_df) - 4, (
-            "Precondition failed: exactly 4 periods must be dropped from intensity_df"
+        assert_injection_changed(
+            intensity_df,
+            gapped_intensity,
+            label="gapped intensity dropped 4 periods",
         )
 
         features = build_example_frame(
@@ -517,8 +531,11 @@ class TestFeatureContractAndInvariants:
         # Horizon 97 corresponds to 48.5 hours ahead.
         # Its forecast was issued at target_time - 48h = issue_time + 30min > issue_time.
         bad_horizons = [97]
-        # Prove the injection landed (ADR-015): assert horizon is beyond 48 hours
-        assert any(h > 96 for h in bad_horizons), "Precondition failed: horizon > 96 required"
+        assert_injection_changed(
+            96,
+            bad_horizons[0],
+            label="horizon contract invalid horizon > 96",
+        )
         with pytest.raises(ValueError, match="(?i)(horizon contract|source timestamp|issue_time)"):
             build_example_frame(
                 intensity_df,
@@ -565,19 +582,16 @@ class TestFeatureContractAndInvariants:
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ) -> None:
         """Archive-api reanalysis weather must be rejected."""
-        intensity_df, _, mix_df = curated_sample_data
+        intensity_df, weather_df, mix_df = curated_sample_data
         bad_weather = pd.DataFrame({
             "period_start_utc": intensity_df["period_start_utc"],
             "temperature_reanalysis": [15.0] * len(intensity_df),
         })
 
-        # Prove the injection landed (ADR-015):
-        # assert reanalysis column exists and previous_day2 is absent
-        assert "temperature_reanalysis" in bad_weather.columns, (
-            "Precondition failed: 'temperature_reanalysis' must be present in injected frame"
-        )
-        assert "temperature_2m_previous_day2" not in bad_weather.columns, (
-            "Precondition failed: 'temperature_2m_previous_day2' must be absent from injected frame"
+        assert_injection_changed(
+            weather_df,
+            bad_weather,
+            label="weather previous_runs replaced by reanalysis",
         )
 
         with pytest.raises(
@@ -622,14 +636,22 @@ class TestFeatureContractAndInvariants:
 
     def test_missing_required_columns_raises(self) -> None:
         """Missing period_start_utc or actual raises ValueError."""
-        # Prove the injection landed (ADR-015): assert missing columns are genuinely absent
+        valid_cols = ["period_start_utc", "actual"]
         df_no_utc = pd.DataFrame({"actual": [100]})
-        assert "period_start_utc" not in df_no_utc.columns, "Precondition failed"
+        assert_injection_changed(
+            valid_cols,
+            list(df_no_utc.columns),
+            label="intensity missing period_start_utc",
+        )
         with pytest.raises(ValueError, match="period_start_utc"):
             build_example_frame(df_no_utc)
 
         df_no_act = pd.DataFrame({"period_start_utc": [pd.Timestamp.now()]})
-        assert "actual" not in df_no_act.columns, "Precondition failed"
+        assert_injection_changed(
+            valid_cols,
+            list(df_no_act.columns),
+            label="intensity missing actual",
+        )
         with pytest.raises(ValueError, match="actual"):
             build_example_frame(df_no_act)
 
@@ -865,8 +887,11 @@ class TestPositiveModelInputSelection:
         frame_with_null = frame.copy()
         frame_with_null.loc[1, "y"] = np.nan
 
-        # Prove the injection landed (ADR-015)
-        assert frame_with_null["y"].isna().sum() == 1, "Precondition failed: 1 null y injected"
+        assert_injection_changed(
+            frame["y"],
+            frame_with_null["y"],
+            label="injected null y into training frame",
+        )
 
         X, y = select_training_arrays(frame_with_null)
         assert len(X) == 3
@@ -891,17 +916,26 @@ class TestPositiveModelInputSelection:
         )
 
         frame_no_y = frame.drop(columns=["y"])
-        assert "y" not in frame_no_y.columns
+        assert_injection_changed(
+            list(frame.columns),
+            list(frame_no_y.columns),
+            label="training arrays missing y column",
+        )
         with pytest.raises(ValueError, match="y"):
             select_training_arrays(frame_no_y)
 
         frame_all_null = frame.copy()
         frame_all_null["y"] = np.nan
+        assert_injection_changed(
+            frame["y"],
+            frame_all_null["y"],
+            label="training arrays all null y",
+        )
         with pytest.raises(ValueError, match="(?i)(valid.*training.*rows|null)"):
             select_training_arrays(frame_all_null)
 
     def test_model_feature_columns_is_subset_of_feature_columns(self) -> None:
-        """The model feature list must be a subset of FEATURE_COLUMNS for P3 compatibility."""
+        """The model feature list must be a subset of FEATURE_COLUMNS."""
         from gridcast.features import MODEL_FEATURE_COLUMNS
 
         assert isinstance(MODEL_FEATURE_COLUMNS, list)
@@ -922,9 +956,10 @@ class TestPositiveModelInputSelection:
             require_aux=True,
         )
         bad_frame = frame.drop(columns=["temperature"])
-        # Prove the injection landed (ADR-015): assert column was actually dropped
-        assert "temperature" not in bad_frame.columns, (
-            "Precondition failed: 'temperature' must be absent"
+        assert_injection_changed(
+            list(frame.columns),
+            list(bad_frame.columns),
+            label="model inputs missing temperature column",
         )
         with pytest.raises(ValueError, match="(?i)(missing.*column|temperature)"):
             select_model_inputs(bad_frame)
@@ -945,9 +980,10 @@ class TestPositiveModelInputSelection:
         )
         bad_frame = frame.copy()
         bad_frame["sneaky_extra_column"] = 42.0
-        # Prove the injection landed (ADR-015): assert extra column exists
-        assert "sneaky_extra_column" in bad_frame.columns, (
-            "Precondition failed: 'sneaky_extra_column' must be present"
+        assert_injection_changed(
+            list(frame.columns),
+            list(bad_frame.columns),
+            label="model inputs undeclared extra column",
         )
         with pytest.raises(ValueError, match="(?i)(undeclared.*column|sneaky_extra_column)"):
             select_model_inputs(bad_frame)
@@ -1043,8 +1079,11 @@ class TestPerHorizonWeatherLead:
         intensity_df, weather_df, mix_df = curated_sample_data
         sample_issue = pd.Timestamp("2025-01-20 00:00:00+00:00")
         override = {72: "temperature_2m_previous_day1"}
-        # Prove the injection landed (ADR-015): assert override deliberately specifies day 1
-        assert override[72] == "temperature_2m_previous_day1", "Precondition failed"
+        assert_injection_changed(
+            "temperature_2m_previous_day2",
+            override[72],
+            label="deliberate lead override day1 at h72",
+        )
         with pytest.raises(ValueError, match="Horizon contract violation"):
             build_example_frame(
                 intensity_df,
@@ -1064,8 +1103,8 @@ def naive_feature_oracle(
     issue_time: pd.Timestamp,
     horizon: int,
     feature_name: str,
-) -> float:
-    """Compute expected feature value via slow, obvious raw store lookups.
+) -> tuple[float, pd.Timestamp | str]:
+    """Compute expected feature value and source timestamp via slow, obvious raw store lookups.
 
     Recomputes directly from raw store with slow, obvious pandas lookups
     (e.g., store.loc[store['period_start_utc'] == expected_ts, ...]) and
@@ -1074,27 +1113,31 @@ def naive_feature_oracle(
     target_time = issue_time + pd.Timedelta(minutes=30 * horizon)
 
     if feature_name == "horizon":
-        return float(horizon)
+        return float(horizon), "N/A"
 
     if feature_name == "actual_recent_3h":
         expected_ts = issue_time - ACTUAL_AVAILABILITY_LAG
         rows = intensity_df.loc[intensity_df["period_start_utc"] == expected_ts, "actual"]
-        return float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+        val = float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+        return val, expected_ts
 
     if feature_name == "actual_lag_24h":
         expected_ts = issue_time - pd.Timedelta(hours=24)
         rows = intensity_df.loc[intensity_df["period_start_utc"] == expected_ts, "actual"]
-        return float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+        val = float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+        return val, expected_ts
 
     if feature_name == "actual_lag_48h":
         expected_ts = issue_time - pd.Timedelta(hours=48)
         rows = intensity_df.loc[intensity_df["period_start_utc"] == expected_ts, "actual"]
-        return float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+        val = float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+        return val, expected_ts
 
     if feature_name == "actual_lag_168h":
         expected_ts = issue_time - pd.Timedelta(hours=168)
         rows = intensity_df.loc[intensity_df["period_start_utc"] == expected_ts, "actual"]
-        return float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+        val = float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+        return val, expected_ts
 
     if feature_name.startswith("actual_rolling_"):
         t_end = issue_time - ACTUAL_AVAILABILITY_LAG
@@ -1112,35 +1155,36 @@ def naive_feature_oracle(
             & (intensity_df["period_start_utc"] <= t_end),
             "actual",
         ]
+        source_ts_str = f"{t_start} to {t_end}"
         if "mean" in feature_name:
-            return float(window_rows.mean())
+            return float(window_rows.mean()), source_ts_str
         if "std" in feature_name:
             val = window_rows.std()
-            return float(val) if pd.notna(val) else float("nan")
+            return (float(val) if pd.notna(val) else float("nan")), source_ts_str
 
     target_local = target_time.tz_convert(LONDON_TZ)
     if feature_name == "hour_of_day":
-        return float(target_local.hour)
+        return float(target_local.hour), target_time
     if feature_name == "day_of_week":
-        return float(target_local.dayofweek)
+        return float(target_local.dayofweek), target_time
     if feature_name == "month":
-        return float(target_local.month)
+        return float(target_local.month), target_time
     if feature_name == "is_weekend":
-        return 1.0 if target_local.dayofweek >= 5 else 0.0
+        return (1.0 if target_local.dayofweek >= 5 else 0.0), target_time
     if feature_name == "is_uk_bank_holiday":
-        return 1.0 if target_local.date() in UK_BANK_HOLIDAYS else 0.0
+        return (1.0 if target_local.date() in UK_BANK_HOLIDAYS else 0.0), target_time
     if feature_name == "sin_hour":
         hour_cont = target_local.hour + target_local.minute / 60.0
-        return float(np.sin(2.0 * np.pi * hour_cont / 24.0))
+        return float(np.sin(2.0 * np.pi * hour_cont / 24.0)), target_time
     if feature_name == "cos_hour":
         hour_cont = target_local.hour + target_local.minute / 60.0
-        return float(np.cos(2.0 * np.pi * hour_cont / 24.0))
+        return float(np.cos(2.0 * np.pi * hour_cont / 24.0)), target_time
     if feature_name == "sin_day_of_year":
         doy_cont = target_local.dayofyear - 1.0
-        return float(np.sin(2.0 * np.pi * doy_cont / 365.25))
+        return float(np.sin(2.0 * np.pi * doy_cont / 365.25)), target_time
     if feature_name == "cos_day_of_year":
         doy_cont = target_local.dayofyear - 1.0
-        return float(np.cos(2.0 * np.pi * doy_cont / 365.25))
+        return float(np.cos(2.0 * np.pi * doy_cont / 365.25)), target_time
 
     if feature_name in ("temperature", "temperature_24h_mean", "temperature_24h_min"):
         target_hour = target_time.floor("h")
@@ -1152,25 +1196,27 @@ def naive_feature_oracle(
         if feature_name == "temperature":
             rows = weather_df.loc[weather_df["period_start_utc"] == target_hour, col]
             if rows.empty or pd.isna(rows.iloc[0]):
-                return float("nan")
-            return float(rows.iloc[0])
+                return float("nan"), target_hour
+            return float(rows.iloc[0]), target_hour
         t_start = target_hour - pd.Timedelta(hours=24)
         window_rows = weather_df.loc[
             (weather_df["period_start_utc"] > t_start)
             & (weather_df["period_start_utc"] <= target_hour),
             col,
         ]
+        source_ts_str = f"{t_start} to {target_hour}"
         if feature_name == "temperature_24h_mean":
-            return float(window_rows.mean())
+            return float(window_rows.mean()), source_ts_str
         if feature_name == "temperature_24h_min":
-            return float(window_rows.min())
+            return float(window_rows.min()), source_ts_str
 
     if feature_name.startswith("mix_share_"):
         fuel = feature_name.removeprefix("mix_share_")
         expected_ts = issue_time - pd.Timedelta(hours=48)
         col = fuel if fuel in mix_df.columns else feature_name
         rows = mix_df.loc[mix_df["period_start_utc"] == expected_ts, col]
-        return float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+        val = float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+        return val, expected_ts
 
     raise ValueError(f"Unknown feature: {feature_name}")
 
@@ -1233,7 +1279,7 @@ class TestDenseValueGridOracle:
             row = day_frame[day_frame["horizon"] == h].iloc[0]
             for feat in FEATURE_COLUMNS:
                 builder_val = row[feat]
-                oracle_val = naive_feature_oracle(
+                oracle_val, source_ts = naive_feature_oracle(
                     intensity_df,
                     weather_df,
                     mix_df,
@@ -1243,27 +1289,69 @@ class TestDenseValueGridOracle:
                 )
                 if pd.isna(builder_val) and pd.isna(oracle_val):
                     continue
-                assert not pd.isna(builder_val), (
-                    f"Builder returned NaN for {feat} at {test_date} (issue={issue_time}), h={h}, "
-                    f"but oracle returned {oracle_val}"
-                )
-                assert not pd.isna(oracle_val), (
-                    f"Oracle returned NaN for {feat} at {test_date} (issue={issue_time}), h={h}, "
-                    f"but builder returned {builder_val}"
-                )
-                assert math.isclose(
+                if pd.isna(builder_val) or pd.isna(oracle_val) or not math.isclose(
                     float(builder_val),
                     float(oracle_val),
                     rel_tol=1e-5,
                     abs_tol=1e-7,
-                ), (
-                    f"Value mismatch for {feat} on {test_date} (issue={issue_time}), h={h}: "
-                    f"builder={builder_val}, oracle={oracle_val}"
-                )
+                ):
+                    raise AssertionError(
+                        f"Dense grid mismatch for column '{feat}' at issue date {test_date}, "
+                        f"horizon {h}:\n"
+                        f"  issue_date:       {test_date}\n"
+                        f"  horizon:          {h}\n"
+                        f"  column:           {feat}\n"
+                        f"  expected value:   {oracle_val}\n"
+                        f"  observed value:   {builder_val}\n"
+                        f"  source timestamp: {source_ts}"
+                    )
 
 
+class TestAssertInjectionChangedHelper:
+    """Verify that assert_injection_changed enforces structural proof of mutation."""
 
+    def test_assert_injection_changed_raises_on_equal_scalars(self) -> None:
+        with pytest.raises(AssertionError, match="scalar equal"):
+            assert_injection_changed(42, 42, label="scalar equal")
+        with pytest.raises(AssertionError, match="both None"):
+            assert_injection_changed(None, None, label="both None")
+        with pytest.raises(AssertionError, match="both NaN"):
+            assert_injection_changed(float("nan"), np.nan, label="both NaN")
+        with pytest.raises(AssertionError, match="pd.NA and None"):
+            assert_injection_changed(pd.NA, None, label="pd.NA and None")
 
+    def test_assert_injection_changed_passes_on_different_scalars(self) -> None:
+        assert_injection_changed(42, 43, label="different ints")
+        assert_injection_changed(None, 42, label="None vs int")
+        assert_injection_changed(np.nan, 1.0, label="nan vs float")
+        assert_injection_changed(True, 1, label="bool vs int")
 
+    def test_assert_injection_changed_raises_on_equal_series_and_frames(self) -> None:
+        s1 = pd.Series([1.0, 2.0])
+        s2 = pd.Series([1.0, 2.0])
+        with pytest.raises(AssertionError, match="differing elements: 0"):
+            assert_injection_changed(s1, s2, label="equal series")
 
+        s_null1 = pd.Series([np.nan, np.nan])
+        s_null2 = pd.Series([np.nan, np.nan])
+        with pytest.raises(AssertionError, match="differing elements: 0"):
+            assert_injection_changed(s_null1, s_null2, label="all-null series")
 
+        df1 = pd.DataFrame({"a": [1.0, 2.0]})
+        df2 = pd.DataFrame({"a": [1.0, 2.0]})
+        with pytest.raises(AssertionError, match="differing elements: 0"):
+            assert_injection_changed(df1, df2, label="equal df")
+
+        df_null1 = pd.DataFrame({"a": [np.nan, np.nan]})
+        df_null2 = pd.DataFrame({"a": [np.nan, np.nan]})
+        with pytest.raises(AssertionError, match="differing elements: 0"):
+            assert_injection_changed(df_null1, df_null2, label="all-null df")
+
+    def test_assert_injection_changed_passes_on_mutated_series_and_frames(self) -> None:
+        s1 = pd.Series([1.0, 2.0])
+        s2 = pd.Series([1.0, 3.0])
+        assert_injection_changed(s1, s2, label="mutated series")
+
+        df1 = pd.DataFrame({"a": [1.0, 2.0]})
+        df2 = pd.DataFrame({"a": [1.0, 3.0]})
+        assert_injection_changed(df1, df2, label="mutated df")
