@@ -92,6 +92,7 @@ def test_schema_assertion(normal_payload: dict) -> None:
         "actual",
         "index",
         "ingested_at",
+        "first_seen_at",
     ]
     assert list(df.columns) == expected_columns
 
@@ -99,6 +100,7 @@ def test_schema_assertion(normal_payload: dict) -> None:
     assert str(df["period_start_utc"].dtype) == "datetime64[ns, UTC]"
     assert str(df["period_end_utc"].dtype) == "datetime64[ns, UTC]"
     assert str(df["ingested_at"].dtype) == "datetime64[ns, UTC]"
+    assert str(df["first_seen_at"].dtype) == "datetime64[ns, UTC]"
     assert str(df["forecast"].dtype) == "Int32"
     assert str(df["actual"].dtype) == "Int32"
     assert str(df["index"].dtype) in ("string", "string[python]")
@@ -183,6 +185,58 @@ def test_pending_fills_in(normal_payload: dict, tmp_path: Path) -> None:
     assert df_read is not None
     assert len(df_read) == 48
     assert not df_read["actual"].isna().any()
+
+
+def test_first_seen_at_lifecycle(normal_payload: dict, tmp_path: Path) -> None:
+    """Assert first_seen_at transitions on arrival and stays unchanged on re-ingest."""
+    target_date = date(2026, 10, 15)
+    t1 = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 10, 15, 13, 0, 0, tzinfo=timezone.utc)
+    t3 = datetime(2026, 10, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+    # 1. First payload where one actual is null
+    p1 = json.loads(json.dumps(normal_payload))
+    p1["data"][5]["intensity"]["actual"] = None
+    p1["data"][5]["intensity"]["index"] = None
+
+    df1 = payload_to_frame(p1, target_date, t1)
+    assert pd.isna(df1.loc[5, "actual"])
+    assert pd.isna(df1.loc[5, "first_seen_at"])
+    # Assert a null actual never carries a first_seen_at
+    assert df1.loc[df1["actual"].isna(), "first_seen_at"].isna().all()
+
+    upsert_day(df1, target_date, base_dir=tmp_path)
+    read1 = read_partition(target_date, base_dir=tmp_path)
+    assert read1 is not None
+    assert pd.isna(read1.loc[5, "actual"])
+    assert pd.isna(read1.loc[5, "first_seen_at"])
+    assert read1.loc[read1["actual"].isna(), "first_seen_at"].isna().all()
+    assert read1.loc[0, "first_seen_at"] == pd.Timestamp(t1)
+
+    # 2. Later payload where it is known
+    p2 = json.loads(json.dumps(normal_payload))
+    known_val = normal_payload["data"][5]["intensity"]["actual"]
+    assert known_val is not None
+    df2 = payload_to_frame(p2, target_date, t2)
+    assert df2.loc[5, "actual"] == known_val
+
+    upsert_day(df2, target_date, base_dir=tmp_path)
+    read2 = read_partition(target_date, base_dir=tmp_path)
+    assert read2 is not None
+    # Assert first_seen_at is set on the transition
+    assert read2.loc[5, "actual"] == known_val
+    assert read2.loc[5, "first_seen_at"] == pd.Timestamp(t2)
+    assert read2.loc[0, "first_seen_at"] == pd.Timestamp(t1)
+
+    # 3. Third identical ingest
+    df3 = payload_to_frame(p2, target_date, t3)
+    upsert_day(df3, target_date, base_dir=tmp_path)
+    read3 = read_partition(target_date, base_dir=tmp_path)
+    assert read3 is not None
+    # Assert unchanged by a third identical ingest
+    assert read3.loc[5, "first_seen_at"] == pd.Timestamp(t2)
+    assert read3.loc[0, "first_seen_at"] == pd.Timestamp(t1)
+    assert read3.loc[read3["actual"].isna(), "first_seen_at"].isna().all()
 
 
 def test_pending_vs_gap(tmp_path: Path) -> None:
@@ -371,6 +425,7 @@ def test_empty_payload_handling(empty_payload: dict) -> None:
         "actual",
         "index",
         "ingested_at",
+        "first_seen_at",
     ]
 
 

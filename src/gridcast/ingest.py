@@ -592,6 +592,7 @@ def payload_to_frame(
                 "actual",
                 "index",
                 "ingested_at",
+                "first_seen_at",
             ]
         )
         empty_df["period_start_utc"] = pd.to_datetime([], utc=True)
@@ -602,6 +603,7 @@ def payload_to_frame(
         empty_df["actual"] = pd.Series([], dtype="Int32")
         empty_df["index"] = pd.Series([], dtype="string")
         empty_df["ingested_at"] = pd.to_datetime([], utc=True)
+        empty_df["first_seen_at"] = pd.to_datetime([], utc=True)
         return empty_df
 
     rows = []
@@ -633,6 +635,10 @@ def payload_to_frame(
                 f"expected requested date {requested_date}"
             )
 
+        act_val = intensity.get("actual")
+        first_seen_val = (
+            ingested_ts if act_val is not None and not pd.isna(act_val) else pd.NaT
+        )
         rows.append(
             {
                 "period_start_utc": start_utc,
@@ -640,9 +646,10 @@ def payload_to_frame(
                 "utc_date": start_utc.date(),
                 "local_date": row_local_date,
                 "forecast": intensity.get("forecast"),
-                "actual": intensity.get("actual"),
+                "actual": act_val,
                 "index": intensity.get("index"),
                 "ingested_at": ingested_ts,
+                "first_seen_at": first_seen_val,
             }
         )
 
@@ -650,6 +657,7 @@ def payload_to_frame(
     df["period_start_utc"] = pd.to_datetime(df["period_start_utc"], utc=True)
     df["period_end_utc"] = pd.to_datetime(df["period_end_utc"], utc=True)
     df["ingested_at"] = pd.to_datetime(df["ingested_at"], utc=True)
+    df["first_seen_at"] = pd.to_datetime(df["first_seen_at"], utc=True)
     df["forecast"] = df["forecast"].astype("Int32")
     df["actual"] = df["actual"].astype("Int32")
     df["index"] = df["index"].astype("string")
@@ -672,6 +680,10 @@ def read_partition(local_date: date | str, base_dir: Path | None = None) -> pd.D
     df["period_start_utc"] = pd.to_datetime(df["period_start_utc"], utc=True)
     df["period_end_utc"] = pd.to_datetime(df["period_end_utc"], utc=True)
     df["ingested_at"] = pd.to_datetime(df["ingested_at"], utc=True)
+    if "first_seen_at" in df.columns:
+        df["first_seen_at"] = pd.to_datetime(df["first_seen_at"], utc=True)
+    else:
+        df["first_seen_at"] = pd.Series([pd.NaT] * len(df), dtype="datetime64[ns, UTC]")
     df["forecast"] = df["forecast"].astype("Int32")
     df["actual"] = df["actual"].astype("Int32")
     df["index"] = df["index"].astype("string")
@@ -781,6 +793,18 @@ def upsert_day(
         rows_refreshed = 0
         duplicates_dropped = incoming_duplicates
         deduped = frame.drop_duplicates(subset=["period_start_utc"], keep="last").copy()
+        if "first_seen_at" not in deduped.columns:
+            deduped["first_seen_at"] = pd.Series(
+                [pd.NaT] * len(deduped), dtype="datetime64[ns, UTC]"
+            )
+            deduped.loc[deduped["actual"].notna(), "first_seen_at"] = deduped.loc[
+                deduped["actual"].notna(), "ingested_at"
+            ]
+        else:
+            deduped["first_seen_at"] = pd.to_datetime(deduped["first_seen_at"], utc=True)
+            deduped.loc[deduped["actual"].isna(), "first_seen_at"] = pd.NaT
+            need_ts = deduped["actual"].notna() & deduped["first_seen_at"].isna()
+            deduped.loc[need_ts, "first_seen_at"] = deduped.loc[need_ts, "ingested_at"]
     else:
         rows_before = len(existing)
         existing_unique = existing["period_start_utc"].nunique()
@@ -802,8 +826,13 @@ def upsert_day(
                 if pd.notna(row_dict["forecast"]) and row_dict["forecast"] is not None:
                     prior["forecast"] = row_dict["forecast"]
                 if pd.notna(row_dict["actual"]) and row_dict["actual"] is not None:
+                    prior_actual_was_null = pd.isna(prior.get("actual"))
                     prior["actual"] = row_dict["actual"]
                     prior["index"] = row_dict["index"]
+                    if prior_actual_was_null and pd.isna(prior.get("first_seen_at")):
+                        prior["first_seen_at"] = (
+                            row_dict.get("first_seen_at") or row_dict["ingested_at"]
+                        )
                 prior["ingested_at"] = max(prior["ingested_at"], row_dict["ingested_at"])
 
         # 2. Coalesce incoming rows: atomic (actual, index), independent forecast, conflicts
@@ -813,6 +842,11 @@ def upsert_day(
             key = row["period_start_utc"]
             row_dict = row.to_dict()
             if key not in records:
+                if pd.notna(row_dict.get("actual")) and row_dict["actual"] is not None:
+                    if "first_seen_at" not in row_dict or pd.isna(row_dict["first_seen_at"]):
+                        row_dict["first_seen_at"] = row_dict["ingested_at"]
+                else:
+                    row_dict["first_seen_at"] = pd.NaT
                 records[key] = row_dict
             else:
                 prior = records[key]
@@ -846,6 +880,13 @@ def upsert_day(
                         prior["actual"] = in_act
                         prior["index"] = in_idx
                         row_changed = True
+
+                    if pd.isna(prior_act):
+                        # Transition null -> non-null: set first_seen_at to ingest instant
+                        prior["first_seen_at"] = row_dict["ingested_at"]
+                    else:
+                        # Already non-null: keep stored first_seen_at. Never overwrite it.
+                        pass
                 else:
                     if pd.notna(prior_act) and prior_act is not None:
                         conflicts.append((
@@ -883,15 +924,20 @@ def upsert_day(
         "actual",
         "index",
         "ingested_at",
+        "first_seen_at",
     ]
     deduped = deduped[columns]
 
     deduped["period_start_utc"] = pd.to_datetime(deduped["period_start_utc"], utc=True)
     deduped["period_end_utc"] = pd.to_datetime(deduped["period_end_utc"], utc=True)
     deduped["ingested_at"] = pd.to_datetime(deduped["ingested_at"], utc=True)
+    deduped["first_seen_at"] = pd.to_datetime(deduped["first_seen_at"], utc=True)
     deduped["forecast"] = deduped["forecast"].astype("Int32")
     deduped["actual"] = deduped["actual"].astype("Int32")
     deduped["index"] = deduped["index"].astype("string")
+
+    # Invariant: null actual never carries a first_seen_at
+    deduped.loc[deduped["actual"].isna(), "first_seen_at"] = pd.NaT
 
     # Sort strictly by period_start_utc
     deduped = deduped.sort_values(by="period_start_utc").reset_index(drop=True)
