@@ -17,7 +17,7 @@ Core Properties:
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Final
 from zoneinfo import ZoneInfo
@@ -94,6 +94,7 @@ __all__: list[str] = [
     "issue_time_for_date",
     "load_feature_sources",
     "max_source_timestamp_allowed",
+    "split_by_issue_date",
 ]
 
 
@@ -118,6 +119,65 @@ def default_issue_schedule(start_date: date | str, end_date: date | str) -> pd.D
     s = date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
     e = date.fromisoformat(end_date) if isinstance(end_date, str) else end_date
     return pd.date_range(start=s, end=e, freq="D", tz=LONDON_TZ).tz_convert("UTC")
+
+
+def split_by_issue_date(
+    frame: pd.DataFrame,
+    train_end: date | str,
+    val_end: date | str,
+    embargo_days: int = 4,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split feature frame into (train, val, test) by issue_date with embargo boundaries.
+
+    - Splits are cut on issue_time (Europe/London local issue date), never on target_time.
+    - At least embargo_days issue dates are dropped at the train/validation boundary
+      and at the validation/test boundary (dropped, not assigned to either side).
+    - Rows with null y are excluded from every split.
+    - No issue date appears in more than one split.
+
+    Args:
+        frame: DataFrame containing 'issue_time', 'target_time', and 'y'.
+        train_end: End date for the train split (inclusive).
+        val_end: End date for the validation split (inclusive).
+        embargo_days: Number of issue dates to drop between consecutive splits (default: 4).
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: (train_df, val_df, test_df)
+    """
+    if "issue_time" not in frame.columns:
+        raise ValueError("frame must contain 'issue_time'")
+    if "y" not in frame.columns:
+        raise ValueError("frame must contain 'y'")
+
+    t_end = date.fromisoformat(train_end) if isinstance(train_end, str) else train_end
+    v_end = date.fromisoformat(val_end) if isinstance(val_end, str) else val_end
+
+    if t_end >= v_end:
+        raise ValueError(f"train_end ({t_end}) must be strictly before val_end ({v_end})")
+
+    val_start = t_end + timedelta(days=embargo_days + 1)
+    if val_start > v_end:
+        raise ValueError(
+            f"embargo_days ({embargo_days}) is too large: "
+            f"validation start ({val_start}) > val_end ({v_end})"
+        )
+    test_start = v_end + timedelta(days=embargo_days + 1)
+
+    issue_ts = pd.to_datetime(frame["issue_time"], utc=True)
+    issue_dates = issue_ts.dt.tz_convert(LONDON_TZ).dt.date
+
+    train_mask = issue_dates <= t_end
+    val_mask = (issue_dates >= val_start) & (issue_dates <= v_end)
+    test_mask = issue_dates >= test_start
+
+    # Exclude rows where y is null
+    valid_y = frame["y"].notna()
+
+    train = frame[train_mask & valid_y].copy()
+    val = frame[val_mask & valid_y].copy()
+    test = frame[test_mask & valid_y].copy()
+
+    return train, val, test
 
 
 def load_feature_sources(

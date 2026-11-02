@@ -237,3 +237,20 @@
   Each day's issue begins at the exact instant of that local day's partition, fully covering all settlement periods in summer without unforecasted leading hours.
 - Alternatives rejected:
   - 00:00 UTC anchor (rejected: sits at 01:00 local for half the year, leaving the first hour of every summer day uncovered by that day's forecast).
+
+## ADR-013 — Split embargo: dropping boundary issue dates to prevent target overlap
+- Status: accepted
+- Date: 2026-11-02
+- Context:
+  The 48-hour forecasting horizon means targets generated from an issue date on day D extend through day D+2 (`issue_time + 48h`). Splitting datasets by issue date without a temporal buffer allows targets in the test period to overlap with targets in the training or validation splits, introducing subtle target leakage into model evaluation.
+- Decision:
+  Implement `split_by_issue_date(frame, train_end, val_end, embargo_days=4)`:
+  1. Splits are cut strictly on `issue_time` (Europe/London local issue date), never on `target_time`.
+  2. At least `embargo_days` (default: 4) issue dates are dropped at the train/validation boundary and at the validation/test boundary. These dates are discarded rather than assigned to either split.
+  3. Rows with null `y` are excluded from all splits so models cannot train or score on unsettled targets.
+  4. Guarantees `max(target_time) of split_i < min(target_time) of split_{i+1} - 48h`, strictly preventing target overlap.
+- Consequences:
+  Eliminates evaluation leakage between train, validation, and test splits while preserving contiguous issue blocks.
+- Alternatives rejected:
+  - Splitting on target_time (rejected: scrambles multi-horizon forecasts from a single issue across train and test).
+  - Contiguous issue-date splits without an embargo (rejected: 48-hour target horizon creates 2-day target overlap across boundaries).

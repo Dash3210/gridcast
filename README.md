@@ -93,6 +93,7 @@ Phase P2 provides a bounded, leakage-free feature construction pipeline in `grid
 - **Temporal and Operational Leakage Guard**: Guarded by a sampled per-row perturbation invariance test across 25+ `(issue_time, horizon)` pairs covering dataset endpoints, DST transition days, and horizon limits (h=1 and h=96), asserting strict invariance when source rows stamped after `issue_time` are altered.
 - **Time-based Keying**: All lags and rolling stats are resolved by UTC timestamp lookup rather than row positions, ensuring correctness across 46-period (spring forward) and 50-period (autumn back) clock changes.
 - **Auxiliary Store Requirement**: `load_feature_sources()` loads source datasets from `data/curated/`, `data/weather/`, and `data/mix/`. `build_example_frame(..., require_aux=True)` enforces that auxiliary stores are present and populated.
+- **Split Embargo (ADR-013)**: Because targets extend 48 hours ahead (`issue_time + 48h`), `split_by_issue_date(frame, train_end, val_end, embargo_days=4)` cuts splits strictly on `issue_time` (local issue date) and drops at least `embargo_days` issue dates at both split boundaries, guaranteeing that training targets never overlap validation or test targets (`max(target_time) of train < min(target_time) of val - 48h`). Rows with null `y` are excluded from all splits.
 - **Bounded Feature Set (ADR-006, ADR-008, ADR-011)**:
   - *Keys*: `issue_time`, `horizon`, `target_time` (`issue_time + horizon * 30min`).
   - *Target (`y`)*: Realised carbon intensity `actual` at `target_time` (nullable for unsettled targets).

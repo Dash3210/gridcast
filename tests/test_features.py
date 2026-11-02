@@ -24,6 +24,7 @@ from gridcast.features import (
     issue_time_for_date,
     load_feature_sources,
     max_source_timestamp_allowed,
+    split_by_issue_date,
 )
 from gridcast.holidays import UK_BANK_HOLIDAYS, is_uk_bank_holiday
 
@@ -630,5 +631,88 @@ class TestHorizonAbsoluteOffsetDST:
         # 4. Target time must equal issue_time + horizon * 30 minutes exactly for every row
         expected_targets = [t_issue + pd.Timedelta(minutes=30 * h) for h in range(1, 97)]
         assert list(target_times) == expected_targets
+
+
+class TestSplitByIssueDate:
+    """Validate split_by_issue_date with embargo gap preventing target leakage (Section 3)."""
+
+    def test_split_by_issue_date_embargo_and_target_overlap(self) -> None:
+        """Synthetic frame split must drop embargo_days, be disjoint, and avoid target overlap."""
+        # Create a synthetic frame of 60 consecutive days from 2025-01-01 to 2025-03-01
+        start_d = date(2025, 1, 1)
+        end_d = date(2025, 3, 1)
+        issue_times = default_issue_schedule(start_d, end_d)
+        n_issues = len(issue_times)
+        horizons = list(range(1, 97))
+        n_h = len(horizons)
+
+        issue_rep = np.repeat(issue_times, n_h)
+        horizon_rep = np.tile(horizons, n_issues)
+        target_rep = pd.DatetimeIndex(issue_rep) + pd.to_timedelta(horizon_rep * 30, unit="m")
+
+        # Create target y, with a few null y rows scattered
+        y_vals = np.random.RandomState(42).randn(len(issue_rep))
+        y_vals[10] = np.nan
+        y_vals[500] = np.nan
+        # Also null at tail
+        y_vals[-10:] = np.nan
+
+        synthetic_frame = pd.DataFrame({
+            "issue_time": issue_rep,
+            "horizon": horizon_rep,
+            "target_time": target_rep,
+            "y": y_vals,
+        })
+        for col in FEATURE_COLUMNS:
+            if col != "horizon":
+                synthetic_frame[col] = 1.0
+
+        train_end = "2025-01-20"
+        val_end = "2025-02-10"
+        embargo = 4
+
+        train, val, test = split_by_issue_date(
+            synthetic_frame,
+            train_end=train_end,
+            val_end=val_end,
+            embargo_days=embargo,
+        )
+
+        # 1. Null y rows are excluded from every split
+        assert train["y"].isna().sum() == 0
+        assert val["y"].isna().sum() == 0
+        assert test["y"].isna().sum() == 0
+
+        # 2. Splits are disjoint by issue_time
+        train_issues = set(train["issue_time"])
+        val_issues = set(val["issue_time"])
+        test_issues = set(test["issue_time"])
+        assert train_issues.isdisjoint(val_issues)
+        assert val_issues.isdisjoint(test_issues)
+        assert train_issues.isdisjoint(test_issues)
+
+        # 3. Check issue-date bounds and number of dropped issue dates at each boundary
+        train_dates = sorted({ts.tz_convert(LONDON_TZ).date() for ts in train_issues})
+        val_dates = sorted({ts.tz_convert(LONDON_TZ).date() for ts in val_issues})
+        test_dates = sorted({ts.tz_convert(LONDON_TZ).date() for ts in test_issues})
+
+        assert train_dates[-1] == date(2025, 1, 20)
+        assert val_dates[0] == date(2025, 1, 25)  # 21, 22, 23, 24 dropped = 4 days
+        dropped_b1 = (val_dates[0] - train_dates[-1]).days - 1
+        assert dropped_b1 >= embargo
+        assert dropped_b1 == 4
+
+        assert val_dates[-1] == date(2025, 2, 10)
+        assert test_dates[0] == date(2025, 2, 15)  # 11, 12, 13, 14 dropped = 4 days
+        dropped_b2 = (test_dates[0] - val_dates[-1]).days - 1
+        assert dropped_b2 >= embargo
+        assert dropped_b2 == 4
+
+        # 4. Target overlap prevention:
+        # max(target_time) of train < min(target_time) of validation - 48h
+        # max(target_time) of validation < min(target_time) of test - 48h
+        assert train["target_time"].max() < val["target_time"].min() - pd.Timedelta(hours=48)
+        assert val["target_time"].max() < test["target_time"].min() - pd.Timedelta(hours=48)
+
 
 
