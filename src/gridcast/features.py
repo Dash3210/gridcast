@@ -21,7 +21,10 @@ from pathlib import Path
 from typing import Final
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
+
+from gridcast.holidays import UK_BANK_HOLIDAYS
 
 DEFAULT_HORIZONS: Final[range] = range(1, 97)
 
@@ -265,4 +268,240 @@ def build_example_frame(
         pd.DataFrame with keys ('issue_time', 'horizon', 'target_time'), target 'y',
         and FEATURE_COLUMNS.
     """
-    raise NotImplementedError("build_example_frame contract defined; implementation pending.")
+    if "period_start_utc" not in intensity_df.columns:
+        raise ValueError("intensity_df must contain 'period_start_utc'")
+    if "actual" not in intensity_df.columns:
+        raise ValueError("intensity_df must contain 'actual'")
+    if intensity_df.empty:
+        raise ValueError("intensity_df is empty")
+
+    sorted_intensity = intensity_df.sort_values("period_start_utc").reset_index(drop=True)
+    intensity_ts = pd.to_datetime(sorted_intensity["period_start_utc"], utc=True)
+
+    # Actuals indexed by timestamp for timestamp lookup
+    actual_series = pd.Series(
+        sorted_intensity["actual"].to_numpy(dtype=float),
+        index=intensity_ts,
+    ).sort_index()
+
+    # 1. Resolve issue times
+    if issue_times is None:
+        min_dt = intensity_ts.min().floor("D")
+        max_dt = intensity_ts.max().floor("D")
+        issue_dt_index = pd.date_range(start=min_dt, end=max_dt, freq="D", tz="UTC")
+    else:
+        issue_dt_index = pd.DatetimeIndex(pd.to_datetime(list(issue_times), utc=True))
+
+    if len(issue_dt_index) == 0:
+        raise ValueError("issue_times resolved to an empty schedule")
+
+    # 2. Resolve horizons
+    horizons_arr = np.asarray(list(horizons), dtype=int)
+    if len(horizons_arr) == 0:
+        raise ValueError("horizons sequence cannot be empty")
+    if (horizons_arr < 1).any():
+        raise ValueError("horizons must be positive integers (>= 1)")
+
+    # 3. Form the grid of (issue_time, horizon)
+    n_issues = len(issue_dt_index)
+    n_horizons = len(horizons_arr)
+
+    issue_times_rep = pd.DatetimeIndex(np.repeat(issue_dt_index, n_horizons))
+    horizons_rep = np.tile(horizons_arr, n_issues)
+    target_times_rep = issue_times_rep + pd.to_timedelta(horizons_rep * 30, unit="m")
+
+    # 4. Enforce Horizon Contract in code (ADR-011)
+    # The day-2 weather forecast for target_time was issued at target_time - 48h.
+    # If horizon > 96 (48 hours), target_time - 48h > issue_time, which violates the contract.
+    w_forecast_issue_ts = target_times_rep - pd.Timedelta(hours=48)
+    if (w_forecast_issue_ts > issue_times_rep).any():
+        bad_idx = (w_forecast_issue_ts > issue_times_rep).argmax()
+        bad_issue = issue_times_rep[bad_idx]
+        bad_target = target_times_rep[bad_idx]
+        bad_h = horizons_rep[bad_idx]
+        bad_issue_str = w_forecast_issue_ts[bad_idx]
+        raise ValueError(
+            f"Horizon contract violation: horizon {bad_h} requires weather forecast for "
+            f"target {bad_target} issued at {bad_issue_str} > issue_time {bad_issue}."
+        )
+
+    result = pd.DataFrame({
+        "issue_time": issue_times_rep,
+        "horizon": horizons_rep,
+        "target_time": target_times_rep,
+    })
+
+    # 5. Target variable y (actual at target_time; may be NaN for unsettled targets)
+    result["y"] = pd.Series(target_times_rep).map(actual_series).to_numpy(dtype=float)
+
+    # 6. Lags of actual relative to issue_time
+    for lag_h in [1, 2, 3, 24, 48, 168]:
+        lag_ts = issue_dt_index - pd.Timedelta(hours=lag_h)
+        lag_vals = lag_ts.map(actual_series).to_numpy(dtype=float)
+        result[f"actual_lag_{lag_h}h"] = np.repeat(lag_vals, n_horizons)
+
+    # 7. Rolling statistics of actual ending strictly at issue_time - 30min
+    t_end = issue_dt_index - pd.Timedelta(minutes=30)
+    roll_3h = actual_series.rolling("3h", min_periods=1)
+    roll_24h = actual_series.rolling("24h", min_periods=1)
+    roll_168h = actual_series.rolling("168h", min_periods=1)
+
+    result["actual_rolling_3h_mean"] = np.repeat(
+        t_end.map(roll_3h.mean()).to_numpy(dtype=float), n_horizons
+    )
+    result["actual_rolling_3h_std"] = np.repeat(
+        t_end.map(roll_3h.std()).to_numpy(dtype=float), n_horizons
+    )
+    result["actual_rolling_24h_mean"] = np.repeat(
+        t_end.map(roll_24h.mean()).to_numpy(dtype=float), n_horizons
+    )
+    result["actual_rolling_24h_std"] = np.repeat(
+        t_end.map(roll_24h.std()).to_numpy(dtype=float), n_horizons
+    )
+    result["actual_rolling_168h_mean"] = np.repeat(
+        t_end.map(roll_168h.mean()).to_numpy(dtype=float), n_horizons
+    )
+    result["actual_rolling_168h_std"] = np.repeat(
+        t_end.map(roll_168h.std()).to_numpy(dtype=float), n_horizons
+    )
+
+    # 8. Calendar features of target_time (Europe/London clock and UK bank holidays)
+    target_london = target_times_rep.tz_convert(LONDON_TZ)
+    hour = target_london.hour
+    minute = target_london.minute
+    day_of_week = target_london.dayofweek
+    month = target_london.month
+    day_of_year = target_london.dayofyear
+    cal_date = target_london.date
+
+    result["hour_of_day"] = hour.to_numpy(dtype=int)
+    result["day_of_week"] = day_of_week.to_numpy(dtype=int)
+    result["month"] = month.to_numpy(dtype=int)
+    result["is_weekend"] = (day_of_week.to_numpy() >= 5).astype(int)
+    result["is_uk_bank_holiday"] = (
+        pd.Series(cal_date).isin(UK_BANK_HOLIDAYS).to_numpy(dtype=int)
+    )
+
+    hour_continuous = hour.to_numpy(dtype=float) + minute.to_numpy(dtype=float) / 60.0
+    result["sin_hour"] = np.sin(2.0 * np.pi * hour_continuous / 24.0)
+    result["cos_hour"] = np.cos(2.0 * np.pi * hour_continuous / 24.0)
+
+    doy_continuous = day_of_year.to_numpy(dtype=float) - 1.0
+    result["sin_day_of_year"] = np.sin(2.0 * np.pi * doy_continuous / 365.25)
+    result["cos_day_of_year"] = np.cos(2.0 * np.pi * doy_continuous / 365.25)
+
+    # 9. Weather features (Open-Meteo previous-runs day-2 forecast at target_time)
+    if weather_df is not None:
+        reanalysis_cols = [
+            c for c in weather_df.columns if "reanalysis" in c.lower() or "archive" in c.lower()
+        ]
+        if reanalysis_cols:
+            raise ValueError(
+                f"Weather from archive-api reanalysis is forbidden (found {reanalysis_cols}). "
+                "Must use Open-Meteo previous-runs day 2 forecast (temperature_2m_previous_day2)."
+            )
+
+        if "temperature_2m_previous_day2" in weather_df.columns:
+            w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
+            w_series = pd.Series(
+                weather_df["temperature_2m_previous_day2"].to_numpy(dtype=float),
+                index=w_ts,
+            ).sort_index()
+
+            # ADR-008: Map half-hour target_time to discrete containing hour target_time.floor("h")
+            containing_hours = target_times_rep.floor("h")
+            result["temperature"] = containing_hours.map(w_series).to_numpy(dtype=float)
+
+            w_roll_24h = w_series.rolling("24h", min_periods=1)
+            w_24h_mean = w_roll_24h.mean()
+            w_24h_min = w_roll_24h.min()
+
+            result["temperature_24h_mean"] = containing_hours.map(w_24h_mean).to_numpy(dtype=float)
+            result["temperature_24h_min"] = containing_hours.map(w_24h_min).to_numpy(dtype=float)
+        else:
+            result["temperature"] = np.nan
+            result["temperature_24h_mean"] = np.nan
+            result["temperature_24h_min"] = np.nan
+    else:
+        result["temperature"] = np.nan
+        result["temperature_24h_mean"] = np.nan
+        result["temperature_24h_min"] = np.nan
+
+    # 10. Generation mix features (fuel shares lagged to issue_time - 48h)
+    mix_lagged_ts = issue_dt_index - pd.Timedelta(hours=48)
+    if mix_df is not None:
+        m_ts = pd.to_datetime(mix_df["period_start_utc"], utc=True)
+        for fuel in MIX_FUELS:
+            col_name = f"mix_share_{fuel}"
+            if fuel in mix_df.columns:
+                fuel_series = pd.Series(
+                    mix_df[fuel].to_numpy(dtype=float),
+                    index=m_ts,
+                ).sort_index()
+                fuel_vals = mix_lagged_ts.map(fuel_series).to_numpy(dtype=float)
+                result[col_name] = np.repeat(fuel_vals, n_horizons)
+            elif col_name in mix_df.columns:
+                fuel_series = pd.Series(
+                    mix_df[col_name].to_numpy(dtype=float),
+                    index=m_ts,
+                ).sort_index()
+                fuel_vals = mix_lagged_ts.map(fuel_series).to_numpy(dtype=float)
+                result[col_name] = np.repeat(fuel_vals, n_horizons)
+            else:
+                result[col_name] = np.nan
+    else:
+        for fuel in MIX_FUELS:
+            result[f"mix_share_{fuel}"] = np.nan
+
+    # 11. Auxiliary requirements validation
+    if require_aux:
+        for col in ["temperature", "temperature_24h_mean", "temperature_24h_min"]:
+            if result[col].isna().all():
+                raise ValueError(
+                    f"Weather feature column '{col}' is entirely null with require_aux=True."
+                )
+        for fuel in MIX_FUELS:
+            col_name = f"mix_share_{fuel}"
+            if result[col_name].isna().all():
+                raise ValueError(
+                    f"Mix feature column '{col_name}' is entirely null with require_aux=True."
+                )
+
+        if weather_df is not None:
+            w_ts_valid = pd.to_datetime(weather_df["period_start_utc"], utc=True)
+            max_available_weather = w_ts_valid.max()
+            post_cutoff = (target_times_rep >= pd.Timestamp("2024-11-01 00:00:00+00:00")) & (
+                target_times_rep <= max_available_weather
+            )
+            null_temps = post_cutoff & result["temperature"].isna()
+            if null_temps.any():
+                bad_ts = target_times_rep[null_temps][0]
+                raise ValueError(
+                    f"Previous-runs temperature null at/after 2024-11-01 for {bad_ts}. "
+                    "Silent reanalysis fallback is strictly prohibited."
+                )
+
+    # 12. Make mix nulls explainable at point of use without imputation
+    if "mix_share_wind" in result.columns:
+        null_count = int(result["mix_share_wind"].isna().sum())
+        if null_count > 0:
+            sg_path = AUDIT_DIR_DEFAULT / "source-gaps.csv"
+            mix_gaps_count = 0
+            if sg_path.exists():
+                try:
+                    sg_df = pd.read_csv(sg_path)
+                    if not sg_df.empty and "store" in sg_df.columns:
+                        mix_gaps_count = len(sg_df[sg_df["store"] == "mix"])
+                except Exception:
+                    pass
+            warmup_issues = int(result.loc[result["mix_share_wind"].isna(), "issue_time"].nunique())
+            print(
+                f"Generation mix features: {null_count} null rows across "
+                f"{warmup_issues} issue times "
+                f"({mix_gaps_count} source gaps: upstream_empty; unimputed)"
+            )
+
+    # Enforce exact column ordering: keys + target y + FEATURE_COLUMNS
+    feature_cols_rest = [c for c in FEATURE_COLUMNS if c != "horizon"]
+    final_cols = ["issue_time", "horizon", "target_time", "y"] + feature_cols_rest
+    return result[final_cols].copy()

@@ -82,20 +82,54 @@ Today (Phase P2), the working automation targets are:
 - `make typecheck` — validates static typing with mypy across `src` and `tests`
 - `make clean` — removes virtual environment, caches, and build artefacts
 - `make ingest` — runs the nightly half-hourly ingest CLI (`gridcast ingest --days 2` followed by `gridcast ingest --reconcile-recent`)
+- `make features` — builds and inspects the canonical example feature frame keyed by `(issue_time, horizon)`
 - `make data-check` — asserts integrity and completeness of the committed curated dataset
 
 ### Features
 
 Phase P2 provides a bounded, leakage-free feature construction pipeline in `gridcast.features`:
-- **Temporal Integrity**: Enforces that no feature at target period `t` uses any value stamped after `t`. Verified via future-perturbation invariance tests across multiple cutoffs (mid-window, DST transitions, and dataset boundary).
-- **Time-based Keying**: All lags and rolling stats are keyed and sorted by `period_start_utc` timestamp lookup rather than row positions, ensuring correctness across 46-period (spring forward) and 50-period (autumn back) clock changes.
-- **Auxiliary Store Requirement**: The real build path (`load_feature_sources()`) loads all three source datasets from `data/curated/`, `data/weather/`, and `data/mix/`. `build_feature_frame(..., require_aux=True)` strictly requires all auxiliary features to be populated, failing if any feature column is entirely null or if previous-runs weather contains nulls within the active window.
-- **Bounded Feature Set (ADR-006, ADR-008)**:
-  - *Actual Lags*: `actual_lag_1h`, `actual_lag_2h`, `actual_lag_3h`, `actual_lag_24h`, `actual_lag_48h`, `actual_lag_168h`.
-  - *Actual Rolling Stats*: 3h, 24h, and 168h rolling mean and std, each window strictly ending at `t-1h`.
-  - *Calendar*: `hour_of_day`, `day_of_week`, `month`, `is_weekend`, `is_uk_bank_holiday` (from static 2024-2027 register), plus sin/cos cyclical encodings of hour and day-of-year.
-  - *Weather*: Open-Meteo previous-runs day-2 forecast temperature at `t` (matching the 48-hour issue horizon; reanalysis is forbidden), mapped from hourly forecast to half-hourly period via containing hour `t.floor("h")` (ADR-008), plus 24h mean and 24h min ending at `t`.
-  - *Generation Mix*: Observed fuel shares for `wind`, `solar`, `gas`, `coal`, `nuclear`, and `biomass` lagged to `t-48h` to prevent contemporaneous leakage.
+- **Issue-Time Framing (ADR-011)**: Forecasts Great Britain's carbon intensity 48 hours ahead from a single issue time. The canonical frame is keyed by `(issue_time, horizon)` where `target_time = issue_time + horizon * 30min` for `horizon in range(1, 97)` (731 daily issue times at 00:00 UTC × 96 horizons = 70,176 examples). The issue schedule is configurable via the `issue_times` parameter.
+- **Horizon Contract Enforced in Code (ADR-011)**: Every feature declares the maximum source timestamp it is permitted to read, asserting directly in code that all values are computable strictly from information available at `<= issue_time`. Any feature build attempting to read source data timestamped after `issue_time` raises `ValueError`.
+- **Temporal and Operational Leakage Guard**: Guarded by a sampled per-row perturbation invariance test across 25+ `(issue_time, horizon)` pairs covering dataset endpoints, DST transition days, and horizon limits (h=1 and h=96), asserting strict invariance when source rows stamped after `issue_time` are altered.
+- **Time-based Keying**: All lags and rolling stats are resolved by UTC timestamp lookup rather than row positions, ensuring correctness across 46-period (spring forward) and 50-period (autumn back) clock changes.
+- **Auxiliary Store Requirement**: `load_feature_sources()` loads source datasets from `data/curated/`, `data/weather/`, and `data/mix/`. `build_example_frame(..., require_aux=True)` enforces that auxiliary stores are present and populated.
+- **Bounded Feature Set (ADR-006, ADR-008, ADR-011)**:
+  - *Keys*: `issue_time`, `horizon`, `target_time` (`issue_time + horizon * 30min`).
+  - *Target (`y`)*: Realised carbon intensity `actual` at `target_time` (nullable for unsettled targets).
+  - *Actual Lags*: `actual_lag_1h`, `actual_lag_2h`, `actual_lag_3h`, `actual_lag_24h`, `actual_lag_48h`, `actual_lag_168h` relative to `issue_time`.
+  - *Actual Rolling Stats*: 3h, 24h, and 168h rolling mean and std, each window strictly ending at `issue_time - 30min`.
+  - *Calendar*: `hour_of_day`, `day_of_week`, `month`, `is_weekend`, `is_uk_bank_holiday` (from static 2024-2027 register), plus sin/cos cyclical encodings of hour and day-of-year evaluated at `target_time`.
+  - *Weather*: Open-Meteo previous-runs day-2 forecast temperature at `target_time` (forecast issued at `target_time - 48h <= issue_time`; reanalysis strictly forbidden), mapped via containing hour `target_time.floor("h")` (ADR-008), plus 24h rolling mean and min.
+  - *Generation Mix*: Observed fuel shares for `wind`, `solar`, `gas`, `coal`, `nuclear`, and `biomass` lagged to `issue_time - 48h`.
+
+#### How to Build and Inspect Features
+
+You can build and inspect the feature frame directly from the CLI or in Python without reading module internals:
+
+**Via Make / CLI**:
+```bash
+make features
+# or: .venv/bin/python -m gridcast.cli features
+```
+
+**In Python**:
+```python
+from gridcast.features import FEATURE_COLUMNS, build_example_frame, load_feature_sources
+
+# 1. Load source datasets
+intensity_df, weather_df, mix_df = load_feature_sources()
+
+# 2. Build example frame keyed by (issue_time, horizon)
+df = build_example_frame(intensity_df, weather_df, mix_df, require_aux=True)
+
+# 3. Extract feature matrix X and target y
+X = df[FEATURE_COLUMNS]
+y = df["y"]
+
+print(f"Dataset: {len(df):,} examples across {df['issue_time'].nunique()} issue times.")
+print(f"X shape: {X.shape} ({len(FEATURE_COLUMNS)} features)")
+print(f"y shape: {y.shape} ({y.notna().sum():,} settled targets)")
+```
 
 ### Ingest
 
@@ -158,7 +192,7 @@ data/
 - **Auxiliary Store Coverage and Source Gaps (ADR-009)**:
   - Both auxiliary stores (`data/mix/` and `data/weather/`) are subject to the same strict completeness invariant as the curated intensity archive: every period is either present in storage or recorded in `data/audit/source-gaps.csv`.
   - Ingestion performs an automated post-fetch coverage check against the curated grid (`check_mix_coverage_and_retry`, `check_weather_coverage_and_retry`). For missing periods, targeted retries recover boundary straddling periods (e.g. `2024-12-31T23:30Z` and `2025-12-31T23:30Z` on month boundaries).
-  - Periods that remain missing after retries because upstream returns empty payloads (`data: []`) are audited in `data/audit/source-gaps.csv` (`store,local_date,period_start_utc,reason`). In the current window, 25 generation mix periods across `2025-01-12`, `2025-01-13`, `2025-08-10`, and `2025-08-11` are documented source gaps (`upstream_empty`), while weather coverage is 100% complete.
+  - Periods that remain missing after retries because upstream returns empty payloads (`data: []`) are audited in `data/audit/source-gaps.csv` (`store,local_date,period_start_utc,reason`). In the current window, 25 generation mix periods grouped by `local_date` (2 on `2025-01-12`, 15 on `2025-01-13`, and 8 on `2025-08-11`; the partition for `2025-08-10` is complete at 48/48 periods) are documented source gaps (`upstream_empty`), while weather coverage is 100% complete.
   - At the point of use in feature extraction, mix feature columns reflect these 25 unrecoverable periods as nulls alongside the initial 96 warmup periods (at `t-48h`). These are reported transparently in `load_feature_sources()` and are never artificially imputed.
 
 - **Upstream Retractions and Conflict Audit**:

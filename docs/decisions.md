@@ -118,6 +118,18 @@
   - ERA5/Open-Meteo reanalysis (rejected: severe retrospective leakage; what was observed is not what was forecasted).
   - Blended historical forecast API (rejected: hides issue time and mutates historical forecasts retroactively).
 
+### Amendment: P2 Horizon Redesign and Anchoring to Issue Time
+- Date: 2026-11-02
+- Context:
+  The original ADR-006 claimed the feature layer "reproduces the exact information set available to an operational model at issue time `t-48h`". However, the initial feature frame was anchored to target period `t` with actual lags (`actual_lag_1h` .. `actual_lag_24h`) and rolling windows evaluated relative to target `t` (e.g. `t-1h`). At an issue time of `t-48h`, `t-1h` was 47 hours in the future. A model trained on that frame depended on observations that could not possibly exist at serving time (operational leakage).
+- Decision:
+  Rebuild the feature frame around `(issue_time, horizon)` where `DEFAULT_HORIZONS = range(1, 97)`.
+  1. All lags of actual are anchored to `issue_time - N hours` (1h, 2h, 3h, 24h, 48h, 168h).
+  2. All rolling statistics of actual end strictly at `issue_time - 30min`.
+  3. Generation mix fuel shares are lagged to `issue_time - 48h`.
+  4. Weather features evaluate `temperature_2m_previous_day2` at `target_time`, which was issued 48 hours earlier at `target_time - 48h <= issue_time`.
+  With this redesign, the claim becomes genuinely true: every feature column is computable strictly from data available at or before `issue_time`.
+
 ## ADR-007 — Evaluation gate policy: validation-fixed accuracy threshold and single-score test split
 - Status: accepted
 - Date: 2026-11-01
@@ -157,7 +169,7 @@
   The curated carbon intensity archive enforces a strict completeness invariant: every settlement period is either present in daily Parquet partitions or recorded in `data/audit/gaps.csv`. Auxiliary feature stores (`data/weather/` and `data/mix/`) initially lacked post-fetch coverage checking, which permitted 27 half-hourly generation mix periods to be silently omitted across the two-year window (resulting in 123 null values across all mix feature columns without an audit trail).
   Investigation revealed two distinct root causes:
   1. Chunk-boundary straddling behaviour (2 periods): The NESO generation endpoint (`/generation/{from}/{to}`) emits the half-hour period straddling before `{from}`. When fetching in monthly chunks bounded by midnight, `2024-12-31T23:30Z` and `2025-12-31T23:30Z` were excluded from the December partition and dropped during January ingestion because January's date filter only retained January dates. Re-requesting with `period_start_utc + 30min` recovers both periods.
-  2. Upstream absent data (25 periods): Across `2025-01-12` (2 periods), `2025-01-13` (15 periods), `2025-08-10` (2 periods), and `2025-08-11` (6 periods) — identical to the dates where upstream intensity payloads returned malformed JSON — the generation mix endpoint returns `data: []`. These periods are genuinely absent upstream and unrecoverable.
+  2. Upstream absent data (25 periods): Across 25 generation mix periods grouped by `local_date` (2 on `2025-01-12`, 15 on `2025-01-13`, and 8 on `2025-08-11`; the partition for `2025-08-10` is complete at 48/48 periods) — identical to the dates where upstream intensity payloads returned malformed JSON — the generation mix endpoint returns `data: []`. These periods are genuinely absent upstream and unrecoverable.
 - Decision:
   1. Auxiliary stores must be audited under the same standards as the curated intensity archive: no period may be silently absent.
   2. Implement a post-fetch coverage check with targeted retries (`check_mix_coverage_and_retry`, `check_weather_coverage_and_retry`):
@@ -190,5 +202,22 @@
   - Relying on coverage percentages to indicate thoroughness (rejected: both escaped defects were found under 89% and 96% coverage).
   - Relying on the generator's own test output as evidence (rejected: in each case the output was green and described the defect as normal behaviour).
 
-
-
+## ADR-011 — Leakage taxonomy: distinguishing temporal and operational leakage
+- Status: accepted
+- Date: 2026-11-02
+- Context:
+  During review of Phase P2, two independent reviews returned a blocking architectural defect: the initial feature frame was constructed with one row per target period `t`, anchoring actual lags (`actual_lag_1h` .. `_24h`) and rolling windows to target `t` instead of forecast issue time `T`. For a 48-hour ahead forecast (`h=96`), `actual_lag_1h` at target `t` was 47 hours in the future at issue time. Yet the test suite passed all tests green.
+  The defect escaped because two fundamentally distinct forms of leakage were conflated:
+  1. **Temporal leakage**: A feature reads a source value stamped after the target period (`t_source > target_time`).
+  2. **Operational leakage**: A feature reads a source value that exists in the historical dataset at the target period, but did not exist at the forecast issue time (`t_source > issue_time`).
+  A future-perturbation invariance test checking cutoffs against target time `t` alone proves only the absence of temporal leakage: because `t - 1h < t`, a feature reading `t - 1h` genuinely precedes target `t` and is invariant to perturbations after `t`. However, operationally the forecast is served at `issue_time = t - 48h`, where `t - 1h` has not occurred.
+- Decision:
+  1. Formally distinguish temporal leakage and operational leakage in architecture, documentation, and tests.
+  2. The canonical example frame is keyed by `(issue_time, horizon)` where `target_time = issue_time + horizon * 30min` for `horizon in 1..96` (48-hour half-hourly curve).
+  3. The horizon contract is enforced directly in code: each feature family declares the maximum allowed source timestamp, and the builder asserts that for every row and feature, `max_source_timestamp <= issue_time`. Any build attempting to read source data timestamped after `issue_time` must raise `ValueError`.
+  4. Operational leakage is guarded via sampled per-row perturbation testing across at least 25 `(issue_time, horizon)` pairs spanning dataset boundaries, DST transition days, and horizon endpoints: for each pair, all source rows timestamped after `issue_time` are replaced with sentinels, and the rebuilt feature row is asserted to be identical.
+- Consequences:
+  Guarantees train/serve integrity: models trained on the example frame depend exclusively on observations available at serving time.
+- Alternatives rejected:
+  - Relying on target-based invariance tests alone (rejected: blind to operational leakage when horizon > 1).
+  - Documenting horizon constraints solely in comments (rejected: permitted operational leakage through two review rounds).

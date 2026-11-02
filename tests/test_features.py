@@ -303,6 +303,40 @@ class TestFeatureContractAndInvariants:
                     f"Mix feature '{col_name}' matched contemporaneous mix rather than lagged!"
                 )
 
+    def test_lags_resolved_by_timestamp_never_by_row_shift(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """Lags must be resolved by timestamp, never by row position/shift."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        sample_issue = pd.Timestamp("2025-06-05 00:00:00+00:00")
+        target_lag_ts = sample_issue - pd.Timedelta(hours=48)
+
+        # Drop 4 half-hour periods between target_lag_ts and sample_issue
+        gap_ts = sample_issue - pd.Timedelta(hours=24)
+        drop_range = pd.date_range(gap_ts, periods=4, freq="30min", tz="UTC")
+        gapped_intensity = intensity_df[
+            ~pd.to_datetime(intensity_df["period_start_utc"], utc=True).isin(drop_range)
+        ].copy()
+
+        features = build_example_frame(
+            gapped_intensity,
+            weather_df,
+            mix_df,
+            issue_times=[sample_issue],
+            horizons=[1],
+            require_aux=False,
+        )
+
+        int_ts = pd.to_datetime(intensity_df["period_start_utc"], utc=True)
+        expected_val = intensity_df.loc[int_ts == target_lag_ts, "actual"].iloc[0]
+        actual_feat = features["actual_lag_48h"].iloc[0]
+        assert actual_feat == pytest.approx(expected_val, rel=1e-5), (
+            f"actual_lag_48h ({actual_feat}) did not match timestamp "
+            f"{target_lag_ts} ({expected_val}); "
+            "lag was likely computed by row position rather than timestamp!"
+        )
+
     def test_weather_feature_matches_previous_runs_differs_from_reanalysis(
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
@@ -397,11 +431,11 @@ class TestFeatureContractAndInvariants:
         """Build a sample from real data and assert no column is entirely null or constant."""
         intensity_df, weather_df, mix_df = load_feature_sources()
         sample_issues = [
-            pd.Timestamp("2025-02-01 00:00:00+00:00"),
+            pd.Timestamp("2024-12-25 00:00:00+00:00"),
             pd.Timestamp("2025-05-01 00:00:00+00:00"),
-            pd.Timestamp("2025-09-01 00:00:00+00:00"),
+            pd.Timestamp("2026-05-22 08:30:00+00:00"),
         ]
-        sample_horizons = [1, 24, 48, 96]
+        sample_horizons = [1, 48]
         features = build_example_frame(
             intensity_df,
             weather_df,

@@ -89,6 +89,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Window size in days for --reconcile-recent (default: 3).",
     )
 
+    features_parser = subparsers.add_parser(
+        "features",
+        help="Build and inspect the example feature frame.",
+    )
+    features_parser.add_argument(
+        "--no-require-aux",
+        dest="require_aux",
+        action="store_false",
+        default=True,
+        help="Do not require auxiliary stores (weather and mix) to be present.",
+    )
+
     subparsers.add_parser("train", help="Train carbon intensity forecast models.")
     subparsers.add_parser("backtest", help="Run backtest against NESO baseline.")
     subparsers.add_parser("serve", help="Run forecast API service.")
@@ -170,6 +182,42 @@ def main(argv: list[str] | None = None) -> int:
             reconcile_recent(window_days=args.window_days, today=today)
 
         return 1 if summary.failures > 0 else 0
+
+    if args.subcommand == "features":
+        from gridcast.features import (
+            FEATURE_COLUMNS,
+            build_example_frame,
+            load_feature_sources,
+        )
+
+        print("Loading feature sources (curated intensity, weather, mix)...")
+        intensity_df, weather_df, mix_df = load_feature_sources()
+        print("Building example frame keyed by (issue_time, horizon)...")
+        df = build_example_frame(
+            intensity_df=intensity_df,
+            weather_df=weather_df,
+            mix_df=mix_df,
+            require_aux=args.require_aux,
+        )
+        n_issues = df["issue_time"].nunique()
+        n_horizons = df["horizon"].nunique()
+        print("\nFeature frame constructed successfully:")
+        print(f"  Shape:             {df.shape[0]:,} rows x {df.shape[1]} columns")
+        print(f"  Distinct issues:   {n_issues:,} (daily at 00:00 UTC)")
+        print(f"  Distinct horizons: {n_horizons} (range 1..96 half-hours ahead)")
+        print(f"  Feature count (X): {len(FEATURE_COLUMNS)} columns")
+        print(f"  Target column (y): 'y' ({df['y'].notna().sum():,} non-null)")
+        print("\nNull counts per column:")
+        null_counts = df.isna().sum()
+        for col, count in null_counts.items():
+            if count > 0:
+                print(f"  {col:<26}: {count:>6} nulls ({count / len(df) * 100:.2f}%)")
+            else:
+                print(f"  {col:<26}:      0 nulls")
+        print("\nTo extract feature matrix X and target y:")
+        print("  X = df[FEATURE_COLUMNS]")
+        print("  y = df['y']")
+        return 0
 
     if args.subcommand == "train":
         todo("P3", "train")

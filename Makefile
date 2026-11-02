@@ -8,7 +8,7 @@ PYTHON ?= python3
 PY ?= .venv/bin/python
 endif
 
-.PHONY: help install test data-check clean ingest train eval serve docker lint typecheck
+.PHONY: help install test data-check clean ingest features train eval serve docker lint typecheck
 .DEFAULT_GOAL := help
 
 help:
@@ -18,6 +18,7 @@ help:
 	@echo   data-check - Assert integrity of committed curated dataset
 	@echo   clean      - Remove virtual environment, caches, and build artefacts
 	@echo   ingest     - Run ingest CLI
+	@echo   features   - Build and inspect the example feature frame
 	@echo   train      - Run model training CLI (arrives in P3)
 	@echo   eval       - Run model evaluation backtest (arrives in P3)
 	@echo   serve      - Run service API (arrives in P4)
@@ -42,6 +43,9 @@ clean:
 ingest:
 	"$(PY)" -m gridcast ingest --days 2
 	"$(PY)" -m gridcast ingest --reconcile-recent
+
+features:
+	"$(PY)" -m gridcast.cli features
 
 train:
 	"$(PY)" -m gridcast.cli train

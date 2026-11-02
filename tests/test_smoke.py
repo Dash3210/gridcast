@@ -25,6 +25,14 @@ def test_cli_version(capsys: pytest.CaptureFixture[str]) -> None:
     assert captured.out.strip() == f"gridcast {gridcast.__version__}"
 
 
+def test_cli_features(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["features"])
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "Feature frame constructed successfully" in captured.out
+    assert "Distinct issues" in captured.out
+
+
 def test_cli_unknown_subcommand_exits_two() -> None:
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["unknown-subcommand"])
