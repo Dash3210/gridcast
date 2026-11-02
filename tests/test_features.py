@@ -787,5 +787,44 @@ class TestPositiveModelInputSelection:
             select_model_inputs(bad_frame)
 
 
+class TestLeadingDateTrimming:
+    """Validate that incomplete leading issue dates from warmup are dropped (Section 5)."""
+
+    def test_leading_issue_dates_dropped_and_first_date_has_zero_null_features(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """The default frame must drop warmup dates; its first date has zero feature nulls."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        frame = build_example_frame(
+            intensity_df=intensity_df,
+            weather_df=weather_df,
+            mix_df=mix_df,
+            require_aux=True,
+        )
+
+        issue_dates = sorted({ts.tz_convert(LONDON_TZ).date() for ts in frame["issue_time"]})
+        first_issue_date = issue_dates[0]
+
+        # 1. Warmup of 7 days (168h lag) dropped: first date must be 2024-11-08
+        assert first_issue_date == date(2024, 11, 8), (
+            f"Expected first issue date 2024-11-08 after 7-day warmup drop, got {first_issue_date}"
+        )
+
+        # 2. Assert the first issue date in the frame has zero nulls across FEATURE_COLUMNS
+        first_date_mask = frame["issue_time"].dt.tz_convert(LONDON_TZ).dt.date == first_issue_date
+        first_date_frame = frame[first_date_mask]
+        feature_nulls = first_date_frame[FEATURE_COLUMNS].isna().sum()
+        assert (feature_nulls == 0).all(), (
+            f"First issue date {first_issue_date} has nulls in feature columns:\n"
+            f"{feature_nulls[feature_nulls > 0]}"
+        )
+
+        # 3. Target y may still have nulls at the tail
+        tail_nulls = frame["y"].isna().sum()
+        assert tail_nulls > 0, "Expected unsettled targets at the tail of the dataset to be null"
+
+
+
 
 

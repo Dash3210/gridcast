@@ -184,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if summary.failures > 0 else 0
 
     if args.subcommand == "features":
+        import pandas as pd
+
         from gridcast.features import (
             FEATURE_COLUMNS,
             build_example_frame,
@@ -204,6 +206,18 @@ def main(argv: list[str] | None = None) -> int:
         print("\nFeature frame constructed successfully:")
         print(f"  Shape:             {df.shape[0]:,} rows x {df.shape[1]} columns")
         print(f"  Distinct issues:   {n_issues:,} (daily at 00:00 Europe/London)")
+        total_schedule_dates = (
+            pd.to_datetime(intensity_df["period_start_utc"], utc=True)
+            .dt.tz_convert(ZoneInfo("Europe/London"))
+            .dt.date.nunique()
+        )
+        dropped_count = total_schedule_dates - n_issues
+        if dropped_count > 0:
+            first_issue = df["issue_time"].dt.tz_convert(ZoneInfo("Europe/London")).dt.date.min()
+            print(
+                f"  Leading dates dropped: {dropped_count} "
+                f"(warmup for 168h actual lag and 48h mix join; frame begins at {first_issue})"
+            )
         print(f"  Distinct horizons: {n_horizons} (range 1..96 half-hours ahead)")
         print(f"  Feature count (X): {len(FEATURE_COLUMNS)} columns")
         print(f"  Target column (y): 'y' ({df['y'].notna().sum():,} non-null)")

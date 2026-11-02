@@ -374,6 +374,7 @@ def build_example_frame(
     issue_times: Sequence[pd.Timestamp] | pd.DatetimeIndex | None = None,
     horizons: Sequence[int] | range = DEFAULT_HORIZONS,
     require_aux: bool = True,
+    trim_leading: bool | None = None,
 ) -> pd.DataFrame:
     """Build the example frame keyed by (issue_time, horizon) without leakage.
 
@@ -636,6 +637,64 @@ def build_example_frame(
                 f"{warmup_issues} issue times "
                 f"({mix_gaps_count} source gaps: upstream_empty; unimputed)"
             )
+
+    # 13. Drop incomplete leading issue dates from warmup (Section 5)
+    should_trim = (issue_times is None) if trim_leading is None else trim_leading
+    if should_trim and not result.empty:
+        sg_path = AUDIT_DIR_DEFAULT / "source-gaps.csv"
+        mix_gaps_ts: set[pd.Timestamp] = set()
+        weather_gaps_ts: set[pd.Timestamp] = set()
+        if sg_path.exists():
+            try:
+                sg_df = pd.read_csv(sg_path)
+                if not sg_df.empty and "store" in sg_df.columns:
+                    m_gaps = sg_df[sg_df["store"] == "mix"]
+                    w_gaps = sg_df[sg_df["store"] == "weather"]
+                    mix_gaps_ts = set(pd.to_datetime(m_gaps["period_start_utc"], utc=True))
+                    weather_gaps_ts = set(pd.to_datetime(w_gaps["period_start_utc"], utc=True))
+            except Exception:
+                pass
+
+        issue_dates = result["issue_time"].dt.tz_convert(LONDON_TZ).dt.date
+        unique_dates = sorted(issue_dates.unique())
+
+        first_complete_date = None
+        for d in unique_dates:
+            day_mask = issue_dates == d
+            day_df = result[day_mask]
+
+            is_complete = True
+            for col in FEATURE_COLUMNS:
+                null_mask = day_df[col].isna()
+                if not null_mask.any():
+                    continue
+
+                if col.startswith("mix_share_"):
+                    null_issue_times = day_df.loc[null_mask, "issue_time"]
+                    lagged_ts = null_issue_times - pd.Timedelta(hours=48)
+                    unexplained = [ts for ts in lagged_ts if ts not in mix_gaps_ts]
+                    if unexplained:
+                        is_complete = False
+                        break
+                elif col in ("temperature", "temperature_24h_mean", "temperature_24h_min"):
+                    null_target_times = day_df.loc[null_mask, "target_time"]
+                    containing_hours = null_target_times.dt.floor("h")
+                    unexplained = [ts for ts in containing_hours if ts not in weather_gaps_ts]
+                    if unexplained:
+                        is_complete = False
+                        break
+                else:
+                    is_complete = False
+                    break
+
+            if is_complete:
+                first_complete_date = d
+                break
+
+        if first_complete_date is not None:
+            dropped_dates = [d for d in unique_dates if d < first_complete_date]
+            if dropped_dates:
+                result = result[issue_dates >= first_complete_date].copy()
 
     # Enforce exact column ordering: keys + target y + FEATURE_COLUMNS
     feature_cols_rest = [c for c in FEATURE_COLUMNS if c != "horizon"]
