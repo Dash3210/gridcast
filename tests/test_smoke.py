@@ -51,7 +51,6 @@ def test_cli_unimplemented_subcommands_raise_phase_exit(
 @pytest.mark.parametrize(
     "module_name",
     [
-        "gridcast.features",
         "gridcast.models",
         "gridcast.backtest",
         "gridcast.serve",
@@ -60,6 +59,15 @@ def test_cli_unimplemented_subcommands_raise_phase_exit(
 def test_stub_modules_expose_empty_all(module_name: str) -> None:
     mod = importlib.import_module(module_name)
     assert getattr(mod, "__all__", None) == []
+
+
+def test_features_module_exposes_non_empty_all() -> None:
+    mod = importlib.import_module("gridcast.features")
+    all_symbols = getattr(mod, "__all__", None)
+    assert isinstance(all_symbols, list)
+    assert len(all_symbols) > 0
+    for symbol in all_symbols:
+        assert hasattr(mod, symbol)
 
 
 def test_ingest_module_exposes_non_empty_all() -> None:

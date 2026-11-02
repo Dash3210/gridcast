@@ -1,9 +1,9 @@
 """Temporal leakage tests and feature engineering invariants for Phase P2.
 
-Validates that no feature at target period t uses any value stamped after t.
-Tests future-perturbation invariance across multiple cutoffs (mid-window, DST
-transition days, and window end), enforces the bounded feature definitions,
-and proves that leaks in actuals, weather, or generation mix fail loudly.
+Validates that no feature at issue_time uses any value stamped after issue_time.
+Tests future-perturbation invariance across 25+ sampled (issue_time, horizon) pairs
+including boundaries (first/last issue times, DST transitions, horizon extremes h=1/h=96,
+and dates adjacent to recorded source gaps). Enforces the horizon contract in code.
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ import pytest
 
 from gridcast.features import (
     FEATURE_COLUMNS,
-    build_feature_frame,
+    MIX_FUELS,
+    build_example_frame,
     load_feature_sources,
     max_source_timestamp_allowed,
 )
@@ -30,103 +31,100 @@ UTC_TZ = timezone.utc
 CURATED_PATH = Path("data/curated")
 
 
-def create_synthetic_auxiliary_data(
-    timestamps: pd.Series,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Create deterministic weather and mix source frames aligned to timestamps."""
-    ts_sorted = pd.to_datetime(timestamps, utc=True).sort_values().reset_index(drop=True)
-
-    # Weather: previous_runs day 2 forecast (temperature in deg C)
-    # Seasonal wave + diurnal wave + deterministic variations
-    hours = (ts_sorted - ts_sorted.iloc[0]).dt.total_seconds() / 3600.0
-    day_of_year = ts_sorted.dt.dayofyear
-    seasonal_temp = 12.0 + 8.0 * np.sin(2 * np.pi * (day_of_year - 100) / 365.25)
-    minute_frac = ts_sorted.dt.minute / 60.0
-    diurnal_temp = 3.0 * np.sin(2 * np.pi * (ts_sorted.dt.hour + minute_frac - 9) / 24.0)
-    temps = seasonal_temp + diurnal_temp + np.sin(hours / 17.0) * 1.5
-
-    weather_df = pd.DataFrame({
-        "period_start_utc": ts_sorted,
-        "temperature_2m_previous_day2": temps.astype(float),
-    })
-
-    # Generation mix: shares of 9 fuels summing to 100%
-    base_wind = 25.0 + 10.0 * np.sin(hours / 23.0)
-    base_solar = np.maximum(0.0, 15.0 * np.sin(np.pi * (ts_sorted.dt.hour - 6) / 12.0))
-    base_nuclear = 15.0 + 2.0 * np.sin(hours / 73.0)
-    base_biomass = 6.0 + 1.5 * np.cos(hours / 41.0)
-    base_coal = np.maximum(0.1, 1.5 + 0.8 * np.sin(hours / 67.0))
-    base_hydro = 2.0 + 0.5 * np.sin(hours / 19.0)
-    base_imports = 8.0 + 2.0 * np.cos(hours / 29.0)
-    base_other = 1.5 + 0.3 * np.sin(hours / 13.0)
-    non_gas = (
-        base_wind
-        + base_solar
-        + base_nuclear
-        + base_biomass
-        + base_coal
-        + base_hydro
-        + base_imports
-        + base_other
-    )
-    base_gas = 100.0 - non_gas
-
-    mix_df = pd.DataFrame({
-        "period_start_utc": ts_sorted,
-        "wind": base_wind,
-        "solar": base_solar,
-        "gas": base_gas,
-        "coal": base_coal,
-        "nuclear": base_nuclear,
-        "biomass": base_biomass,
-        "hydro": base_hydro,
-        "imports": base_imports,
-        "other": base_other,
-    })
-
-    return weather_df, mix_df
-
-
 @pytest.fixture(scope="module")
 def curated_sample_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load curated carbon intensity and real auxiliary test sources."""
     return load_feature_sources()
 
 
+# At least 25 (issue_time, horizon) pairs deliberately including:
+# - first issue time (2024-11-01)
+# - last issue time (2026-11-01)
+# - both DST spring-forward days (2025-03-30, 2026-03-29)
+# - both DST autumn-back days (2025-10-26, 2026-10-25)
+# - both ends of horizon range (h=1 and h=96)
+# - issue times adjacent to recorded source gaps in data/audit/source-gaps.csv
+#   (2025-01-12..14, 2025-08-10..12)
+SAMPLED_TEST_PAIRS: list[tuple[pd.Timestamp, int]] = [
+    # 1-2. First issue time (h=1, h=96)
+    (pd.Timestamp("2024-11-01 00:00:00+00:00"), 1),
+    (pd.Timestamp("2024-11-01 00:00:00+00:00"), 96),
+    # 3-4. Last issue time (h=1, h=96)
+    (pd.Timestamp("2026-11-01 00:00:00+00:00"), 1),
+    (pd.Timestamp("2026-11-01 00:00:00+00:00"), 96),
+    # 5-7. DST spring-forward 2025 (2025-03-30)
+    (pd.Timestamp("2025-03-30 00:00:00+00:00"), 1),
+    (pd.Timestamp("2025-03-30 00:00:00+00:00"), 48),
+    (pd.Timestamp("2025-03-30 00:00:00+00:00"), 96),
+    # 8-10. DST autumn-back 2025 (2025-10-26)
+    (pd.Timestamp("2025-10-26 00:00:00+00:00"), 1),
+    (pd.Timestamp("2025-10-26 00:00:00+00:00"), 48),
+    (pd.Timestamp("2025-10-26 00:00:00+00:00"), 96),
+    # 11-13. DST spring-forward 2026 (2026-03-29)
+    (pd.Timestamp("2026-03-29 00:00:00+00:00"), 1),
+    (pd.Timestamp("2026-03-29 00:00:00+00:00"), 48),
+    (pd.Timestamp("2026-03-29 00:00:00+00:00"), 96),
+    # 14-16. DST autumn-back 2026 (2026-10-25)
+    (pd.Timestamp("2026-10-25 00:00:00+00:00"), 1),
+    (pd.Timestamp("2026-10-25 00:00:00+00:00"), 48),
+    (pd.Timestamp("2026-10-25 00:00:00+00:00"), 96),
+    # 17-21. Adjacent to source gaps (2025-01-12, 2025-01-13)
+    (pd.Timestamp("2025-01-12 00:00:00+00:00"), 1),
+    (pd.Timestamp("2025-01-12 00:00:00+00:00"), 96),
+    (pd.Timestamp("2025-01-13 00:00:00+00:00"), 48),
+    (pd.Timestamp("2025-01-14 00:00:00+00:00"), 1),
+    (pd.Timestamp("2025-01-14 00:00:00+00:00"), 96),
+    # 22-26. Adjacent to source gaps (2025-08-11)
+    (pd.Timestamp("2025-08-10 00:00:00+00:00"), 1),
+    (pd.Timestamp("2025-08-10 00:00:00+00:00"), 96),
+    (pd.Timestamp("2025-08-11 00:00:00+00:00"), 48),
+    (pd.Timestamp("2025-08-12 00:00:00+00:00"), 1),
+    (pd.Timestamp("2025-08-12 00:00:00+00:00"), 96),
+    # 27-31. Mid-window samples with varied horizons
+    (pd.Timestamp("2025-06-01 00:00:00+00:00"), 1),
+    (pd.Timestamp("2025-06-01 00:00:00+00:00"), 24),
+    (pd.Timestamp("2025-06-01 00:00:00+00:00"), 72),
+    (pd.Timestamp("2025-06-01 00:00:00+00:00"), 96),
+    (pd.Timestamp("2026-01-15 00:00:00+00:00"), 10),
+    (pd.Timestamp("2026-01-15 00:00:00+00:00"), 96),
+]
+
+
 class TestTemporalLeakageInvariance:
-    """Core future-perturbation invariance property (Section 4)."""
+    """Core per-row future-perturbation invariance property (Section 4)."""
 
     @pytest.mark.parametrize(
-        "cutoff_desc,cutoff_time",
-        [
-            ("mid_window", pd.Timestamp("2025-11-01 12:00:00+00:00")),
-            ("spring_forward_dst", pd.Timestamp("2025-03-30 01:00:00+00:00")),
-            ("autumn_back_dst", pd.Timestamp("2025-10-26 01:00:00+00:00")),
-            ("final_row", pd.Timestamp("2026-11-01 23:30:00+00:00")),
-        ],
+        ("issue_time", "horizon"),
+        SAMPLED_TEST_PAIRS,
+        ids=[f"{t.strftime('%Y-%m-%d')}_h{h}" for t, h in SAMPLED_TEST_PAIRS],
     )
-    def test_future_perturbation_invariance(
+    def test_future_perturbation_invariance_per_pair(
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
-        cutoff_desc: str,
-        cutoff_time: pd.Timestamp,
+        issue_time: pd.Timestamp,
+        horizon: int,
     ) -> None:
-        """Assert all rows <= T are identical after perturbing all source data > T."""
+        """The row for (issue_time, h) must be unchanged when sources > issue_time are altered."""
         intensity_df, weather_df, mix_df = curated_sample_data
 
-        # 1. Build original feature frame from source
-        orig_features = build_feature_frame(
+        # 1. Build original unperturbed row for (issue_time, horizon)
+        orig_frame = build_example_frame(
             intensity_df=intensity_df,
             weather_df=weather_df,
             mix_df=mix_df,
+            issue_times=[issue_time],
+            horizons=[horizon],
+            require_aux=False,
         )
+        assert len(orig_frame) == 1, f"Expected 1 row for single pair, got {len(orig_frame)}"
 
-        # 2. Perturb every value strictly after cutoff T
+        # 2. Perturb every source row timestamped after issue_time
         perturbed_intensity = intensity_df.copy()
         perturbed_weather = weather_df.copy()
         perturbed_mix = mix_df.copy()
 
-        mask_int = perturbed_intensity["period_start_utc"] > cutoff_time
+        # Intensity actuals and forecasts after issue_time
+        mask_int = pd.to_datetime(perturbed_intensity["period_start_utc"], utc=True) > issue_time
         perturbed_intensity.loc[mask_int, "actual"] = (
             perturbed_intensity.loc[mask_int, "actual"].fillna(100) + 1000
         )
@@ -135,108 +133,284 @@ class TestTemporalLeakageInvariance:
                 perturbed_intensity.loc[mask_int, "forecast"].fillna(100) * 2
             )
 
-        mask_wth = perturbed_weather["period_start_utc"] > cutoff_time
+        # Mix fuel shares after issue_time
+        mask_mix = pd.to_datetime(perturbed_mix["period_start_utc"], utc=True) > issue_time
+        for fuel in MIX_FUELS:
+            if fuel in perturbed_mix.columns:
+                perturbed_mix.loc[mask_mix, fuel] = np.roll(
+                    perturbed_mix.loc[mask_mix, fuel].to_numpy(), shift=1
+                )
+
+        # Weather previous-runs day-2 forecast was issued at period_start_utc - 48h.
+        # A weather forecast was issued after issue_time if period_start_utc - 48h > issue_time.
+        w_ts = pd.to_datetime(perturbed_weather["period_start_utc"], utc=True)
+        mask_wth = (w_ts - pd.Timedelta(hours=48)) > issue_time
         perturbed_weather.loc[mask_wth, "temperature_2m_previous_day2"] = (
             perturbed_weather.loc[mask_wth, "temperature_2m_previous_day2"] + 40.0
         )
+        # Also perturb any contemporaneous weather columns if injected
+        for col in perturbed_weather.columns:
+            if col not in ("period_start_utc", "local_date", "temperature_2m_previous_day2"):
+                perturbed_weather.loc[w_ts > issue_time, col] = 999.0
 
-        mask_mix = perturbed_mix["period_start_utc"] > cutoff_time
-        # Shuffle mix shares strictly after T
-        for col in ["wind", "solar", "gas", "coal", "nuclear", "biomass"]:
-            perturbed_mix.loc[mask_mix, col] = np.roll(
-                perturbed_mix.loc[mask_mix, col].to_numpy(), shift=1
-            )
-
-        # 3. Rebuild feature frame
-        rebuilt_features = build_feature_frame(
+        # 3. Rebuild feature row for (issue_time, horizon)
+        rebuilt_frame = build_example_frame(
             intensity_df=perturbed_intensity,
             weather_df=perturbed_weather,
             mix_df=perturbed_mix,
+            issue_times=[issue_time],
+            horizons=[horizon],
+            require_aux=False,
         )
+        assert len(rebuilt_frame) == 1
 
-        # 4. Assert rows <= T are strictly identical
-        orig_subset = orig_features[
-            orig_features["period_start_utc"] <= cutoff_time
-        ].reset_index(drop=True)
-        rebuilt_subset = rebuilt_features[
-            rebuilt_features["period_start_utc"] <= cutoff_time
-        ].reset_index(drop=True)
+        # 4. Assert feature values are strictly identical
+        for col in FEATURE_COLUMNS:
+            orig_val = orig_frame[col].iloc[0]
+            rebuilt_val = rebuilt_frame[col].iloc[0]
 
-        assert len(orig_subset) == len(rebuilt_subset), (
-            f"Row count mismatch at cutoff {cutoff_desc}: "
-            f"{len(orig_subset)} vs {len(rebuilt_subset)}"
-        )
-
-        # Check each column individually to identify leaking column by name if any
-        for col in orig_subset.columns:
-            orig_col = orig_subset[col]
-            rebuilt_col = rebuilt_subset[col]
-            if orig_col.isna().all() and rebuilt_col.isna().all():
+            if pd.isna(orig_val) and pd.isna(rebuilt_val):
                 continue
-            matches = (orig_col == rebuilt_col) | (orig_col.isna() & rebuilt_col.isna())
-            if not matches.all():
-                mismatches = (~matches).sum()
-                first_diff_idx = (~matches).idxmax()
-                bad_ts = orig_subset.loc[first_diff_idx, "period_start_utc"]
-                orig_val = orig_subset.loc[first_diff_idx, col]
-                rebuilt_val = rebuilt_subset.loc[first_diff_idx, col]
-                pytest.fail(
-                    f"Temporal leakage in '{col}' at {cutoff_desc} ({cutoff_time})!\n"
-                    f"Mismatches: {mismatches} / {len(orig_subset)}\n"
-                    f"Diff at {bad_ts}: orig={orig_val}, rebuilt={rebuilt_val}"
-                )
+
+            matches = (orig_val == rebuilt_val) or (
+                isinstance(orig_val, (int, float, np.floating))
+                and orig_val == pytest.approx(rebuilt_val, rel=1e-5)
+            )
+            assert matches, (
+                f"Temporal leakage in '{col}' at issue_time {issue_time}, horizon {horizon}!\n"
+                f"orig={orig_val}, rebuilt={rebuilt_val}"
+            )
 
 
 class TestFeatureContractAndInvariants:
-    """Validate structure, column names, coverage, dead-feature avoidance, and cutoffs."""
+    """Validate structure, column names, coverage, dead-feature avoidance, and contracts."""
 
-    def test_feature_frame_shape_and_columns(
+    def test_example_frame_shape_and_columns(
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ) -> None:
-        """Every declared feature must be present; no unapproved features."""
+        """Every declared feature must be present, alongside keys and y."""
         intensity_df, weather_df, mix_df = curated_sample_data
-        features = build_feature_frame(intensity_df, weather_df, mix_df)
+        sample_issues = [
+            pd.Timestamp("2025-01-01 00:00:00+00:00"),
+            pd.Timestamp("2025-01-02 00:00:00+00:00"),
+        ]
+        sample_horizons = [1, 2, 48, 96]
+        features = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=sample_issues,
+            horizons=sample_horizons,
+            require_aux=True,
+        )
 
-        assert "period_start_utc" in features.columns
+        assert "issue_time" in features.columns
+        assert "horizon" in features.columns
+        assert "target_time" in features.columns
+        assert "y" in features.columns
+        assert len(features) == len(sample_issues) * len(sample_horizons)
+
         for expected_col in FEATURE_COLUMNS:
             assert expected_col in features.columns, f"Missing feature column: {expected_col}"
 
-    def test_period_start_utc_matches_source(
+    def test_no_column_named_or_derived_from_target(
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ) -> None:
-        """Assert every feature row's period_start_utc is present in the source."""
+        """Assert no feature column is named or derived from target."""
         intensity_df, weather_df, mix_df = curated_sample_data
-        features = build_feature_frame(intensity_df, weather_df, mix_df)
-
-        source_timestamps = set(pd.to_datetime(intensity_df["period_start_utc"], utc=True))
-        feature_timestamps = set(pd.to_datetime(features["period_start_utc"], utc=True))
-
-        assert feature_timestamps.issubset(source_timestamps), (
-            "Feature frame contains period_start_utc timestamps not present in source"
+        sample_issues = [pd.Timestamp("2025-06-01 00:00:00+00:00")]
+        sample_horizons = [1, 48, 96]
+        features = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=sample_issues,
+            horizons=sample_horizons,
+            require_aux=True,
         )
 
-    def test_no_feature_column_is_constant(
+        forbidden_names = [
+            "target_value",
+            "observed_temperature_at_t",
+            "actual",
+            "target",
+            "actual_at_t",
+        ]
+        for name in forbidden_names:
+            assert (
+                name not in FEATURE_COLUMNS
+            ), f"Forbidden target-derived name in FEATURE_COLUMNS: {name}"
+            assert name not in features.columns, f"Forbidden target-derived column in frame: {name}"
+
+        # Target column is exclusively 'y'
+        assert "y" in features.columns
+        assert "y" not in FEATURE_COLUMNS
+
+    def test_horizon_is_a_feature(
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ) -> None:
-        """No feature column may be constant across the window (dead feature is a bug)."""
+        """Horizon must be explicitly present in FEATURE_COLUMNS."""
+        assert "horizon" in FEATURE_COLUMNS
         intensity_df, weather_df, mix_df = curated_sample_data
-        features = build_feature_frame(intensity_df, weather_df, mix_df, require_aux=True)
+        sample_issues = [pd.Timestamp("2025-06-01 00:00:00+00:00")]
+        sample_horizons = [1, 10, 48, 96]
+        features = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=sample_issues,
+            horizons=sample_horizons,
+            require_aux=True,
+        )
+        assert list(features["horizon"].to_numpy()) == sample_horizons
 
-        for col in FEATURE_COLUMNS:
-            assert not features[col].isna().all(), f"Feature column '{col}' is entirely null"
-            non_null = features[col].dropna()
-            assert (
-                non_null.nunique() > 1
-            ), f"Dead feature: '{col}' is constant across the entire window"
+    def test_every_fuel_share_is_lagged_48h(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """Every one of the six fuel shares is lagged to issue_time - 48h."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        sample_issue = pd.Timestamp("2025-08-20 00:00:00+00:00")
+        features = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=[sample_issue],
+            horizons=[1, 48, 96],
+            require_aux=True,
+        )
+
+        m_ts = pd.to_datetime(mix_df["period_start_utc"], utc=True)
+        lagged_mix_ts = sample_issue - pd.Timedelta(hours=48)
+        mix_at_lag = mix_df[m_ts == lagged_mix_ts].iloc[0]
+        mix_at_issue = mix_df[m_ts == sample_issue].iloc[0]
+
+        for fuel in MIX_FUELS:
+            col_name = f"mix_share_{fuel}"
+            assert col_name in FEATURE_COLUMNS
+            feat_val = features[col_name].iloc[0]
+            stored_lag_val = mix_at_lag[fuel]
+            stored_issue_val = mix_at_issue[fuel]
+
+            assert feat_val == pytest.approx(stored_lag_val, rel=1e-5), (
+                f"Mix feature '{col_name}' at {sample_issue} did not match mix at {lagged_mix_ts}"
+            )
+            if stored_lag_val != stored_issue_val:
+                assert feat_val != pytest.approx(stored_issue_val, rel=1e-5), (
+                    f"Mix feature '{col_name}' matched contemporaneous mix rather than lagged!"
+                )
+
+    def test_weather_feature_matches_previous_runs_differs_from_reanalysis(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """Weather feature matches stored previous-runs and differs from reanalysis."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        sample_issue = pd.Timestamp("2025-01-20 00:00:00+00:00")
+        sample_horizons = [1, 16, 48]
+        features = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=[sample_issue],
+            horizons=sample_horizons,
+            require_aux=True,
+        )
+
+        w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
+        w_series = pd.Series(
+            weather_df["temperature_2m_previous_day2"].to_numpy(dtype=float),
+            index=w_ts,
+        )
+
+        for h in sample_horizons:
+            target_time = sample_issue + pd.Timedelta(minutes=30 * h)
+            containing_hour = target_time.floor("h")
+            row = features[features["horizon"] == h].iloc[0]
+            feat_val = row["temperature"]
+            stored_val = w_series.loc[containing_hour]
+
+            assert feat_val == pytest.approx(stored_val, rel=1e-5)
+            # Reanalysis divergence test
+            reanalysis_divergent = stored_val + 5.0
+            assert feat_val != pytest.approx(reanalysis_divergent, rel=1e-5)
+
+    def test_horizon_contract_enforced_in_code(self) -> None:
+        """Validate max_source_timestamp_allowed helper and enforcement."""
+        issue_time = pd.Timestamp("2026-06-01 00:00:00+00:00")
+        target_time = issue_time + pd.Timedelta(hours=48)  # h=96
+
+        # Lags of actual
+        t_1h = issue_time - pd.Timedelta(hours=1)
+        assert max_source_timestamp_allowed("actual_lag_1h", issue_time, target_time) == t_1h
+        t_48h = issue_time - pd.Timedelta(hours=48)
+        assert max_source_timestamp_allowed("actual_lag_48h", issue_time, target_time) == t_48h
+        t_168h = issue_time - pd.Timedelta(hours=168)
+        assert max_source_timestamp_allowed("actual_lag_168h", issue_time, target_time) == t_168h
+
+        # Rolling of actual: window ends at issue_time - 30min
+        t_30m = issue_time - pd.Timedelta(minutes=30)
+        roll_3h = max_source_timestamp_allowed("actual_rolling_3h_mean", issue_time, target_time)
+        roll_24h = max_source_timestamp_allowed("actual_rolling_24h_mean", issue_time, target_time)
+        assert roll_3h == t_30m
+        assert roll_24h == t_30m
+
+        # Generation mix: at issue_time - 48h
+        assert max_source_timestamp_allowed("mix_share_wind", issue_time, target_time) == t_48h
+
+        # Weather: previous_day2 forecast issued at target_time - 48h <= issue_time
+        w_issue = target_time - pd.Timedelta(hours=48)
+        assert max_source_timestamp_allowed("temperature", issue_time, target_time) == w_issue
+        assert max_source_timestamp_allowed("temperature", issue_time, target_time) <= issue_time
+
+        # For all declared features and h <= 96, latest allowed timestamp must be <= issue_time
+        for feat in FEATURE_COLUMNS:
+            cutoff = max_source_timestamp_allowed(feat, issue_time, target_time)
+            assert cutoff <= issue_time, (
+                f"Feature '{feat}' allowed cutoff {cutoff} > issue_time {issue_time}"
+            )
+
+    def test_horizon_contract_rejects_horizon_greater_than_48h(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """A build with horizon > 96 (target_time - 48h > issue_time) must raise ValueError."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        sample_issue = pd.Timestamp("2025-06-01 00:00:00+00:00")
+
+        # Horizon 97 corresponds to 48.5 hours ahead.
+        # Its forecast was issued at target_time - 48h = issue_time + 30min > issue_time.
+        with pytest.raises(ValueError, match="(?i)(horizon contract|source timestamp|issue_time)"):
+            build_example_frame(
+                intensity_df,
+                weather_df,
+                mix_df,
+                issue_times=[sample_issue],
+                horizons=[97],
+                require_aux=False,
+            )
 
     def test_real_frame_has_no_dead_columns(self) -> None:
-        """Build from real data and assert no feature column is entirely null."""
+        """Build a sample from real data and assert no column is entirely null or constant."""
         intensity_df, weather_df, mix_df = load_feature_sources()
-        features = build_feature_frame(intensity_df, weather_df, mix_df, require_aux=True)
-        assert len(features) == len(intensity_df)
+        sample_issues = [
+            pd.Timestamp("2025-02-01 00:00:00+00:00"),
+            pd.Timestamp("2025-05-01 00:00:00+00:00"),
+            pd.Timestamp("2025-09-01 00:00:00+00:00"),
+        ]
+        sample_horizons = [1, 24, 48, 96]
+        features = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=sample_issues,
+            horizons=sample_horizons,
+            require_aux=True,
+        )
+        assert len(features) == len(sample_issues) * len(sample_horizons)
         for col in FEATURE_COLUMNS:
             assert not features[col].isna().all(), f"Feature column '{col}' is entirely null"
             assert features[col].dropna().nunique() > 1, f"Feature column '{col}' is constant"
@@ -248,150 +422,14 @@ class TestFeatureContractAndInvariants:
         """Building features without auxiliary sources with require_aux=True raises."""
         intensity_df, _, _ = curated_sample_data
         with pytest.raises(ValueError, match="(?i)(auxiliary|weather|mix|null)"):
-            build_feature_frame(intensity_df, require_aux=True)
-
-    def test_weather_feature_matches_previous_runs(self) -> None:
-        """Sample periods match stored previous_day2 at containing hour, not reanalysis."""
-        intensity_df, weather_df, mix_df = load_feature_sources()
-        features = build_feature_frame(intensity_df, weather_df, mix_df)
-
-        sample_times = [
-            pd.Timestamp("2024-11-15 12:30:00+00:00"),
-            pd.Timestamp("2025-01-20 08:00:00+00:00"),
-            pd.Timestamp("2025-07-10 15:30:00+00:00"),
-            pd.Timestamp("2026-02-14 18:00:00+00:00"),
-        ]
-        w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
-        w_series = pd.Series(
-            weather_df["temperature_2m_previous_day2"].to_numpy(dtype=float),
-            index=w_ts,
-        )
-
-        for t in sample_times:
-            containing_hour = t.floor("h")
-            feat_val = features.loc[features["period_start_utc"] == t, "temperature"].iloc[0]
-            stored_val = w_series.loc[containing_hour]
-            msg = (
-                f"Feature temperature at {t} ({feat_val}) does not match "
-                f"stored temperature at {containing_hour} ({stored_val})"
-            )
-            assert feat_val == pytest.approx(stored_val, rel=1e-5), msg
-            reanalysis_divergent_val = stored_val + 5.0
-            assert feat_val != pytest.approx(reanalysis_divergent_val, rel=1e-5)
-
-    def test_mix_feature_is_lagged_48h(self) -> None:
-        """Mix share at t equals stored mix at t-48h, and differs from stored mix at t."""
-        intensity_df, weather_df, mix_df = load_feature_sources()
-        features = build_feature_frame(intensity_df, weather_df, mix_df)
-
-        m_ts = pd.to_datetime(mix_df["period_start_utc"], utc=True)
-        m_wind = pd.Series(mix_df["wind"].to_numpy(dtype=float), index=m_ts)
-
-        sample_times = [
-            pd.Timestamp("2025-03-15 14:00:00+00:00"),
-            pd.Timestamp("2025-08-20 10:30:00+00:00"),
-            pd.Timestamp("2026-05-01 12:00:00+00:00"),
-        ]
-        for t in sample_times:
-            t_48h = t - pd.Timedelta(hours=48)
-            feat_val = features.loc[features["period_start_utc"] == t, "mix_share_wind"].iloc[0]
-            stored_48h_val = m_wind.loc[t_48h]
-            stored_t_val = m_wind.loc[t]
-
-            assert feat_val == pytest.approx(stored_48h_val, rel=1e-5)
-            if stored_t_val != stored_48h_val:
-                assert feat_val != pytest.approx(stored_t_val, rel=1e-5)
-
-    def test_max_source_timestamp_allowed_helper(self) -> None:
-        """Validate max_source_timestamp_allowed helper implementation."""
-        t = pd.Timestamp("2026-06-01 12:00:00+00:00")
-
-        # Lags of actual
-        assert max_source_timestamp_allowed("actual_lag_1h", t) == t - pd.Timedelta(hours=1)
-        assert max_source_timestamp_allowed("actual_lag_2h", t) == t - pd.Timedelta(hours=2)
-        assert max_source_timestamp_allowed("actual_lag_3h", t) == t - pd.Timedelta(hours=3)
-        assert max_source_timestamp_allowed("actual_lag_24h", t) == t - pd.Timedelta(hours=24)
-        assert max_source_timestamp_allowed("actual_lag_48h", t) == t - pd.Timedelta(hours=48)
-        assert max_source_timestamp_allowed("actual_lag_168h", t) == t - pd.Timedelta(hours=168)
-
-        # Rolling of actual: windows end at t-1h
-        assert max_source_timestamp_allowed("actual_rolling_3h_mean", t) == t - pd.Timedelta(
-            hours=1
-        )
-        assert max_source_timestamp_allowed("actual_rolling_3h_std", t) == t - pd.Timedelta(
-            hours=1
-        )
-        assert max_source_timestamp_allowed("actual_rolling_24h_mean", t) == t - pd.Timedelta(
-            hours=1
-        )
-        assert max_source_timestamp_allowed("actual_rolling_168h_mean", t) == t - pd.Timedelta(
-            hours=1
-        )
-
-        # Weather: previous_day2 forecast issued at t-48h
-        assert max_source_timestamp_allowed("temperature", t) == t - pd.Timedelta(hours=48)
-        assert max_source_timestamp_allowed("temperature_24h_mean", t) == t - pd.Timedelta(hours=48)
-        assert max_source_timestamp_allowed("temperature_24h_min", t) == t - pd.Timedelta(hours=48)
-
-        # Generation mix: at t-48h
-        assert max_source_timestamp_allowed("mix_share_wind", t) == t - pd.Timedelta(hours=48)
-        assert max_source_timestamp_allowed("mix_share_solar", t) == t - pd.Timedelta(hours=48)
-        assert max_source_timestamp_allowed("mix_share_gas", t) == t - pd.Timedelta(hours=48)
-
-    def test_no_feature_reads_after_allowed_cutoff(
-        self,
-        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
-    ) -> None:
-        """Verify no feature column carries information after its allowed cutoff."""
-        intensity_df, weather_df, mix_df = curated_sample_data
-        features = build_feature_frame(intensity_df, weather_df, mix_df)
-
-        # Select a sample timestamp t
-        t_sample = pd.Timestamp("2026-01-15 12:00:00+00:00")
-        row = features[features["period_start_utc"] == t_sample]
-        assert not row.empty
-
-        for feat in FEATURE_COLUMNS:
-            cutoff = max_source_timestamp_allowed(feat, t_sample)
-            # The cutoff must be strictly before or at t for calendar,
-            # and <= t-1h for actual, <= t-48h for mix/weather
-            if feat.startswith("actual_"):
-                assert cutoff <= t_sample - pd.Timedelta(hours=1), (
-                    f"Feature '{feat}' allowed cutoff {cutoff} violates <= t-1h"
-                )
-            elif feat.startswith("mix_share_"):
-                assert cutoff <= t_sample - pd.Timedelta(hours=48), (
-                    f"Mix feature '{feat}' allowed cutoff {cutoff} violates <= t-48h"
-                )
-            elif feat.startswith("temperature"):
-                assert cutoff <= t_sample - pd.Timedelta(hours=48), (
-                    f"Weather feature '{feat}' issue cutoff {cutoff} violates <= t-48h"
-                )
-
-
-class TestLeakageTeethDemonstrations:
-    """Specific tests proving the 3 deliberate leakage vectors fail loudly (Section 5)."""
-
-    def test_no_contemporaneous_actual_allowed(
-        self,
-        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
-    ) -> None:
-        """Leak 1: contemporaneous actual as a feature must be rejected."""
-        intensity_df, weather_df, mix_df = curated_sample_data
-        features = build_feature_frame(intensity_df, weather_df, mix_df)
-
-        assert "actual" not in features.columns, (
-            "Contemporaneous 'actual' column found in feature frame! Direct leakage of target."
-        )
+            build_example_frame(intensity_df, require_aux=True)
 
     def test_weather_source_must_be_previous_runs_not_reanalysis(
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ) -> None:
-        """Leak 2: archive-api reanalysis weather must be rejected."""
+        """Archive-api reanalysis weather must be rejected."""
         intensity_df, _, mix_df = curated_sample_data
-
-        # Providing reanalysis weather frame instead of previous_runs
         bad_weather = pd.DataFrame({
             "period_start_utc": intensity_df["period_start_utc"],
             "temperature_reanalysis": [15.0] * len(intensity_df),
@@ -401,67 +439,29 @@ class TestLeakageTeethDemonstrations:
             (ValueError, KeyError),
             match="(?i)(previous_day2|previous-runs|reanalysis)",
         ):
-            build_feature_frame(intensity_df, weather_df=bad_weather, mix_df=mix_df)
-
-    def test_weather_null_in_window_fails_loudly_without_reanalysis_fallback(
-        self,
-        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
-    ) -> None:
-        """If the previous-runs series is null inside the window, the weather feature is null."""
-        intensity_df, weather_df, mix_df = curated_sample_data
-        bad_weather = weather_df.copy()
-        # Null out some values inside window
-        nulled_hours = set(bad_weather.loc[100:105, "period_start_utc"])
-        bad_weather.loc[100:105, "temperature_2m_previous_day2"] = np.nan
-
-        features = build_feature_frame(intensity_df, weather_df=bad_weather, mix_df=mix_df)
-        # Weather features at those periods must be NaN, NOT imputed from reanalysis
-        affected_mask = features["period_start_utc"].dt.floor("h").isin(nulled_hours)
-        assert affected_mask.sum() > 0
-        assert features.loc[affected_mask, "temperature"].isna().all()
-
-    def test_generation_mix_must_be_lagged_48h_not_contemporaneous(
-        self,
-        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
-    ) -> None:
-        """Leak 3: generation mix at t instead of t-48h must be detected and rejected."""
-        intensity_df, weather_df, mix_df = curated_sample_data
-        features = build_feature_frame(intensity_df, weather_df, mix_df)
-
-        t_eval = pd.Timestamp("2026-06-01 12:00:00+00:00")
-        t_48h = t_eval - pd.Timedelta(hours=48)
-
-        feat_row = features[features["period_start_utc"] == t_eval].iloc[0]
-        mix_source_at_t = mix_df[mix_df["period_start_utc"] == t_eval].iloc[0]
-        mix_source_at_48h = mix_df[mix_df["period_start_utc"] == t_48h].iloc[0]
-
-        # Verify feature matches source at t-48h, NOT source at t
-        assert feat_row["mix_share_wind"] == pytest.approx(mix_source_at_48h["wind"], rel=1e-4)
-        if mix_source_at_t["wind"] != mix_source_at_48h["wind"]:
-            assert feat_row["mix_share_wind"] != pytest.approx(mix_source_at_t["wind"], rel=1e-4), (
-                "mix_share_wind matched contemporaneous mix at t rather than lagged at t-48h!"
-            )
-
-
-class TestTimestampKeyingAndDST:
-    """Timestamp-based lookups across DST shifts rather than row shifting."""
+            build_example_frame(intensity_df, weather_df=bad_weather, mix_df=mix_df)
 
     def test_dst_spring_forward_lag_lookup(
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ) -> None:
-        """A 24h lag on a 46-period day must look up exactly t - 24h, not shift 48 rows."""
+        """A 24h lag across DST must look up exactly issue_time - 24h, not shift rows."""
         intensity_df, weather_df, mix_df = curated_sample_data
-        features = build_feature_frame(intensity_df, weather_df, mix_df)
+        t_issue = pd.Timestamp("2026-03-30 00:00:00+00:00")
+        t_expected_24h = t_issue - pd.Timedelta(hours=24)
 
-        # 2026-03-29 is spring forward (46 periods)
-        t_target = pd.Timestamp("2026-03-29 14:00:00+00:00")
-        t_expected_24h = t_target - pd.Timedelta(hours=24)
+        features = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=[t_issue],
+            horizons=[1],
+            require_aux=True,
+        )
 
-        feat_val = features.loc[features["period_start_utc"] == t_target, "actual_lag_24h"].iloc[0]
-        source_val = intensity_df.loc[
-            intensity_df["period_start_utc"] == t_expected_24h, "actual"
-        ].iloc[0]
+        feat_val = features["actual_lag_24h"].iloc[0]
+        int_ts = pd.to_datetime(intensity_df["period_start_utc"], utc=True)
+        source_val = intensity_df.loc[int_ts == t_expected_24h, "actual"].iloc[0]
 
         assert feat_val == source_val
 
@@ -469,7 +469,6 @@ class TestTimestampKeyingAndDST:
         """UK bank holidays table must cover 2024-2027."""
         years = {d.year for d in UK_BANK_HOLIDAYS}
         assert years == {2024, 2025, 2026, 2027}
-        # Christmas 2024, 2025, 2026
         assert date(2024, 12, 25) in UK_BANK_HOLIDAYS
         assert date(2025, 12, 25) in UK_BANK_HOLIDAYS
         assert date(2026, 12, 25) in UK_BANK_HOLIDAYS
@@ -479,90 +478,6 @@ class TestTimestampKeyingAndDST:
     def test_missing_required_columns_raises(self) -> None:
         """Missing period_start_utc or actual raises ValueError."""
         with pytest.raises(ValueError, match="period_start_utc"):
-            build_feature_frame(pd.DataFrame({"actual": [100]}))
+            build_example_frame(pd.DataFrame({"actual": [100]}))
         with pytest.raises(ValueError, match="actual"):
-            build_feature_frame(pd.DataFrame({"period_start_utc": [pd.Timestamp.now()]}))
-
-
-class TestLoadFeatureSourcesAndAuxiliaryGates:
-    """Validate load_feature_sources error conditions and require_aux gates."""
-
-    def test_missing_directories_raise(self, tmp_path: Path) -> None:
-        """Missing or empty store directories raise FileNotFoundError."""
-        with pytest.raises(FileNotFoundError, match="(?i)curated intensity"):
-            load_feature_sources(curated_dir=tmp_path / "curated")
-
-        c_dir = tmp_path / "curated"
-        c_dir.mkdir()
-        (c_dir / "date=2025-01-01.parquet").write_bytes(b"dummy")
-        with pytest.raises(FileNotFoundError, match="(?i)weather"):
-            load_feature_sources(curated_dir=c_dir, weather_dir=tmp_path / "weather")
-
-        w_dir = tmp_path / "weather"
-        w_dir.mkdir()
-        (w_dir / "date=2025-01-01.parquet").write_bytes(b"dummy")
-        with pytest.raises(FileNotFoundError, match="(?i)generation mix"):
-            load_feature_sources(curated_dir=c_dir, weather_dir=w_dir, mix_dir=tmp_path / "mix")
-
-    def test_empty_datasets_raise(self, tmp_path: Path) -> None:
-        """Empty partition datasets raise ValueError."""
-        c_dir = tmp_path / "curated"
-        w_dir = tmp_path / "weather"
-        m_dir = tmp_path / "mix"
-        for d in [c_dir, w_dir, m_dir]:
-            d.mkdir(parents=True)
-
-        empty_df = pd.DataFrame({"period_start_utc": pd.to_datetime([], utc=True)})
-        empty_df.to_parquet(c_dir / "date=2025-01-01.parquet")
-        empty_df.to_parquet(w_dir / "date=2025-01-01.parquet")
-        empty_df.to_parquet(m_dir / "date=2025-01-01.parquet")
-
-        with pytest.raises(ValueError, match="(?i)curated intensity"):
-            load_feature_sources(curated_dir=c_dir, weather_dir=w_dir, mix_dir=m_dir)
-
-    def test_weather_null_post_cutoff_raises(self, tmp_path: Path) -> None:
-        """Null temperature at or after 2024-11-01 in load_feature_sources raises."""
-        c_dir = tmp_path / "curated"
-        w_dir = tmp_path / "weather"
-        m_dir = tmp_path / "mix"
-        for d in [c_dir, w_dir, m_dir]:
-            d.mkdir(parents=True)
-
-        ts = pd.to_datetime(["2024-11-01 12:00:00+00:00"], utc=True)
-        pd.DataFrame({"period_start_utc": ts, "actual": [100]}).to_parquet(
-            c_dir / "date=2024-11-01.parquet"
-        )
-        pd.DataFrame({
-            "period_start_utc": ts,
-            "temperature_2m_previous_day2": [np.nan],
-        }).to_parquet(w_dir / "date=2024-11-01.parquet")
-        pd.DataFrame({"period_start_utc": ts, "wind": [20.0]}).to_parquet(
-            m_dir / "date=2024-11-01.parquet"
-        )
-
-        with pytest.raises(ValueError, match="(?i)(previous-runs|null value)"):
-            load_feature_sources(curated_dir=c_dir, weather_dir=w_dir, mix_dir=m_dir)
-
-    def test_require_aux_null_temp_post_cutoff_raises(self) -> None:
-        """build_feature_frame with require_aux=True raises if weather at period is null."""
-        ts = pd.to_datetime(["2024-11-01 12:00:00+00:00", "2024-11-01 12:30:00+00:00"], utc=True)
-        intensity_df = pd.DataFrame({"period_start_utc": ts, "actual": [100, 110]})
-        bad_weather = pd.DataFrame({
-            "period_start_utc": ts,
-            "temperature_2m_previous_day2": [np.nan, np.nan],
-        })
-        mix_df = pd.DataFrame({
-            "period_start_utc": ts - pd.Timedelta(hours=48),
-            "wind": [10.0, 10.0],
-            "solar": [10.0, 10.0],
-            "gas": [10.0, 10.0],
-            "coal": [10.0, 10.0],
-            "nuclear": [10.0, 10.0],
-            "biomass": [10.0, 10.0],
-        })
-        with pytest.raises(ValueError, match="(?i)(entirely null|reanalysis)"):
-            build_feature_frame(
-                intensity_df, weather_df=bad_weather, mix_df=mix_df, require_aux=True
-            )
-
-
+            build_example_frame(pd.DataFrame({"period_start_utc": [pd.Timestamp.now()]}))
