@@ -1,0 +1,3 @@
+# Parquet partitions are binary. Without this, git treats them as text and a nightly commit
+# shows the scoreboard and archive as a full-file rewrite rather than a changed file.
+*.parquet binary
