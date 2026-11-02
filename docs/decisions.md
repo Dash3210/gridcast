@@ -269,3 +269,16 @@
   Guarantees that downstream model inputs remain strictly bounded, predictable, and immune to undeclared column leakage.
 - Alternatives rejected:
   - Negative selection via `df.drop(columns=["y"])` (rejected: silently leaks unexpected or undeclared columns directly into model features).
+
+## ADR-015 — Injection tests: asserting mutation preconditions before verifying guards
+- Status: accepted
+- Date: 2026-11-02
+- Context:
+  In defensive testing, guard assertions check that an injection, perturbation, or malformed payload is detected and rejected (or that causal invariance holds under future perturbations). However, if an injection silently fails to apply—such as modifying a non-existent column, targeting a filtered slice, or injecting values identical to the original—the test passes trivially (false green). In this project's history, two injections silently failed to alter anything, and the resulting green test suite was briefly misread as a vulnerability in the guard rather than a defect in the test.
+- Decision:
+  An injection test must first assert that the injection took effect—the injected column exists, or the altered value actually differs from the original—and only then assert that the guard fires or invariance holds.
+- Consequences:
+  Eliminates silent injection failures. Any test whose mutation does not alter state will fail immediately on the precondition assertion before reaching the guard verdict.
+- Alternatives rejected:
+  - Trusting guard verdicts without verifying mutation application (rejected: permits vacuous green tests).
+

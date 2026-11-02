@@ -363,6 +363,11 @@ class TestFeatureContractAndInvariants:
             ~pd.to_datetime(intensity_df["period_start_utc"], utc=True).isin(drop_range)
         ].copy()
 
+        # Prove the injection landed (ADR-015): assert rows were actually dropped
+        assert len(gapped_intensity) == len(intensity_df) - 4, (
+            "Precondition failed: exactly 4 periods must be dropped from intensity_df"
+        )
+
         features = build_example_frame(
             gapped_intensity,
             weather_df,
@@ -466,13 +471,16 @@ class TestFeatureContractAndInvariants:
 
         # Horizon 97 corresponds to 48.5 hours ahead.
         # Its forecast was issued at target_time - 48h = issue_time + 30min > issue_time.
+        bad_horizons = [97]
+        # Prove the injection landed (ADR-015): assert horizon is beyond 48 hours
+        assert any(h > 96 for h in bad_horizons), "Precondition failed: horizon > 96 required"
         with pytest.raises(ValueError, match="(?i)(horizon contract|source timestamp|issue_time)"):
             build_example_frame(
                 intensity_df,
                 weather_df,
                 mix_df,
                 issue_times=[sample_issue],
-                horizons=[97],
+                horizons=bad_horizons,
                 require_aux=False,
             )
 
@@ -518,6 +526,15 @@ class TestFeatureContractAndInvariants:
             "temperature_reanalysis": [15.0] * len(intensity_df),
         })
 
+        # Prove the injection landed (ADR-015):
+        # assert reanalysis column exists and previous_day2 is absent
+        assert "temperature_reanalysis" in bad_weather.columns, (
+            "Precondition failed: 'temperature_reanalysis' must be present in injected frame"
+        )
+        assert "temperature_2m_previous_day2" not in bad_weather.columns, (
+            "Precondition failed: 'temperature_2m_previous_day2' must be absent from injected frame"
+        )
+
         with pytest.raises(
             (ValueError, KeyError),
             match="(?i)(previous_day2|previous-runs|reanalysis)",
@@ -560,10 +577,16 @@ class TestFeatureContractAndInvariants:
 
     def test_missing_required_columns_raises(self) -> None:
         """Missing period_start_utc or actual raises ValueError."""
+        # Prove the injection landed (ADR-015): assert missing columns are genuinely absent
+        df_no_utc = pd.DataFrame({"actual": [100]})
+        assert "period_start_utc" not in df_no_utc.columns, "Precondition failed"
         with pytest.raises(ValueError, match="period_start_utc"):
-            build_example_frame(pd.DataFrame({"actual": [100]}))
+            build_example_frame(df_no_utc)
+
+        df_no_act = pd.DataFrame({"period_start_utc": [pd.Timestamp.now()]})
+        assert "actual" not in df_no_act.columns, "Precondition failed"
         with pytest.raises(ValueError, match="actual"):
-            build_example_frame(pd.DataFrame({"period_start_utc": [pd.Timestamp.now()]}))
+            build_example_frame(df_no_act)
 
 
 class TestIssueAnchorEuropeLondon:
@@ -800,6 +823,10 @@ class TestPositiveModelInputSelection:
             require_aux=True,
         )
         bad_frame = frame.drop(columns=["temperature"])
+        # Prove the injection landed (ADR-015): assert column was actually dropped
+        assert "temperature" not in bad_frame.columns, (
+            "Precondition failed: 'temperature' must be absent"
+        )
         with pytest.raises(ValueError, match="(?i)(missing.*column|temperature)"):
             select_model_inputs(bad_frame)
 
@@ -819,6 +846,10 @@ class TestPositiveModelInputSelection:
         )
         bad_frame = frame.copy()
         bad_frame["sneaky_extra_column"] = 42.0
+        # Prove the injection landed (ADR-015): assert extra column exists
+        assert "sneaky_extra_column" in bad_frame.columns, (
+            "Precondition failed: 'sneaky_extra_column' must be present"
+        )
         with pytest.raises(ValueError, match="(?i)(undeclared.*column|sneaky_extra_column)"):
             select_model_inputs(bad_frame)
 
@@ -912,6 +943,9 @@ class TestPerHorizonWeatherLead:
     ) -> None:
         intensity_df, weather_df, mix_df = curated_sample_data
         sample_issue = pd.Timestamp("2025-01-20 00:00:00+00:00")
+        override = {72: "temperature_2m_previous_day1"}
+        # Prove the injection landed (ADR-015): assert override deliberately specifies day 1
+        assert override[72] == "temperature_2m_previous_day1", "Precondition failed"
         with pytest.raises(ValueError, match="Horizon contract violation"):
             build_example_frame(
                 intensity_df,
@@ -920,7 +954,7 @@ class TestPerHorizonWeatherLead:
                 issue_times=[sample_issue],
                 horizons=[72],
                 require_aux=True,
-                weather_series_by_horizon={72: "temperature_2m_previous_day1"},
+                weather_series_by_horizon=override,
             )
 
 
