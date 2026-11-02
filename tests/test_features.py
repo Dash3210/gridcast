@@ -8,6 +8,7 @@ and dates adjacent to recorded source gaps). Enforces the horizon contract in co
 
 from __future__ import annotations
 
+import math
 from datetime import date, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -1025,6 +1026,212 @@ class TestPerHorizonWeatherLead:
                 require_aux=True,
                 weather_series_by_horizon=override,
             )
+
+
+def naive_feature_oracle(
+    intensity_df: pd.DataFrame,
+    weather_df: pd.DataFrame,
+    mix_df: pd.DataFrame,
+    issue_time: pd.Timestamp,
+    horizon: int,
+    feature_name: str,
+) -> float:
+    """Compute expected feature value via slow, obvious raw store lookups.
+
+    Recomputes directly from raw store with slow, obvious pandas lookups
+    (e.g., store.loc[store['period_start_utc'] == expected_ts, ...]) and
+    never calls the feature builder.
+    """
+    target_time = issue_time + pd.Timedelta(minutes=30 * horizon)
+
+    if feature_name == "horizon":
+        return float(horizon)
+
+    if feature_name == "actual_recent_3h":
+        expected_ts = issue_time - ACTUAL_AVAILABILITY_LAG
+        rows = intensity_df.loc[intensity_df["period_start_utc"] == expected_ts, "actual"]
+        return float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+
+    if feature_name == "actual_lag_24h":
+        expected_ts = issue_time - pd.Timedelta(hours=24)
+        rows = intensity_df.loc[intensity_df["period_start_utc"] == expected_ts, "actual"]
+        return float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+
+    if feature_name == "actual_lag_48h":
+        expected_ts = issue_time - pd.Timedelta(hours=48)
+        rows = intensity_df.loc[intensity_df["period_start_utc"] == expected_ts, "actual"]
+        return float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+
+    if feature_name == "actual_lag_168h":
+        expected_ts = issue_time - pd.Timedelta(hours=168)
+        rows = intensity_df.loc[intensity_df["period_start_utc"] == expected_ts, "actual"]
+        return float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+
+    if feature_name.startswith("actual_rolling_"):
+        t_end = issue_time - ACTUAL_AVAILABILITY_LAG
+        if "3h" in feature_name:
+            t_start = t_end - pd.Timedelta(hours=3)
+        elif "24h" in feature_name:
+            t_start = t_end - pd.Timedelta(hours=24)
+        elif "168h" in feature_name:
+            t_start = t_end - pd.Timedelta(hours=168)
+        else:
+            raise ValueError(f"Unknown rolling feature: {feature_name}")
+
+        window_rows = intensity_df.loc[
+            (intensity_df["period_start_utc"] > t_start)
+            & (intensity_df["period_start_utc"] <= t_end),
+            "actual",
+        ]
+        if "mean" in feature_name:
+            return float(window_rows.mean())
+        if "std" in feature_name:
+            val = window_rows.std()
+            return float(val) if pd.notna(val) else float("nan")
+
+    target_local = target_time.tz_convert(LONDON_TZ)
+    if feature_name == "hour_of_day":
+        return float(target_local.hour)
+    if feature_name == "day_of_week":
+        return float(target_local.dayofweek)
+    if feature_name == "month":
+        return float(target_local.month)
+    if feature_name == "is_weekend":
+        return 1.0 if target_local.dayofweek >= 5 else 0.0
+    if feature_name == "is_uk_bank_holiday":
+        return 1.0 if target_local.date() in UK_BANK_HOLIDAYS else 0.0
+    if feature_name == "sin_hour":
+        hour_cont = target_local.hour + target_local.minute / 60.0
+        return float(np.sin(2.0 * np.pi * hour_cont / 24.0))
+    if feature_name == "cos_hour":
+        hour_cont = target_local.hour + target_local.minute / 60.0
+        return float(np.cos(2.0 * np.pi * hour_cont / 24.0))
+    if feature_name == "sin_day_of_year":
+        doy_cont = target_local.dayofyear - 1.0
+        return float(np.sin(2.0 * np.pi * doy_cont / 365.25))
+    if feature_name == "cos_day_of_year":
+        doy_cont = target_local.dayofyear - 1.0
+        return float(np.cos(2.0 * np.pi * doy_cont / 365.25))
+
+    if feature_name in ("temperature", "temperature_24h_mean", "temperature_24h_min"):
+        target_hour = target_time.floor("h")
+        col = (
+            "temperature_2m_previous_day1"
+            if horizon <= 48
+            else "temperature_2m_previous_day2"
+        )
+        if feature_name == "temperature":
+            rows = weather_df.loc[weather_df["period_start_utc"] == target_hour, col]
+            if rows.empty or pd.isna(rows.iloc[0]):
+                return float("nan")
+            return float(rows.iloc[0])
+        t_start = target_hour - pd.Timedelta(hours=24)
+        window_rows = weather_df.loc[
+            (weather_df["period_start_utc"] > t_start)
+            & (weather_df["period_start_utc"] <= target_hour),
+            col,
+        ]
+        if feature_name == "temperature_24h_mean":
+            return float(window_rows.mean())
+        if feature_name == "temperature_24h_min":
+            return float(window_rows.min())
+
+    if feature_name.startswith("mix_share_"):
+        fuel = feature_name.removeprefix("mix_share_")
+        expected_ts = issue_time - pd.Timedelta(hours=48)
+        col = fuel if fuel in mix_df.columns else feature_name
+        rows = mix_df.loc[mix_df["period_start_utc"] == expected_ts, col]
+        return float(rows.iloc[0]) if not rows.empty and pd.notna(rows.iloc[0]) else float("nan")
+
+    raise ValueError(f"Unknown feature: {feature_name}")
+
+
+DENSE_GRID_TEST_DATES: list[str] = [
+    # All four DST transition days
+    "2025-03-30",
+    "2025-10-26",
+    "2026-03-29",
+    "2026-10-25",
+    # Each date adjacent to a recorded source gap
+    "2025-01-12",
+    "2025-01-13",
+    "2025-08-10",
+    "2025-08-11",
+    "2025-08-12",
+    "2025-08-13",
+]
+
+
+@pytest.fixture(scope="module")
+def dense_grid_frame(
+    curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+) -> pd.DataFrame:
+    """Build dense example frame across all DST and gap-adjacent test dates."""
+    intensity_df, weather_df, mix_df = curated_sample_data
+    issue_times = [issue_time_for_date(d) for d in DENSE_GRID_TEST_DATES]
+    return build_example_frame(
+        intensity_df=intensity_df,
+        weather_df=weather_df,
+        mix_df=mix_df,
+        issue_times=issue_times,
+        horizons=range(1, 97),
+        require_aux=True,
+    )
+
+
+class TestDenseValueGridOracle:
+    """Validate builder values against naive raw store lookups across dense grid."""
+
+    @pytest.mark.parametrize(
+        "test_date",
+        DENSE_GRID_TEST_DATES,
+        ids=DENSE_GRID_TEST_DATES,
+    )
+    def test_dense_grid_matches_naive_store_oracle(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+        dense_grid_frame: pd.DataFrame,
+        test_date: str,
+    ) -> None:
+        """Assert every declared feature across all 96 horizons equals naive store oracle."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        issue_time = issue_time_for_date(test_date)
+
+        day_frame = dense_grid_frame[dense_grid_frame["issue_time"] == issue_time]
+        assert len(day_frame) == 96
+
+        for h in range(1, 97):
+            row = day_frame[day_frame["horizon"] == h].iloc[0]
+            for feat in FEATURE_COLUMNS:
+                builder_val = row[feat]
+                oracle_val = naive_feature_oracle(
+                    intensity_df,
+                    weather_df,
+                    mix_df,
+                    issue_time,
+                    h,
+                    feat,
+                )
+                if pd.isna(builder_val) and pd.isna(oracle_val):
+                    continue
+                assert not pd.isna(builder_val), (
+                    f"Builder returned NaN for {feat} at {test_date} (issue={issue_time}), h={h}, "
+                    f"but oracle returned {oracle_val}"
+                )
+                assert not pd.isna(oracle_val), (
+                    f"Oracle returned NaN for {feat} at {test_date} (issue={issue_time}), h={h}, "
+                    f"but builder returned {builder_val}"
+                )
+                assert math.isclose(
+                    float(builder_val),
+                    float(oracle_val),
+                    rel_tol=1e-5,
+                    abs_tol=1e-7,
+                ), (
+                    f"Value mismatch for {feat} on {test_date} (issue={issue_time}), h={h}: "
+                    f"builder={builder_val}, oracle={oracle_val}"
+                )
+
 
 
 
