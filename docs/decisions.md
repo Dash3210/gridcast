@@ -282,3 +282,25 @@
 - Alternatives rejected:
   - Trusting guard verdicts without verifying mutation application (rejected: permits vacuous green tests).
 
+## ADR-016 — Availability allowance: three-hour lag on actual-derived features
+- Status: accepted
+- Date: 2026-11-02
+- Context:
+  Live observation on 2026-11-01 demonstrated that NESO publication of actual carbon intensity is subject to significant operational latency:
+  - Settlement periods ending at 20:00Z were observed still null at 20:11Z.
+  - Earlier in the evening, settlement periods were observed still null 40 minutes after they ended.
+  A feature that is mathematically correct by timestamp (such as reading the actual for the half-hour ending 30 minutes prior to issue) can still be unavailable in production at issue time. Retaining `actual_lag_1h`, `actual_lag_2h`, or `actual_lag_3h` conceals operational leakage where serving code attempts to read data that has not yet arrived.
+- Decision:
+  1. Define a parameterized module-level constant `ACTUAL_AVAILABILITY_LAG = 3 hours` (`pd.Timedelta(hours=3)`).
+  2. Apply this allowance once for the entire frame: because a single forecast issue produces all 96 horizons simultaneously from one information set, no horizon may observe fresher actuals than another by construction.
+  3. Rename `actual_lag_1h` to `actual_recent_3h`—the most recent actual available at issue time, defined as "the actual for the half hour ending immediately before `issue_time - ACTUAL_AVAILABILITY_LAG`".
+  4. Drop `actual_lag_2h` and `actual_lag_3h`: under a 3-hour availability allowance, they are unavailable by definition, and preserving them would either be false or duplicate `actual_recent_3h`.
+  5. Retain `actual_lag_24h`, `actual_lag_48h`, and `actual_lag_168h` under their existing names because their source timestamps remain valid and precede the availability cutoff.
+  6. Align all actual rolling windows (`actual_rolling_*`) to terminate strictly at `issue_time - ACTUAL_AVAILABILITY_LAG` rather than `issue_time - 30min`.
+  7. The 3-hour allowance chosen on 2026-11-02 is conservative pending empirical arrival measurement from `first_seen_at` once nightly runs have accumulated.
+- Consequences:
+  All actual-derived features read at or before `issue_time - ACTUAL_AVAILABILITY_LAG`, ensuring train/serve parity without operational leakage.
+- Alternatives rejected:
+  - Allowing horizons to observe different freshness of actuals (rejected: one issue produces all 96 horizons from a single information set).
+  - Forward-imputing stale values under the old lag names (rejected: dishonest naming conceals data drift).
+

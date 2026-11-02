@@ -17,6 +17,7 @@ import pandas as pd
 import pytest
 
 from gridcast.features import (
+    ACTUAL_AVAILABILITY_LAG,
     FEATURE_COLUMNS,
     MIX_FUELS,
     build_example_frame,
@@ -432,19 +433,22 @@ class TestFeatureContractAndInvariants:
         target_time = issue_time + pd.Timedelta(hours=48)  # h=96
 
         # Lags of actual
-        t_1h = issue_time - pd.Timedelta(hours=1)
-        assert max_source_timestamp_allowed("actual_lag_1h", issue_time, target_time) == t_1h
+        t_recent_3h = issue_time - ACTUAL_AVAILABILITY_LAG
+        assert (
+            max_source_timestamp_allowed("actual_recent_3h", issue_time, target_time)
+            == t_recent_3h
+        )
         t_48h = issue_time - pd.Timedelta(hours=48)
         assert max_source_timestamp_allowed("actual_lag_48h", issue_time, target_time) == t_48h
         t_168h = issue_time - pd.Timedelta(hours=168)
         assert max_source_timestamp_allowed("actual_lag_168h", issue_time, target_time) == t_168h
 
-        # Rolling of actual: window ends at issue_time - 30min
-        t_30m = issue_time - pd.Timedelta(minutes=30)
+        # Rolling of actual: window ends at issue_time - ACTUAL_AVAILABILITY_LAG
+        t_roll = issue_time - ACTUAL_AVAILABILITY_LAG
         roll_3h = max_source_timestamp_allowed("actual_rolling_3h_mean", issue_time, target_time)
         roll_24h = max_source_timestamp_allowed("actual_rolling_24h_mean", issue_time, target_time)
-        assert roll_3h == t_30m
-        assert roll_24h == t_30m
+        assert roll_3h == t_roll
+        assert roll_24h == t_roll
 
         # Generation mix: at issue_time - 48h
         assert max_source_timestamp_allowed("mix_share_wind", issue_time, target_time) == t_48h
@@ -453,6 +457,71 @@ class TestFeatureContractAndInvariants:
         w_issue = target_time - pd.Timedelta(hours=48)
         assert max_source_timestamp_allowed("temperature", issue_time, target_time) == w_issue
         assert max_source_timestamp_allowed("temperature", issue_time, target_time) <= issue_time
+
+    def test_actual_availability_allowance(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """Assert actual-derived features observe ACTUAL_AVAILABILITY_LAG and match store."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        issue_time = pd.Timestamp("2026-06-01 00:00:00+00:00")
+        target_time = issue_time + pd.Timedelta(hours=24)
+
+        # 1. Assert every actual-derived feature's source timestamp is at or before issue_time - 3h
+        actual_features = [
+            "actual_recent_3h",
+            "actual_lag_24h",
+            "actual_lag_48h",
+            "actual_lag_168h",
+            "actual_rolling_3h_mean",
+            "actual_rolling_3h_std",
+            "actual_rolling_24h_mean",
+            "actual_rolling_24h_std",
+            "actual_rolling_168h_mean",
+            "actual_rolling_168h_std",
+        ]
+        three_hours = pd.Timedelta(hours=3)
+        assert three_hours == ACTUAL_AVAILABILITY_LAG
+
+        for feat in actual_features:
+            max_ts = max_source_timestamp_allowed(feat, issue_time, target_time)
+            assert max_ts <= issue_time - three_hours, (
+                f"Feature {feat} source ts {max_ts} > cutoff {issue_time - three_hours}"
+            )
+            assert max_ts <= issue_time - ACTUAL_AVAILABILITY_LAG
+
+        # 2. Assert actual_recent_3h equals the store value at that instant
+        frame = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=[issue_time],
+            horizons=[1, 48],
+            require_aux=True,
+        )
+        expected_instant = issue_time - ACTUAL_AVAILABILITY_LAG
+        sorted_i = intensity_df.sort_values("period_start_utc").reset_index(drop=True)
+        expected_val = float(
+            sorted_i.loc[sorted_i["period_start_utc"] == expected_instant, "actual"].iloc[0]
+        )
+        assert frame["actual_recent_3h"].iloc[0] == expected_val
+
+        # 3. Assert constant is parameterised and used rather than hardcoded literal 3
+        custom_lag = pd.Timedelta(hours=5)
+        custom_frame = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=[issue_time],
+            horizons=[1],
+            require_aux=True,
+            actual_availability_lag=custom_lag,
+        )
+        custom_expected_instant = issue_time - custom_lag
+        custom_expected_val = float(
+            sorted_i.loc[sorted_i["period_start_utc"] == custom_expected_instant, "actual"].iloc[0]
+        )
+        assert custom_frame["actual_recent_3h"].iloc[0] == custom_expected_val
 
         # For all declared features and h <= 96, latest allowed timestamp must be <= issue_time
         for feat in FEATURE_COLUMNS:

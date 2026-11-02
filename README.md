@@ -101,8 +101,8 @@ Phase P2 provides a bounded, leakage-free feature construction pipeline in `grid
 - **Bounded Feature Set (ADR-006, ADR-008, ADR-011)**:
   - *Keys*: `issue_time`, `horizon`, `target_time` (`issue_time + horizon * 30min`).
   - *Target (`y`)*: Realised carbon intensity `actual` at `target_time` (nullable for unsettled targets).
-  - *Actual Lags*: `actual_lag_1h`, `actual_lag_2h`, `actual_lag_3h`, `actual_lag_24h`, `actual_lag_48h`, `actual_lag_168h` relative to `issue_time`.
-  - *Actual Rolling Stats*: 3h, 24h, and 168h rolling mean and std, each window strictly ending at `issue_time - 30min`.
+  - *Actual Features (ADR-016)*: `actual_recent_3h` (the most recent actual available at issue time, for the half hour ending immediately before `issue_time - ACTUAL_AVAILABILITY_LAG`), and historical lags `actual_lag_24h`, `actual_lag_48h`, `actual_lag_168h` relative to `issue_time`.
+  - *Actual Rolling Stats*: 3h, 24h, and 168h rolling mean and std, each window strictly ending at `issue_time - ACTUAL_AVAILABILITY_LAG`.
   - *Calendar*: `hour_of_day`, `day_of_week`, `month`, `is_weekend`, `is_uk_bank_holiday` (from static 2024-2027 register), plus sin/cos cyclical encodings of hour and day-of-year evaluated at `target_time`.
   - *Weather*: Open-Meteo previous-runs forecast temperature at `target_time`, using a per-horizon lead: short horizons (`h <= 48`, <= 24h) consume a 24-hour-old forecast (`temperature_2m_previous_day1`), while long horizons (`h > 48`, > 24h) consume a 48-hour-old forecast (`temperature_2m_previous_day2`), and that is by design. Both satisfy the horizon contract (`forecast_issue_time <= issue_time`), mapped via containing hour `target_time.floor("h")` (ADR-008), plus 24h rolling mean and min computed from the per-horizon series.
   <!-- Model Card Reference: Weather features use a per-horizon lead: short horizons (h <= 48) consume a 24-hour-old forecast (temperature_2m_previous_day1), long horizons (h > 48) consume a 48-hour-old one (temperature_2m_previous_day2), and that is by design. -->

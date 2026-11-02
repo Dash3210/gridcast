@@ -33,6 +33,9 @@ DEFAULT_HORIZONS: Final[range] = range(1, 97)
 
 LONDON_TZ: Final[ZoneInfo] = ZoneInfo("Europe/London")
 
+# Module-level constant: availability lag for actual carbon intensity observations
+ACTUAL_AVAILABILITY_LAG: Final[pd.Timedelta] = pd.Timedelta(hours=3)
+
 CURATED_DIR_DEFAULT: Final[Path] = Path("data/curated")
 WEATHER_DIR_DEFAULT: Final[Path] = Path("data/weather")
 MIX_DIR_DEFAULT: Final[Path] = Path("data/mix")
@@ -50,14 +53,14 @@ MIX_FUELS: Final[list[str]] = [
 FEATURE_COLUMNS: Final[list[str]] = [
     # Forecast horizon (step in half-hours ahead)
     "horizon",
-    # Lags of actual relative to issue_time
-    "actual_lag_1h",
-    "actual_lag_2h",
-    "actual_lag_3h",
+    # Most recent actual available at issue time: the actual for the half hour ending
+    # immediately before issue_time - ACTUAL_AVAILABILITY_LAG
+    "actual_recent_3h",
+    # Historical lags of actual relative to issue_time
     "actual_lag_24h",
     "actual_lag_48h",
     "actual_lag_168h",
-    # Rolling stats of actual (windows ending strictly at issue_time - 30min)
+    # Rolling stats of actual (windows ending strictly at issue_time - ACTUAL_AVAILABILITY_LAG)
     "actual_rolling_3h_mean",
     "actual_rolling_3h_std",
     "actual_rolling_24h_mean",
@@ -98,6 +101,7 @@ ALLOWED_FRAME_COLUMNS: Final[set[str]] = {
 }
 
 __all__: list[str] = [
+    "ACTUAL_AVAILABILITY_LAG",
     "ALLOWED_FRAME_COLUMNS",
     "DEFAULT_HORIZONS",
     "FEATURE_COLUMNS",
@@ -332,12 +336,8 @@ def max_source_timestamp_allowed(
     issue_ts = pd.Timestamp(issue_time)
     target_ts = pd.Timestamp(target_time)
 
-    if feature_name == "actual_lag_1h":
-        return issue_ts - pd.Timedelta(hours=1)
-    if feature_name == "actual_lag_2h":
-        return issue_ts - pd.Timedelta(hours=2)
-    if feature_name == "actual_lag_3h":
-        return issue_ts - pd.Timedelta(hours=3)
+    if feature_name == "actual_recent_3h":
+        return issue_ts - ACTUAL_AVAILABILITY_LAG
     if feature_name == "actual_lag_24h":
         return issue_ts - pd.Timedelta(hours=24)
     if feature_name == "actual_lag_48h":
@@ -346,7 +346,7 @@ def max_source_timestamp_allowed(
         return issue_ts - pd.Timedelta(hours=168)
 
     if feature_name.startswith("actual_rolling_"):
-        return issue_ts - pd.Timedelta(minutes=30)
+        return issue_ts - ACTUAL_AVAILABILITY_LAG
 
     if feature_name.startswith("mix_share_"):
         return issue_ts - pd.Timedelta(hours=48)
@@ -380,6 +380,7 @@ def build_example_frame(
     require_aux: bool = True,
     trim_leading: bool | None = None,
     weather_series_by_horizon: dict[int, str] | None = None,
+    actual_availability_lag: pd.Timedelta = ACTUAL_AVAILABILITY_LAG,
 ) -> pd.DataFrame:
     """Build the example frame keyed by (issue_time, horizon) without leakage.
 
@@ -496,14 +497,20 @@ def build_example_frame(
     # 5. Target variable y (actual at target_time; may be NaN for unsettled targets)
     result["y"] = pd.Series(target_times_rep).map(actual_series).to_numpy(dtype=float)
 
-    # 6. Lags of actual relative to issue_time
-    for lag_h in [1, 2, 3, 24, 48, 168]:
+    # 6. Recent and historical lags of actual relative to issue_time
+    # actual_recent_3h: the actual for the half hour ending immediately
+    # before issue_time - ACTUAL_AVAILABILITY_LAG
+    recent_ts = issue_dt_index - actual_availability_lag
+    recent_vals = recent_ts.map(actual_series).to_numpy(dtype=float)
+    result["actual_recent_3h"] = np.repeat(recent_vals, n_horizons)
+
+    for lag_h in [24, 48, 168]:
         lag_ts = issue_dt_index - pd.Timedelta(hours=lag_h)
         lag_vals = lag_ts.map(actual_series).to_numpy(dtype=float)
         result[f"actual_lag_{lag_h}h"] = np.repeat(lag_vals, n_horizons)
 
-    # 7. Rolling statistics of actual ending strictly at issue_time - 30min
-    t_end = issue_dt_index - pd.Timedelta(minutes=30)
+    # 7. Rolling statistics of actual ending strictly at issue_time - actual_availability_lag
+    t_end = issue_dt_index - actual_availability_lag
     roll_3h = actual_series.rolling("3h", min_periods=1)
     roll_24h = actual_series.rolling("24h", min_periods=1)
     roll_168h = actual_series.rolling("168h", min_periods=1)
