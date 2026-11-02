@@ -570,3 +570,65 @@ class TestIssueAnchorEuropeLondon:
         assert features["issue_time"].iloc[0] == pd.Timestamp("2025-01-15 00:00:00+00:00")
         assert features["issue_time"].iloc[1] == pd.Timestamp("2025-07-14 23:00:00+00:00")
 
+
+class TestHorizonAbsoluteOffsetDST:
+    """Validate that horizon is an absolute offset spanning 48 hours across DST days (Section 2)."""
+
+    @pytest.mark.parametrize(
+        ("dst_date", "expected_local_periods"),
+        [
+            ("2025-03-30", 46),  # Spring clocks go forward (2025)
+            ("2025-10-26", 50),  # Autumn clocks go back (2025)
+            ("2026-03-29", 46),  # Spring clocks go forward (2026)
+            ("2026-10-25", 50),  # Autumn clocks go back (2026)
+        ],
+        ids=["2025-spring", "2025-autumn", "2026-spring", "2026-autumn"],
+    )
+    def test_horizon_absolute_offset_on_dst_transition_day(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+        dst_date: str,
+        expected_local_periods: int,
+    ) -> None:
+        """On DST days with 46 or 50 local half-hours, horizons are strictly 1..96 over 48 hours."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        t_issue = issue_time_for_date(dst_date)
+
+        frame = build_example_frame(
+            intensity_df=intensity_df,
+            weather_df=weather_df,
+            mix_df=mix_df,
+            issue_times=[t_issue],
+            horizons=range(1, 97),
+            require_aux=True,
+        )
+
+        # 1. Exactly 96 horizons, 1..96
+        assert len(frame) == 96
+        assert list(frame["horizon"]) == list(range(1, 97))
+
+        # 2. 96 distinct target_time values spanning exactly 48 hours from issue_time
+        target_times = frame["target_time"]
+        assert target_times.nunique() == 96
+        assert target_times.is_monotonic_increasing
+
+        span_from_issue = target_times.max() - t_issue
+        assert span_from_issue == pd.Timedelta(hours=48), (
+            f"Expected span of 48 hours from issue_time {t_issue}, got {span_from_issue}"
+        )
+
+        # Target range: from t_issue + 30m to t_issue + 48h
+        assert target_times.iloc[0] == t_issue + pd.Timedelta(minutes=30)
+        assert target_times.iloc[-1] == t_issue + pd.Timedelta(hours=48)
+
+        # 3. No gap and no duplicate in target sequence (every step is exactly 30 minutes)
+        target_diffs = target_times.diff().iloc[1:]
+        assert (target_diffs == pd.Timedelta(minutes=30)).all(), (
+            f"Found gaps or irregular steps in target sequence: {target_diffs.unique()}"
+        )
+
+        # 4. Target time must equal issue_time + horizon * 30 minutes exactly for every row
+        expected_targets = [t_issue + pd.Timedelta(minutes=30 * h) for h in range(1, 97)]
+        assert list(target_times) == expected_targets
+
+
