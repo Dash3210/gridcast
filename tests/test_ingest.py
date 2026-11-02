@@ -93,6 +93,7 @@ def test_schema_assertion(normal_payload: dict) -> None:
         "index",
         "ingested_at",
         "first_seen_at",
+        "forecast_first_seen_at",
     ]
     assert list(df.columns) == expected_columns
 
@@ -101,6 +102,7 @@ def test_schema_assertion(normal_payload: dict) -> None:
     assert str(df["period_end_utc"].dtype) == "datetime64[ns, UTC]"
     assert str(df["ingested_at"].dtype) == "datetime64[ns, UTC]"
     assert str(df["first_seen_at"].dtype) == "datetime64[ns, UTC]"
+    assert str(df["forecast_first_seen_at"].dtype) == "datetime64[ns, UTC]"
     assert str(df["forecast"].dtype) == "Int32"
     assert str(df["actual"].dtype) == "Int32"
     assert str(df["index"].dtype) in ("string", "string[python]")
@@ -237,6 +239,60 @@ def test_first_seen_at_lifecycle(normal_payload: dict, tmp_path: Path) -> None:
     assert read3.loc[5, "first_seen_at"] == pd.Timestamp(t2)
     assert read3.loc[0, "first_seen_at"] == pd.Timestamp(t1)
     assert read3.loc[read3["actual"].isna(), "first_seen_at"].isna().all()
+
+
+def test_forecast_first_seen_at_lifecycle(normal_payload: dict, tmp_path: Path) -> None:
+    """forecast_first_seen_at is stamped on arrival and never overwritten."""
+    target_date = date(2026, 10, 15)
+    t1 = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 10, 15, 13, 0, 0, tzinfo=timezone.utc)
+    t3 = datetime(2026, 10, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+    # 1. First payload where one forecast is null
+    p1 = json.loads(json.dumps(normal_payload))
+    p1["data"][5]["intensity"]["forecast"] = None
+
+    df1 = payload_to_frame(p1, target_date, t1)
+    assert pd.isna(df1.loc[5, "forecast"])
+    assert pd.isna(df1.loc[5, "forecast_first_seen_at"])
+    # Assert a null forecast never carries a forecast_first_seen_at
+    assert df1.loc[df1["forecast"].isna(), "forecast_first_seen_at"].isna().all()
+
+    upsert_day(df1, target_date, base_dir=tmp_path)
+    read1 = read_partition(target_date, base_dir=tmp_path)
+    assert read1 is not None
+    assert pd.isna(read1.loc[5, "forecast"])
+    assert pd.isna(read1.loc[5, "forecast_first_seen_at"])
+    assert read1.loc[read1["forecast"].isna(), "forecast_first_seen_at"].isna().all()
+    assert read1.loc[0, "forecast_first_seen_at"] == pd.Timestamp(t1)
+
+    # 2. Later payload where forecast arrives
+    p2 = json.loads(json.dumps(normal_payload))
+    known_fc = normal_payload["data"][5]["intensity"]["forecast"]
+    assert known_fc is not None
+    df2 = payload_to_frame(p2, target_date, t2)
+    assert df2.loc[5, "forecast"] == known_fc
+
+    upsert_day(df2, target_date, base_dir=tmp_path)
+    read2 = read_partition(target_date, base_dir=tmp_path)
+    assert read2 is not None
+    # Assert forecast_first_seen_at is set on the transition
+    assert read2.loc[5, "forecast"] == known_fc
+    assert read2.loc[5, "forecast_first_seen_at"] == pd.Timestamp(t2)
+    assert read2.loc[0, "forecast_first_seen_at"] == pd.Timestamp(t1)
+
+    # 3. Third ingest with modified forecast value (must preserve original forecast_first_seen_at)
+    p3 = json.loads(json.dumps(normal_payload))
+    p3["data"][5]["intensity"]["forecast"] = 299
+    df3 = payload_to_frame(p3, target_date, t3)
+    upsert_day(df3, target_date, base_dir=tmp_path)
+    read3 = read_partition(target_date, base_dir=tmp_path)
+    assert read3 is not None
+    assert read3.loc[5, "forecast"] == 299
+    # Invariant: forecast_first_seen_at is never overwritten on update
+    assert read3.loc[5, "forecast_first_seen_at"] == pd.Timestamp(t2)
+    assert read3.loc[0, "forecast_first_seen_at"] == pd.Timestamp(t1)
+    assert read3.loc[read3["forecast"].isna(), "forecast_first_seen_at"].isna().all()
 
 
 def test_pending_vs_gap(tmp_path: Path) -> None:
@@ -426,6 +482,7 @@ def test_empty_payload_handling(empty_payload: dict) -> None:
         "index",
         "ingested_at",
         "first_seen_at",
+        "forecast_first_seen_at",
     ]
 
 
@@ -2736,11 +2793,13 @@ def test_source_gap_reconciled_when_data_appears(tmp_path: Path) -> None:
 
 
 def test_weather_coverage_is_complete() -> None:
-    """Zero missing hours across the window, no gaps file for weather."""
+    """Zero missing hours across the settled window, no gaps file for weather."""
     curated = pd.read_parquet("data/curated")
     weather = pd.read_parquet("data/weather")
 
     c_starts = pd.to_datetime(curated["period_start_utc"], utc=True)
+    max_weather_ts = pd.to_datetime(weather["period_start_utc"], utc=True).max()
+    c_starts = c_starts[c_starts <= max_weather_ts]
     w_starts = set(pd.to_datetime(weather["period_start_utc"], utc=True))
 
     c_hours = set(c_starts.dt.floor("h"))

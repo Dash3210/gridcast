@@ -25,6 +25,7 @@ FORECAST_COLUMNS: Final[list[str]] = [
     "model_version",
     "value",
     "issued_at",
+    "neso_forecast_at_issue",
 ]
 
 SCORE_COLUMNS: Final[list[str]] = [
@@ -37,6 +38,7 @@ SCORE_COLUMNS: Final[list[str]] = [
     "neso_forecast",
     "abs_error",
     "neso_abs_error",
+    "neso_source",
 ]
 
 HORIZON_BUCKETS: Final[list[tuple[str, int, int]]] = [
@@ -103,6 +105,59 @@ def get_actual_at_timestamp(curated_dir: Path, target_ts: pd.Timestamp) -> float
     )
 
 
+def get_operator_forecast_at_issue(
+    curated_dir: Path, target_ts: pd.Timestamp, issue_ts: pd.Timestamp
+) -> float | None:
+    """Read the operator forecast published as of issue_ts for target_ts.
+
+    Returns float forecast if published by issue_ts (forecast_first_seen_at <= issue_ts),
+    otherwise None.
+    """
+    if not curated_dir.exists():
+        return None
+
+    ts_utc = pd.to_datetime(target_ts, utc=True)
+    local_d = ts_utc.tz_convert(LONDON_TZ).date()
+    target_partition = curated_dir / f"date={local_d}.parquet"
+
+    df: pd.DataFrame | None = None
+    if target_partition.exists():
+        df = pd.read_parquet(target_partition)
+    else:
+        for p in sorted(curated_dir.glob("*.parquet")):
+            pdf = pd.read_parquet(p)
+            if "period_start_utc" in pdf.columns:
+                matches_p = pdf[pd.to_datetime(pdf["period_start_utc"], utc=True) == ts_utc]
+                if not matches_p.empty:
+                    df = pdf
+                    break
+
+    if df is None or df.empty:
+        return None
+    if "period_start_utc" not in df.columns or "forecast" not in df.columns:
+        return None
+
+    matches = df[pd.to_datetime(df["period_start_utc"], utc=True) == ts_utc]
+    if matches.empty:
+        return None
+
+    val = matches["forecast"].iloc[0]
+    if pd.isna(val) or val is None:
+        return None
+
+    if "forecast_first_seen_at" in matches.columns:
+        seen = matches["forecast_first_seen_at"].iloc[0]
+        if pd.isna(seen) or seen is None:
+            return None
+        seen_ts = pd.to_datetime(seen, utc=True)
+        if seen_ts > issue_ts:
+            return None
+    else:
+        return None
+
+    return float(val)
+
+
 def issue_forecast(
     issue_time: pd.Timestamp | datetime | str | None = None,
     date_val: date | str | None = None,
@@ -133,6 +188,11 @@ def issue_forecast(
     horizons = list(range(1, 97))
     target_times = [resolved_issue + pd.Timedelta(minutes=30 * h) for h in horizons]
 
+    neso_snapshots: list[float | None] = []
+    for tt in target_times:
+        neso_val = get_operator_forecast_at_issue(curated_dir, tt, resolved_issue)
+        neso_snapshots.append(neso_val)
+
     forecast_df = pd.DataFrame(
         {
             "issue_time": [resolved_issue] * 96,
@@ -141,6 +201,7 @@ def issue_forecast(
             "model_version": [model_version] * 96,
             "value": [actual_val] * 96,
             "issued_at": [issued_at_now] * 96,
+            "neso_forecast_at_issue": neso_snapshots,
         }
     )
 
@@ -150,11 +211,16 @@ def issue_forecast(
     forecast_df["model_version"] = forecast_df["model_version"].astype("string")
     forecast_df["value"] = forecast_df["value"].astype("float64")
     forecast_df["issued_at"] = pd.to_datetime(forecast_df["issued_at"], utc=True)
+    forecast_df["neso_forecast_at_issue"] = pd.to_numeric(
+        forecast_df["neso_forecast_at_issue"], errors="coerce"
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     new_points_count = 96
     if output_path.exists():
         existing_df = pd.read_parquet(output_path)
+        if "neso_forecast_at_issue" not in existing_df.columns:
+            existing_df["neso_forecast_at_issue"] = float("nan")
         existing_keys = set(
             zip(
                 pd.to_datetime(existing_df["issue_time"], utc=True),
@@ -188,7 +254,7 @@ def generate_scoreboard_markdown(
     output_path: Path = DEFAULT_SCOREBOARD_MD_PATH,
     start_date: date | str | None = None,
 ) -> str:
-    """Generate docs/scoreboard.md from scores DataFrame."""
+    """Generate docs/scoreboard.md from scores DataFrame, reporting sources separately."""
     if not scores_df.empty and "issue_time" in scores_df.columns:
         first_date = (
             pd.to_datetime(scores_df["issue_time"], utc=True).dt.tz_convert(LONDON_TZ).dt.date.min()
@@ -203,80 +269,20 @@ def generate_scoreboard_markdown(
     if scores_df.empty:
         consecutive_days = 0
         date_range_str = "None"
-        total_points = 0
-        model_mae_str = "N/A"
-        operator_mae_str = "N/A"
-    else:
-        issue_dates = sorted(
-            set(
-                pd.to_datetime(scores_df["issue_time"], utc=True)
-                .dt.tz_convert(LONDON_TZ)
-                .dt.date
-            )
-        )
-        consecutive_days = 1
-        for i in range(1, len(issue_dates)):
-            if issue_dates[i] == issue_dates[i - 1] + timedelta(days=1):
-                consecutive_days += 1
-            elif issue_dates[i] == issue_dates[i - 1]:
-                continue
-            else:
-                break
-
-        target_dates = (
-            pd.to_datetime(scores_df["target_time"], utc=True).dt.tz_convert(LONDON_TZ).dt.date
-        )
-        min_td = target_dates.min()
-        max_td = target_dates.max()
-        date_range_str = f"{min_td} to {max_td}"
-
-        total_points = len(scores_df)
-        model_mae_str = f"{scores_df['abs_error'].astype(float).mean():.2f}"
-        neso_non_null = scores_df[
-            scores_df["neso_abs_error"].notna() & (scores_df["neso_abs_error"] != "")
+        bucket_rows: list[str] = [
+            f"| {label} | 0 | N/A | N/A |" for label, _, _ in HORIZON_BUCKETS
         ]
-        if not neso_non_null.empty:
-            operator_mae_str = f"{neso_non_null['neso_abs_error'].astype(float).mean():.2f}"
-        else:
-            operator_mae_str = "N/A"
+        bucket_table = "\n".join(bucket_rows)
+        out_content = f"""# Scoreboard
 
-    bucket_rows: list[str] = []
-    for label, h_min, h_max in HORIZON_BUCKETS:
-        if not scores_df.empty:
-            b_df = scores_df[
-                (scores_df["horizon"].astype(int) >= h_min)
-                & (scores_df["horizon"].astype(int) <= h_max)
-            ]
-            b_count = len(b_df)
-            if b_count > 0:
-                b_model_mae = f"{b_df['abs_error'].astype(float).mean():.2f}"
-                b_neso = b_df[b_df["neso_abs_error"].notna() & (b_df["neso_abs_error"] != "")]
-                b_oper_mae = (
-                    f"{b_neso['neso_abs_error'].astype(float).mean():.2f}"
-                    if not b_neso.empty
-                    else "N/A"
-                )
-            else:
-                b_model_mae = "N/A"
-                b_oper_mae = "N/A"
-        else:
-            b_count = 0
-            b_model_mae = "N/A"
-            b_oper_mae = "N/A"
-        bucket_rows.append(f"| {label} | {b_count} | {b_model_mae} | {b_oper_mae} |")
-
-    bucket_table = "\n".join(bucket_rows)
-
-    content = f"""# Scoreboard
-
-scoreboard started {first_date}; consecutive days recorded: {consecutive_days}
+scoreboard started {first_date}; consecutive days recorded: 0
 
 ## Overview
 
-- **Date range covered:** {date_range_str}
-- **Scored points:** {total_points}
-- **Model MAE:** {model_mae_str}
-- **Operator MAE:** {operator_mae_str}
+- **Date range covered:** None
+- **Scored points:** 0
+- **Model MAE:** N/A
+- **Operator MAE:** N/A
 
 ## Horizon Performance
 
@@ -284,10 +290,217 @@ scoreboard started {first_date}; consecutive days recorded: {consecutive_days}
 |---|---|---|---|
 {bucket_table}
 """
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(out_content, encoding="utf-8")
+        return out_content
 
+    issue_dates = sorted(
+        set(
+            pd.to_datetime(scores_df["issue_time"], utc=True)
+            .dt.tz_convert(LONDON_TZ)
+            .dt.date
+        )
+    )
+    consecutive_days = 1
+    for i in range(1, len(issue_dates)):
+        if issue_dates[i] == issue_dates[i - 1] + timedelta(days=1):
+            consecutive_days += 1
+        elif issue_dates[i] == issue_dates[i - 1]:
+            continue
+        else:
+            break
+
+    target_dates = (
+        pd.to_datetime(scores_df["target_time"], utc=True).dt.tz_convert(LONDON_TZ).dt.date
+    )
+    min_td = target_dates.min()
+    max_td = target_dates.max()
+    date_range_str = f"{min_td} to {max_td}"
+
+    if "neso_source" in scores_df.columns:
+        snapshot_df = scores_df[scores_df["neso_source"] == "snapshot_at_issue"]
+        archive_df = scores_df[scores_df["neso_source"] == "archive_at_scoring"]
+    else:
+        snapshot_df = pd.DataFrame()
+        archive_df = scores_df
+
+    def _render_buckets(sub_df: pd.DataFrame, include_skill: bool = False) -> str:
+        rows: list[str] = []
+        for label, h_min, h_max in HORIZON_BUCKETS:
+            if not sub_df.empty:
+                b_df = sub_df[
+                    (sub_df["horizon"].astype(int) >= h_min)
+                    & (sub_df["horizon"].astype(int) <= h_max)
+                ]
+                b_count = len(b_df)
+                if b_count > 0:
+                    b_model_mae = f"{b_df['abs_error'].astype(float).mean():.2f}"
+                    b_neso = b_df[b_df["neso_abs_error"].notna() & (b_df["neso_abs_error"] != "")]
+                    if not b_neso.empty:
+                        op_mae_val = b_neso["neso_abs_error"].astype(float).mean()
+                        b_oper_mae = f"{op_mae_val:.2f}"
+                        if include_skill and op_mae_val > 0:
+                            m_mae_val = b_df["abs_error"].astype(float).mean()
+                            skill = (1.0 - m_mae_val / op_mae_val) * 100
+                            skill_str = f" | {skill:+.2f}%"
+                        elif include_skill:
+                            skill_str = " | N/A"
+                        else:
+                            skill_str = ""
+                    else:
+                        b_oper_mae = "N/A"
+                        skill_str = " | N/A" if include_skill else ""
+                else:
+                    b_model_mae = "N/A"
+                    b_oper_mae = "N/A"
+                    skill_str = " | N/A" if include_skill else ""
+            else:
+                b_count = 0
+                b_model_mae = "N/A"
+                b_oper_mae = "N/A"
+                skill_str = " | N/A" if include_skill else ""
+
+            if include_skill:
+                rows.append(f"| {label} | {b_count} | {b_model_mae} | {b_oper_mae}{skill_str} |")
+            else:
+                rows.append(f"| {label} | {b_count} | {b_model_mae} | {b_oper_mae} |")
+        return "\n".join(rows)
+
+    header = (
+        f"# Scoreboard\n\nscoreboard started {first_date}; "
+        f"consecutive days recorded: {consecutive_days}"
+    )
+    sections: list[str] = [header]
+
+    if not snapshot_df.empty and not archive_df.empty:
+        snap_points = len(snapshot_df)
+        snap_model_mae = f"{snapshot_df['abs_error'].astype(float).mean():.2f}"
+        snap_neso = snapshot_df[
+            snapshot_df["neso_abs_error"].notna()
+            & (snapshot_df["neso_abs_error"] != "")
+        ]
+        if not snap_neso.empty:
+            snap_op_mae = snap_neso["neso_abs_error"].astype(float).mean()
+            snap_op_mae_str = f"{snap_op_mae:.2f}"
+            m_mae_f = snapshot_df["abs_error"].astype(float).mean()
+            skill_val = (1.0 - m_mae_f / snap_op_mae) * 100
+            skill_str = f"{skill_val:+.2f}%"
+        else:
+            snap_op_mae_str = "N/A"
+            skill_str = "N/A"
+
+        snap_buckets = _render_buckets(snapshot_df, include_skill=True)
+        sections.append(f"""## Snapshot at Issue (Verified Vintage)
+
+- **Date range covered:** {date_range_str}
+- **Scored points:** {snap_points}
+- **Model MAE:** {snap_model_mae}
+- **Operator MAE (at issue):** {snap_op_mae_str}
+- **Skill vs Operator:** {skill_str}
+
+### Horizon Performance
+
+| Horizon Bucket | Scored Points | Model MAE | Operator MAE | Skill vs Operator |
+|---|---|---|---|---|
+{snap_buckets}""")
+
+        arch_points = len(archive_df)
+        arch_model_mae = f"{archive_df['abs_error'].astype(float).mean():.2f}"
+        arch_neso = archive_df[
+            archive_df["neso_abs_error"].notna()
+            & (archive_df["neso_abs_error"] != "")
+        ]
+        arch_op_mae_str = (
+            f"{arch_neso['neso_abs_error'].astype(float).mean():.2f}"
+            if not arch_neso.empty
+            else "N/A"
+        )
+        arch_buckets = _render_buckets(archive_df, include_skill=False)
+        sections.append(f"""## Archive at Scoring (Vintage Unverified)
+
+> Published NESO forecast for the same periods, vintage unverified.
+> Refusing to aggregate across sources; not eligible for skill comparison.
+
+- **Date range covered:** {date_range_str}
+- **Scored points:** {arch_points}
+- **Model MAE:** {arch_model_mae}
+- **Operator MAE (vintage unverified):** {arch_op_mae_str}
+
+### Horizon Performance
+
+| Horizon Bucket | Scored Points | Model MAE | Operator MAE |
+|---|---|---|---|
+{arch_buckets}""")
+
+    elif not snapshot_df.empty:
+        snap_points = len(snapshot_df)
+        snap_model_mae = f"{snapshot_df['abs_error'].astype(float).mean():.2f}"
+        snap_neso = snapshot_df[
+            snapshot_df["neso_abs_error"].notna()
+            & (snapshot_df["neso_abs_error"] != "")
+        ]
+        if not snap_neso.empty:
+            snap_op_mae = snap_neso["neso_abs_error"].astype(float).mean()
+            snap_op_mae_str = f"{snap_op_mae:.2f}"
+            m_mae_f = snapshot_df["abs_error"].astype(float).mean()
+            skill_val = (1.0 - m_mae_f / snap_op_mae) * 100
+            skill_str = f"{skill_val:+.2f}%"
+        else:
+            snap_op_mae_str = "N/A"
+            skill_str = "N/A"
+
+        snap_buckets = _render_buckets(snapshot_df, include_skill=True)
+        sections.append(f"""## Overview
+
+- **Date range covered:** {date_range_str}
+- **Scored points:** {snap_points}
+- **Model MAE:** {snap_model_mae}
+- **Operator MAE (at issue):** {snap_op_mae_str}
+- **Skill vs Operator:** {skill_str}
+
+## Horizon Performance
+
+| Horizon Bucket | Scored Points | Model MAE | Operator MAE | Skill vs Operator |
+|---|---|---|---|---|
+{snap_buckets}""")
+
+    else:
+        arch_points = len(archive_df)
+        arch_model_mae = (
+            f"{archive_df['abs_error'].astype(float).mean():.2f}"
+            if not archive_df.empty
+            else "N/A"
+        )
+        arch_neso = archive_df[
+            archive_df["neso_abs_error"].notna()
+            & (archive_df["neso_abs_error"] != "")
+        ]
+        arch_op_mae_str = (
+            f"{arch_neso['neso_abs_error'].astype(float).mean():.2f}"
+            if not arch_neso.empty
+            else "N/A"
+        )
+        arch_buckets = _render_buckets(archive_df, include_skill=False)
+        sections.append(f"""## Overview
+
+> Published NESO forecast for the same periods, vintage unverified.
+> Refusing to aggregate across sources; not eligible for skill comparison.
+
+- **Date range covered:** {date_range_str}
+- **Scored points:** {arch_points}
+- **Model MAE:** {arch_model_mae}
+- **Operator MAE (vintage unverified):** {arch_op_mae_str}
+
+## Horizon Performance
+
+| Horizon Bucket | Scored Points | Model MAE | Operator MAE |
+|---|---|---|---|
+{arch_buckets}""")
+
+    out_content = "\n\n".join(sections) + "\n"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(content, encoding="utf-8")
-    return content
+    output_path.write_text(out_content, encoding="utf-8")
+    return out_content
 
 
 def score_forecasts(
@@ -302,6 +515,8 @@ def score_forecasts(
     """
     if scores_path.exists() and scores_path.stat().st_size > 0:
         existing_scores = pd.read_csv(scores_path)
+        if "neso_source" not in existing_scores.columns:
+            existing_scores["neso_source"] = "archive_at_scoring"
         existing_keys = set(
             zip(
                 pd.to_datetime(existing_scores["issue_time"], utc=True),
@@ -380,13 +595,24 @@ def score_forecasts(
             continue
 
         tt = pd.to_datetime(row["target_time"], utc=True)
-        actual_val, neso_forecast = get_target_observation(tt)
+        actual_val, _ = get_target_observation(tt)
         if actual_val is None:
             continue
 
         f_val = float(row["value"])
         abs_err = abs(f_val - actual_val)
-        neso_abs_err = abs(neso_forecast - actual_val) if neso_forecast is not None else None
+
+        # Snapshot at issue instant
+        neso_snap = row.get("neso_forecast_at_issue") if "neso_forecast_at_issue" in row else None
+        if neso_snap is not None and pd.notna(neso_snap):
+            snap_val = float(neso_snap)
+            neso_forecast: float | str = snap_val
+            neso_abs_err: float | str = abs(snap_val - actual_val)
+            neso_source = "snapshot_at_issue"
+        else:
+            neso_forecast = ""
+            neso_abs_err = ""
+            neso_source = "none"
 
         new_rows.append(
             {
@@ -396,9 +622,10 @@ def score_forecasts(
                 "model_version": mv,
                 "forecast": f_val,
                 "actual": actual_val,
-                "neso_forecast": neso_forecast if neso_forecast is not None else "",
+                "neso_forecast": neso_forecast,
                 "abs_error": abs_err,
-                "neso_abs_error": neso_abs_err if neso_abs_err is not None else "",
+                "neso_abs_error": neso_abs_err,
+                "neso_source": neso_source,
             }
         )
         existing_keys.add(key)

@@ -2,11 +2,21 @@
 
 import argparse
 import sys
+from collections.abc import Sequence
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import pandas as pd
 
 from gridcast import __version__
 from gridcast._phase import todo
+from gridcast.features import (
+    build_example_frame,
+    default_issue_schedule,
+    load_feature_sources,
+    select_training_arrays,
+)
 from gridcast.ingest import (
     ingest_mix_range,
     ingest_range,
@@ -159,12 +169,193 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to scoreboard markdown documentation.",
     )
 
-    subparsers.add_parser("train", help="Train carbon intensity forecast models.")
-    subparsers.add_parser("backtest", help="Run backtest against NESO baseline.")
+    train_parser = subparsers.add_parser(
+        "train",
+        help="Train carbon intensity forecast models.",
+    )
+    train_parser.add_argument(
+        "--output",
+        type=str,
+        default="data/models/lgbm_model.txt",
+        help="Path to save trained model artifact.",
+    )
+    train_parser.add_argument(
+        "--num-boost-round",
+        type=int,
+        default=100,
+        help="Number of boosting iterations (default: 100).",
+    )
+
+    backtest_parser = subparsers.add_parser(
+        "backtest",
+        help="Run backtest against NESO baseline.",
+    )
+    backtest_parser.add_argument(
+        "--origins",
+        nargs="*",
+        default=None,
+        help="Explicit list of origin dates or timestamps (default: fixed test split).",
+    )
+    backtest_parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Start date for test split origins derivation (default: 2026-09-05).",
+    )
+    backtest_parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="End date for test split origins derivation (default: 2026-11-01).",
+    )
+    backtest_parser.add_argument(
+        "--threshold",
+        type=float,
+        default=35.0,
+        help="Gate threshold for GATE_VALUE in gCO2/kWh (default: 35.0).",
+    )
+    backtest_parser.add_argument(
+        "--num-boost-round",
+        type=int,
+        default=100,
+        help="Number of boosting iterations per fold (default: 100).",
+    )
+    backtest_parser.add_argument(
+        "--no-fail-on-gate",
+        dest="fail_on_gate",
+        action="store_false",
+        default=False,
+        help="Do not return non-zero exit code if gate fails.",
+    )
     subparsers.add_parser("serve", help="Run forecast API service.")
     subparsers.add_parser("version", help="Print package version.")
 
     return parser
+
+
+def run_train_cli(
+    output_path: Path | str = "data/models/lgbm_model.txt",
+    num_boost_round: int = 100,
+) -> int:
+    """Train primary LightGBM model on curated training dataset and save artifact."""
+    from pathlib import Path
+
+    from gridcast.models import model_artifact_hash, train_lgbm
+
+    print("Loading feature sources (intensity, weather, mix)...")
+    intensity_df, weather_df, mix_df = load_feature_sources()
+    latest_date = intensity_df["period_start_utc"].max().tz_convert("Europe/London").date()
+    if not weather_df.empty:
+        max_weather_date = weather_df["period_start_utc"].max().tz_convert("Europe/London").date()
+        if max_weather_date < latest_date:
+            latest_date = max_weather_date
+
+    schedule = default_issue_schedule("2024-11-08", latest_date.isoformat())
+    print(
+        f"Building example frame across {len(schedule)} issue dates "
+        f"({schedule[0]} to {schedule[-1]})..."
+    )
+    frame = build_example_frame(
+        intensity_df=intensity_df,
+        weather_df=weather_df,
+        mix_df=mix_df,
+        issue_times=schedule,
+        require_aux=True,
+    )
+    print(f"Selecting non-null training arrays from {len(frame)} rows...")
+    X_train, y_train = select_training_arrays(frame)
+    print(f"Training LightGBM model on {len(X_train)} samples with {X_train.shape[1]} features...")
+    booster = train_lgbm(X_train, y_train, num_boost_round=num_boost_round)
+    model_hash = model_artifact_hash(booster)
+    print(f"Model trained successfully. Artifact SHA-256: {model_hash}")
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    booster.save_model(str(out))
+    print(f"Saved model artifact to {out}")
+    return 0
+
+
+def run_backtest_cli(
+    origins: Sequence[pd.Timestamp | str] | None = None,
+    threshold: float | None = 35.0,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    num_boost_round: int = 100,
+    verbose: bool = True,
+    fail_on_gate: bool = False,
+) -> int:
+    """Run rolling-origin backtest and evaluate accuracy gate."""
+    import pandas as pd
+
+    from gridcast.backtest import (
+        TEST_SPLIT_END_DATE,
+        TEST_SPLIT_START_DATE,
+        derive_test_split_origins,
+        evaluate_gate,
+        run_rolling_origin_backtest,
+    )
+
+    resolved_start = start_date or TEST_SPLIT_START_DATE
+    resolved_end = end_date or TEST_SPLIT_END_DATE
+
+    if origins is None:
+        origins = derive_test_split_origins(resolved_start, resolved_end)
+
+    if verbose:
+        print("Loading feature sources for backtest...")
+    intensity_df, weather_df, mix_df = load_feature_sources()
+
+    frame_start = "2024-11-08"
+    schedule = default_issue_schedule(frame_start, resolved_end)
+    if verbose:
+        print(
+            f"Calling build_example_frame for {len(schedule)} issues "
+            f"({frame_start} to {resolved_end})..."
+        )
+    frame = build_example_frame(
+        intensity_df=intensity_df,
+        weather_df=weather_df,
+        mix_df=mix_df,
+        issue_times=schedule,
+        require_aux=True,
+    )
+
+    operator_forecasts = pd.Series(
+        intensity_df["forecast"].values,
+        index=pd.to_datetime(intensity_df["period_start_utc"], utc=True),
+    )
+
+    results = run_rolling_origin_backtest(
+        frame=frame,
+        origins=origins,
+        operator_forecasts=operator_forecasts,
+        num_boost_round=num_boost_round,
+        verbose=verbose,
+    )
+
+    if verbose:
+        print("\n" + "=" * 94)
+        print("PER-HORIZON PERFORMANCE (h=1..96)")
+        print("=" * 94)
+        print(
+            f"{'Horizon':<8}{'Periods':<10}{'Model MAE':<14}{'Operator MAE':<16}"
+            f"{'Persistence':<14}{'Seasonal-Naive':<16}{'Skill vs NESO':<14}"
+        )
+        print("-" * 94)
+        for _, r in results.per_horizon_table.iterrows():
+            h_int = int(r["horizon"])
+            cnt = int(r["count"])
+            m_mae = f"{r['model_mae']:.2f}" if pd.notna(r["model_mae"]) else "N/A"
+            o_mae = f"{r['operator_mae']:.2f}" if pd.notna(r["operator_mae"]) else "N/A"
+            p_mae = f"{r['persistence_mae']:.2f}" if pd.notna(r["persistence_mae"]) else "N/A"
+            s_mae = f"{r['seasonal_naive_mae']:.2f}" if pd.notna(r["seasonal_naive_mae"]) else "N/A"
+            sk = f"{r['skill_vs_operator']:+.2%}" if pd.notna(r["skill_vs_operator"]) else "N/A"
+            print(f"{h_int:<8}{cnt:<10}{m_mae:<14}{o_mae:<16}{p_mae:<14}{s_mae:<16}{sk:<14}")
+        print("=" * 94)
+
+    evaluate_gate(results, threshold=threshold, verbose=verbose)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -175,6 +366,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.subcommand == "version":
         print(f"gridcast {__version__}")
         return 0
+
+    if args.subcommand == "train":
+        from pathlib import Path
+
+        return run_train_cli(
+            output_path=Path(args.output),
+            num_boost_round=args.num_boost_round,
+        )
+
+    if args.subcommand == "backtest":
+        return run_backtest_cli(
+            origins=getattr(args, "origins", None),
+            threshold=args.threshold,
+            start_date=getattr(args, "start_date", None),
+            end_date=getattr(args, "end_date", None),
+            num_boost_round=args.num_boost_round,
+            fail_on_gate=args.fail_on_gate,
+        )
 
     if args.subcommand == "ingest":
         if args.prune_cache:
@@ -315,11 +524,7 @@ def main(argv: list[str] | None = None) -> int:
             scoreboard_md_path=Path(args.scoreboard_md_path),
         )
 
-    if args.subcommand == "train":
-        todo("P3", "train")
-    elif args.subcommand == "backtest":
-        todo("P3", "backtest")
-    elif args.subcommand == "serve":
+    if args.subcommand == "serve":
         todo("P4", "serve")
 
     return 0

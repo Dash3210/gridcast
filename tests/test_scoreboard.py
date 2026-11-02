@@ -408,3 +408,137 @@ def test_cli_forecast_and_score(tmp_path: Path, capsys: pytest.CaptureFixture[st
         ]
     )
     assert code_err == 1
+
+
+def test_forecast_snapshots_operator_published_at_issue(tmp_path: Path) -> None:
+    """Snapshot reads operator forecast published as of T; null where unpublished at T."""
+    curated_dir = tmp_path / "curated"
+    curated_dir.mkdir()
+    p_prev = _make_curated_partition(date(2026, 11, 1), default_actual=160)
+    p_prev.to_parquet(curated_dir / "date=2026-11-01.parquet", index=False)
+
+    issue_ts = pd.Timestamp("2026-11-02 00:00:00+00:00")
+    forecasts_path = tmp_path / "forecasts.parquet"
+
+    # Create target partition 2026-11-02 with varying publication timestamps
+    p_target = _make_curated_partition(date(2026, 11, 2), default_actual=150, default_forecast=160)
+    # Add forecast_first_seen_at column with explicit timestamps
+    # Horizon 1 (00:30, index 1): published before T
+    # Horizon 2 (01:00, index 2): published after T
+    # Horizon 3 (01:30, index 3): unverified vintage (null forecast_first_seen_at)
+    # Horizon 4 (02:00, index 4): null operator forecast
+    seen_col: list[object] = [pd.NaT] * 48
+    seen_col[1] = issue_ts - pd.Timedelta(hours=1)  # published before T
+    seen_col[2] = issue_ts + pd.Timedelta(hours=2)  # published after T
+    seen_col[3] = pd.NaT  # unverified vintage
+    seen_col[4] = issue_ts - pd.Timedelta(hours=1)
+
+    p_target["forecast_first_seen_at"] = pd.to_datetime(seen_col, utc=True)
+    p_target.loc[4, "forecast"] = pd.NA
+    p_target.loc[4, "forecast_first_seen_at"] = pd.NaT
+    p_target.to_parquet(curated_dir / "date=2026-11-02.parquet", index=False)
+
+    df, count = issue_forecast(
+        issue_time=issue_ts,
+        curated_dir=curated_dir,
+        output_path=forecasts_path,
+    )
+
+    assert count == 96
+    # Horizon 1: published before T -> snapshot captured
+    assert df.loc[df["horizon"] == 1, "neso_forecast_at_issue"].iloc[0] == 160.0
+    # Horizon 2: published after T -> null snapshot
+    assert pd.isna(df.loc[df["horizon"] == 2, "neso_forecast_at_issue"].iloc[0])
+    # Horizon 3: unverified vintage -> null snapshot
+    assert pd.isna(df.loc[df["horizon"] == 3, "neso_forecast_at_issue"].iloc[0])
+    # Horizon 4: null forecast upstream -> null snapshot
+    assert pd.isna(df.loc[df["horizon"] == 4, "neso_forecast_at_issue"].iloc[0])
+
+
+def test_score_records_snapshot_source_and_null_where_unpublished(tmp_path: Path) -> None:
+    """Scoring marks neso_source=snapshot_at_issue or none; does not fill from later publication."""
+    curated_dir = tmp_path / "curated"
+    curated_dir.mkdir()
+    p_prev = _make_curated_partition(date(2026, 11, 1), default_actual=160)
+    p_prev.to_parquet(curated_dir / "date=2026-11-01.parquet", index=False)
+
+    issue_ts = pd.Timestamp("2026-11-02 00:00:00+00:00")
+    forecasts_path = tmp_path / "forecasts.parquet"
+    scores_path = tmp_path / "scores.csv"
+    md_path = tmp_path / "scoreboard.md"
+
+    p_target = _make_curated_partition(date(2026, 11, 2), default_actual=150, default_forecast=170)
+    seen_col: list[object] = [pd.NaT] * 48
+    seen_col[1] = issue_ts - pd.Timedelta(hours=1)  # horizon 1 (index 1: 00:30) published before T
+    p_target["forecast_first_seen_at"] = pd.to_datetime(seen_col, utc=True)
+    p_target.to_parquet(curated_dir / "date=2026-11-02.parquet", index=False)
+
+    issue_forecast(
+        issue_time=issue_ts,
+        curated_dir=curated_dir,
+        output_path=forecasts_path,
+    )
+
+    score_forecasts(
+        curated_dir=curated_dir,
+        forecasts_path=forecasts_path,
+        scores_path=scores_path,
+        scoreboard_md_path=md_path,
+    )
+
+    scores_df = pd.read_csv(scores_path)
+    # Horizon 1 has snapshot
+    h1 = scores_df[scores_df["horizon"] == 1].iloc[0]
+    assert h1["neso_source"] == "snapshot_at_issue"
+    assert h1["neso_forecast"] == 170.0
+    assert h1["neso_abs_error"] == abs(170.0 - 150.0)
+
+    # Horizon 2 has no snapshot published at T -> null and neso_source=none
+    h2 = scores_df[scores_df["horizon"] == 2].iloc[0]
+    assert h2["neso_source"] == "none"
+    assert pd.isna(h2["neso_forecast"])
+    assert pd.isna(h2["neso_abs_error"])
+
+
+def test_scoreboard_markdown_separates_sources_and_refuses_to_aggregate(tmp_path: Path) -> None:
+    """Scoreboard markdown reports snapshot and archive separately without aggregating."""
+    md_path = tmp_path / "scoreboard.md"
+    rows = [
+        # Snapshot row
+        {
+            "issue_time": "2026-11-02 00:00:00+00:00",
+            "horizon": 1,
+            "target_time": "2026-11-02 00:30:00+00:00",
+            "model_version": MODEL_VERSION,
+            "forecast": 150.0,
+            "actual": 160.0,
+            "neso_forecast": 170.0,
+            "abs_error": 10.0,
+            "neso_abs_error": 10.0,
+            "neso_source": "snapshot_at_issue",
+        },
+        # Archive row
+        {
+            "issue_time": "2026-11-01 00:00:00+00:00",
+            "horizon": 1,
+            "target_time": "2026-11-01 00:30:00+00:00",
+            "model_version": MODEL_VERSION,
+            "forecast": 150.0,
+            "actual": 140.0,
+            "neso_forecast": 145.0,
+            "abs_error": 10.0,
+            "neso_abs_error": 5.0,
+            "neso_source": "archive_at_scoring",
+        },
+    ]
+    df = pd.DataFrame(rows)
+    content = generate_scoreboard_markdown(df, output_path=md_path)
+
+    # Must contain both distinct sections
+    assert "## Snapshot at Issue (Verified Vintage)" in content
+    assert "## Archive at Scoring (Vintage Unverified)" in content
+    # Refusal callout in archive section
+    assert "Refusing to aggregate across sources" in content
+    # Skill score only on snapshot section
+    assert "Skill vs Operator:" in content
+    assert "Published NESO forecast for the same periods, vintage unverified" in content

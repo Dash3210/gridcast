@@ -323,22 +323,131 @@
   - Validating contract functions against their own declared return values (rejected: permits false green test suites when declarations lie about their bounds).
 
 ## ADR-018 — Serving risk: train/serve lead distribution mismatch on weather features
-- Status: open
+- Status: accepted
 - Date: 2026-11-02
 - Context:
-  This is the fourth time the same bug class has appeared in this phase: target-anchored, then issue-anchored, then availability-anchored, now servability.
   At inference the targets are in the future, and the previous-runs series has no future values. The weather available for `T+h` at serve time is the current model run with lead `h`, not the day-1/day-2 series the frame trains on with lead `>= 24h`.
   Training and serving therefore use different lead distributions, so "the model has weather features" is true in training and not true as stated for the service.
 - Decision:
-  Record this serving risk with status `open`. Decided at Phase P3 (model training and backtest), not now.
-  Nothing in the repository may claim that weather ships in the service without this caveat.
-- Options and Trade-offs (as far as known today):
-  a. **Restrict the product to horizons `>= 24h`**: where the trained lead is closest to the served lead.
-     Trade-off: reduces lead distribution divergence between training and serving, but forfeits the short-horizon forecast product (`h < 48`) which is operationally critical for intraday balancing.
-  b. **Keep all horizons, document the mismatch, and bound the damage by scoring day-1 features against day-2 features on the same frame**:
-     Trade-off: preserves the full 1–96 horizon product, but accepts train/serve distribution mismatch and requires continuous empirical quantification of lead sensitivity.
-  c. **Drop weather entirely, removing the class of problem at some accuracy cost**:
-     Trade-off: eliminates the entire defect class and upstream weather dependencies cleanly, at the expense of potentially sacrificing model accuracy during weather-driven demand and renewable supply extremes.
+  Adopt Option (b): Keep all 96 horizons, document the lead mismatch caveat across all model documentation, and bound the damage by empirically scoring day-1 features against day-2 features on the canonical validation frame.
+  Empirical quantification on the validation split for short horizons ($h \le 48$):
+  - Mean absolute temperature difference between day-1 and day-2 forecasts: $1.008$ °C (max $8.200$ °C, 95th percentile $2.700$ °C).
+  - Validation MAE with Day-1 weather features: $28.6310$ gCO2/kWh.
+  - Validation MAE with Day-2 weather features: $28.5435$ gCO2/kWh.
+  - Divergence: $0.0875$ gCO2/kWh ($0.31\%$).
+  Because the empirical accuracy divergence from lead mismatch is under $0.1$ gCO2/kWh, truncating short horizons (Option a) would sacrifice critical intraday balancing periods for negligible benefit, while dropping weather entirely (Option c) removes useful meteorological signals during grid strain.
+- Caveat:
+  No artifact or service documentation may claim that weather features ship in production without the explicit caveat that short horizons receive forecast lead $h$ at inference while trained on lead $\ge 24$h.
+- Alternatives rejected:
+  - Restricting the product to horizons $\ge 24$h (rejected: forfeits 48 half-hours essential for system balancing when empirical divergence is $< 0.1$ gCO2/kWh).
+  - Dropping weather features entirely (rejected: removes temperature-demand relationship across the 48-hour window).
+
+## ADR-019 — Evaluation gate: single scalar threshold fixed from validation split
+- Status: accepted
+- Date: 2026-11-02
+- Context:
+  The evaluation gate requires a single scalar metric so 96 separate numbers do not gate a build. Each target half-hour appears in up to three issues in a rolling evaluation, so a pooled average weights the middle of the window three times more than the edges. Furthermore, under evaluation integrity principles, the accuracy gate threshold must be determined strictly from the validation split before the test split is scored once, avoiding tuning leakage.
+- Decision:
+  1. Define the single gate scalar:
+     `MAE_h = mean absolute error over scored periods at horizon h`
+     `GATE_VALUE = (1 / 96) * sum_{h=1}^{96} MAE_h`
+     Every horizon is weighted equally.
+  2. Fix the accuracy gate threshold to `GATE_VALUE <= 35.0 gCO2/kWh` on 2026-11-02 from the validation split (`2026-06-05` to `2026-08-30`, 15 rolling origins). On this split, the LightGBM candidate achieved `GATE_VALUE = 33.815 gCO2/kWh`, beating the persistence baseline (`57.776 gCO2/kWh`, 41.5% improvement) and seasonal-naive baseline (`46.732 gCO2/kWh`, 27.6% improvement).
+  3. Score the test split (frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run) against this threshold. The candidate achieved `GATE_VALUE = 39.043 gCO2/kWh` (superseding the initial sliding evaluation; declared void and superseded by ADR-020).
+  4. The gate must evaluate all candidates and baselines strictly on the intersection of non-null periods.
+  5. The evaluation gate is executed locally via `make eval` (`python -m gridcast.cli backtest`). Wiring into CI is deferred to Phase P5, where CI will execute `make eval` alongside `make check`.
+- Consequences:
+  Deterministic evaluation machinery. Superseded by ADR-020 (threshold invalid; void verdict) and ADR-021 (gap-closure gate).
+- Alternatives rejected:
+  - Multi-metric or per-horizon gating (rejected: complex and conflicting pass/fail conditions).
+  - Pooled sample mean absolute error (rejected: triple-weights overlapping middle horizons).
+  - Tuning or tightening the threshold on the test set (rejected: corrupts test split isolation).
+
+### Amendment: Frozen test split, evaluation integrity defects, and void verdict
+- Date: 2026-11-02
+- Context:
+  An evaluation review identified three integrity defects in the evaluation pipeline:
+  1. Moving origin window: `run_rolling_origin_backtest` defaulted to `test_issues[-60:][::4]`, walking one day forward every night and intruding into the 4-day embargo (`2026-09-04`). On the sliding default origins, the model scored `33.045`, whereas on the committed documented split (frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run) it scored `39.043`.
+  2. Tautological provenance guard: the assertion compared the assigned timestamp against the formula used to assign it without verifying prediction values against the raw curated store.
+  3. Dead-code period-set guard: `compute_skill_score` enforced period-set equality at division time, but `run_rolling_origin_backtest` computed skill inline.
+  4. Silent denominator: `Series.mean(skipna=True)` silently dropped missing horizons, dividing by 95 instead of 96.
+- Decision:
+  1. Fix the backtest split to a committed, immutable range in constants:
+     - `TEST_SPLIT_START_DATE = "2026-09-05"`
+     - `TEST_SPLIT_END_DATE = "2026-11-01"`
+     - `TEST_SPLIT_STEP_DAYS = 4`
+     Origins are derived in one place (`derive_test_split_origins()`), producing 15 fixed rolling origins (`2026-09-04 23:00 UTC` to `2026-10-31 00:00 UTC`). The first origin is asserted to be at or after `2026-09-05`, never inside the 4-day embargo (`2026-08-31` to `2026-09-04`). New ingested data appends to the archive but does not extend the split.
+  2. The provenance guard (`assert_baseline_provenance`) reads the raw curated store directly via plain lookup at `issue_time - ACTUAL_AVAILABILITY_LAG`, asserting that the store row exists, is non-null, and exactly equals the prediction value.
+  3. All skill figures (per-horizon and overall) must execute through `compute_skill_score` on the live path.
+  4. The gate scalar is strictly defined as `(1 / 96) * sum(MAE_h)`; all 96 horizons are required to contribute non-null MAEs, raising `ValueError` otherwise.
+  5. The 35.0 threshold is recognized as invalid under ADR-020 (derived from candidate's own validation score). On the frozen test split (frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run), the candidate scores `GATE_VALUE = 39.043 gCO2/kWh`. The first scoring is void, P3 closes with no gate verdict (neither pass nor fail), and `make eval` prints `GATE VERDICT: NONE - threshold invalid (ADR-020); no pass or fail is claimed` and exits 0.
+- Consequences:
+  Evaluation verdicts are completely deterministic and independent of execution date.
+
+## ADR-020 — Invalid threshold and void evaluation verdict
+- Status: accepted
+- Date: 2026-11-02
+- Context:
+  The evaluation gate threshold of 35.0 gCO2/kWh used in Phase P3 was derived from the candidate model's own validation score (33.815 gCO2/kWh) plus 3.5%. It was therefore never an external standard: a model cannot be judged against a bar computed from itself. A threshold computed from the thing it judges cannot gate that thing.
+- Decision:
+  1. The first scoring is void, and Phase P3 closes with **neither a pass nor a fail** (GATE VERDICT: NONE; no verdict).
+  2. No pass or fail may be cited from Phase P3. All wording implying the candidate passed, failed, met, or missed a bar is removed across the repository (README, MODEL_CARD, and ADRs).
+  3. `make eval` prints the metrics on the frozen split and then prints, exactly and prominently:
+     `GATE VERDICT: NONE - threshold invalid (ADR-020); no pass or fail is claimed`
+     It exits 0: nothing failed, because nothing was judged.
+  4. What is retained: the per-horizon metrics, the four evaluated candidates/baselines (LightGBM candidate, issue-anchored persistence, seasonal-naive, and NESO operator), the frozen evaluation window (15 origins from `2026-09-04 23:00 UTC` to `2026-10-31 00:00 UTC`), and the backtest machinery.
+- Consequences:
+  P3 closes with no claimed verdict. Evaluation machinery is preserved intact for Phase P4.
+- Alternatives rejected:
+  - Overriding the threshold retroactively to claim a pass (rejected: dishonest and circular).
+  - Recording a gate failure against an illegitimate bar (rejected: a threshold derived from the candidate is mathematically invalid to judge it).
+
+## ADR-021 — External evaluation gate referencing persistence and operator baselines
+- Status: accepted
+- Date: 2026-11-02
+- Context:
+  An evaluation gate must be specified before a model is trained and must reference quantities entirely outside the model itself. Furthermore, the benchmark is a data source, not an oracle: it needs the same alignment discipline as any feature. The vintage of an archived forecast is a property that must be recorded rather than assumed, and the only fair comparison is between two forecasts made at the same instant.
+- Decision:
+  1. State the gate rule now, defined only in terms of quantities outside the model:
+     > On the frozen evaluation split, with candidate, persistence and operator measured on identical periods:
+     > the candidate must close at least 30 percent of the MAE gap between issue-anchored persistence and the
+     > operator.
+     >
+     > gap = MAE_persistence - MAE_operator
+     > required = MAE_persistence - 0.30 * gap
+     > passes only if MAE_candidate <= required
+  2. Derive the number from the VALIDATION split only, with its dates (`2026-06-05` to `2026-08-30`, 15 rolling origins):
+     - `MAE_persistence = 57.776 gCO2/kWh`
+     - `MAE_operator = 9.649 gCO2/kWh`
+     - `gap = MAE_persistence - MAE_operator = 57.776 - 9.649 = 48.127 gCO2/kWh`
+     - `required = MAE_persistence - 0.30 * gap = 57.776 - 0.30 * 48.127 = 43.3379 gCO2/kWh` (43.338 gCO2/kWh)
+     Do not compute or quote the frozen-split threshold in this ADR: that split is scored once, later, and a threshold printed beside a result looks tuned.
+  3. Why 30 percent: a floor demanding much of the distance between doing nothing and the operator, without requiring a solo model to beat an operator with information it does not have. State that the fraction is a policy choice fixed now, changeable only before a model is trained, never after a score is seen.
+  4. The gate is not wired into CI until P5.
+  5. The benchmark is a data source, not an oracle, and needs the same alignment discipline as any feature; the vintage of an archived forecast is a property to be recorded, not assumed; the only fair comparison is between two forecasts made at the same instant.
+- Consequences:
+  Pre-specified, objective gate rule for Phase P4 referencing external reality rather than model-derived numbers.
+- Alternatives rejected:
+  - Absolute error threshold like 35.0 gCO2/kWh (rejected: arbitrary and unanchored to difficulty of the period).
+  - Requiring the model to beat the operator (rejected: operator possesses private dispatch and transmission information).
+  - Computing the frozen-split threshold prior to P4 model training (rejected: risks appearing post-hoc tuned).
+
+## ADR-022 — Operator baseline information set mismatch
+- Status: open
+- Date: 2026-11-02
+- Context:
+  The operator forecast is read from the curated `forecast` column at `target_time`. That column is NESO's published forecast for that settlement period, and it is published relative to the **target**, not to our issue instant. For a long horizon (e.g. 48 hours ahead), the operator had information closer to the target than the candidate did; for a short horizon (e.g. 30 minutes ahead), it may have had less (or was published earlier). The published upstream data does not expose the publication timestamp, so alignment to what genuinely existed at issue instant `T` is not possible from this archive source.
+- Decision:
+  1. Record the information set mismatch in both directions as an explicit, open limitation of the comparison, not a bug to be patched silently.
+  2. No claim of "we beat" or "we lost to" the operator may appear anywhere in repository documentation without this caveat.
+  3. In all tables and scoreboards comparing against historical archive forecasts, describe the baseline as `Published NESO forecast for the same periods, vintage unverified`.
+  4. The option to seek an upstream source with explicit publication timestamps is deferred to a later phase.
+- Consequences:
+  All comparisons with the operator are caveated and honest about differing information sets.
+- Alternatives rejected:
+  - Silently assuming archived forecasts are day-ahead (rejected: false and flatters the operator).
+  - Imputing publication timestamps (rejected: unverified fiction).
+
 
 
 

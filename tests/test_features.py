@@ -74,27 +74,41 @@ GAP_ADJACENT_DATES: list[str] = [
 EXPLICIT_SPECIAL_DATES: list[str] = DST_TRANSITION_DATES + GAP_ADJACENT_DATES
 
 
+def derive_head_issue_dates(frame: pd.DataFrame, n: int = 7) -> list[str]:
+    """Derive the first n issue dates present in the frame in ISO format."""
+    issue_dates = sorted({ts.tz_convert(LONDON_TZ).date() for ts in frame["issue_time"]})
+    if len(issue_dates) < n:
+        raise ValueError(f"Frame has fewer than {n} issue dates ({len(issue_dates)})")
+    return [d.isoformat() for d in issue_dates[:n]]
+
+
+def derive_tail_issue_dates(frame: pd.DataFrame, n: int = 7) -> list[str]:
+    """Derive the last n issue dates present in the frame in ISO format."""
+    issue_dates = sorted({ts.tz_convert(LONDON_TZ).date() for ts in frame["issue_time"]})
+    if len(issue_dates) < n:
+        raise ValueError(f"Frame has fewer than {n} issue dates ({len(issue_dates)})")
+    return [d.isoformat() for d in issue_dates[-n:]]
+
+
 def derive_required_grid_dates(frame: pd.DataFrame) -> set[str]:
     """Derive required test grid dates as a computed property from the frame itself.
 
     Rule: first seven and last seven issue dates present in the frame, plus the four
     DST transition days, plus the gap-adjacent dates already covered.
     """
-    issue_dates = sorted({ts.tz_convert(LONDON_TZ).date() for ts in frame["issue_time"]})
-    if len(issue_dates) < 14:
-        raise ValueError(f"Frame has fewer than 14 issue dates ({len(issue_dates)})")
-    first_seven = {d.isoformat() for d in issue_dates[:7]}
-    last_seven = {d.isoformat() for d in issue_dates[-7:]}
+    first_seven = set(derive_head_issue_dates(frame, 7))
+    last_seven = set(derive_tail_issue_dates(frame, 7))
     return first_seven | last_seven | set(EXPLICIT_SPECIAL_DATES)
 
 
 def derive_invariance_windows(frame: pd.DataFrame) -> list[tuple[str, str, str]]:
     """Derive realistic multi-issue frame test windows including first 7 and last 7 issue dates."""
-    issue_dates = sorted({ts.tz_convert(LONDON_TZ).date() for ts in frame["issue_time"]})
-    first_7_start = issue_dates[0].isoformat()
-    first_7_end = issue_dates[6].isoformat()
-    last_7_start = issue_dates[-7].isoformat()
-    last_7_end = issue_dates[-1].isoformat()
+    first_7 = derive_head_issue_dates(frame, 7)
+    last_7 = derive_tail_issue_dates(frame, 7)
+    first_7_start = first_7[0]
+    first_7_end = first_7[-1]
+    last_7_start = last_7[0]
+    last_7_end = last_7[-1]
     return [
         (first_7_start, first_7_end, "first_seven_issue_dates_week"),
         # Standard summer week
@@ -146,100 +160,113 @@ class TestTemporalLeakageInvariance:
         )
         assert orig_frame["issue_time"].nunique() == 7 and len(orig_frame) == 7 * 96
 
-        # 2. Test one perturbation per issue inside the frame
-        for issue_time in schedule:
-            perturbed_intensity = intensity_df.copy()
-            perturbed_weather = weather_df.copy()
-            perturbed_mix = mix_df.copy()
+        # 2. Choose window cutoff so post-cutoff source data exists:
+        # use the window's first issue when the window contains > 1 issue,
+        # or step the cutoff back until the masks are non-empty.
+        cutoff = schedule[0]
+        int_times = pd.to_datetime(intensity_df["period_start_utc"], utc=True)
+        mix_times = pd.to_datetime(mix_df["period_start_utc"], utc=True)
+        while not (int_times > cutoff).any() or not (mix_times > cutoff).any():
+            cutoff -= pd.Timedelta(hours=24)
 
-            # Intensity actuals and forecasts after issue_time
-            mask_int = (
-                pd.to_datetime(perturbed_intensity["period_start_utc"], utc=True) > issue_time
+        perturbed_intensity = intensity_df.copy()
+        perturbed_weather = weather_df.copy()
+        perturbed_mix = mix_df.copy()
+
+        # Intensity actuals and forecasts after cutoff
+        mask_int = (
+            pd.to_datetime(perturbed_intensity["period_start_utc"], utc=True) > cutoff
+        )
+        perturbed_intensity.loc[mask_int, "actual"] = (
+            perturbed_intensity.loc[mask_int, "actual"].fillna(100) + 1000
+        )
+        if "forecast" in perturbed_intensity.columns:
+            perturbed_intensity.loc[mask_int, "forecast"] = (
+                perturbed_intensity.loc[mask_int, "forecast"].fillna(100) * 2
             )
-            perturbed_intensity.loc[mask_int, "actual"] = (
-                perturbed_intensity.loc[mask_int, "actual"].fillna(100) + 1000
+
+        # Mix fuel shares after cutoff
+        mask_mix = pd.to_datetime(perturbed_mix["period_start_utc"], utc=True) > cutoff
+        for fuel in MIX_FUELS:
+            if fuel in perturbed_mix.columns:
+                arr = perturbed_mix.loc[mask_mix, fuel].to_numpy()
+                rolled = np.roll(arr, shift=1)
+                if np.array_equal(arr, rolled):
+                    rolled = arr + 10.0
+                perturbed_mix.loc[mask_mix, fuel] = rolled
+
+        # Weather previous-runs forecasts:
+        # Day 1 forecast was issued at period_start_utc - 24h.
+        # Day 2 forecast was issued at period_start_utc - 48h.
+        w_ts = pd.to_datetime(perturbed_weather["period_start_utc"], utc=True)
+        mask_wth_d1 = (w_ts - pd.Timedelta(hours=24)) > cutoff
+        if "temperature_2m_previous_day1" in perturbed_weather.columns:
+            perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"] = (
+                perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"] + 40.0
             )
-            if "forecast" in perturbed_intensity.columns:
-                perturbed_intensity.loc[mask_int, "forecast"] = (
-                    perturbed_intensity.loc[mask_int, "forecast"].fillna(100) * 2
-                )
 
-            # Mix fuel shares after issue_time
-            mask_mix = pd.to_datetime(perturbed_mix["period_start_utc"], utc=True) > issue_time
-            for fuel in MIX_FUELS:
-                if fuel in perturbed_mix.columns:
-                    arr = perturbed_mix.loc[mask_mix, fuel].to_numpy()
-                    rolled = np.roll(arr, shift=1)
-                    if np.array_equal(arr, rolled):
-                        rolled = arr + 10.0
-                    perturbed_mix.loc[mask_mix, fuel] = rolled
-
-            # Weather previous-runs forecasts:
-            # Day 1 forecast was issued at period_start_utc - 24h.
-            # Day 2 forecast was issued at period_start_utc - 48h.
-            w_ts = pd.to_datetime(perturbed_weather["period_start_utc"], utc=True)
-            mask_wth_d1 = (w_ts - pd.Timedelta(hours=24)) > issue_time
-            if "temperature_2m_previous_day1" in perturbed_weather.columns:
-                perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"] = (
-                    perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"] + 40.0
-                )
-
-            mask_wth_d2 = (w_ts - pd.Timedelta(hours=48)) > issue_time
-            if "temperature_2m_previous_day2" in perturbed_weather.columns:
-                perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"] = (
-                    perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"] + 40.0
-                )
-
-            for col in perturbed_weather.columns:
-                if col not in (
-                    "period_start_utc",
-                    "local_date",
-                    "temperature_2m_previous_day1",
-                    "temperature_2m_previous_day2",
-                ):
-                    perturbed_weather.loc[w_ts > issue_time, col] = 999.0
-
-            assert mask_int.any(), (
-                "Precondition failed: intensity mutation mask must not be empty"
+        mask_wth_d2 = (w_ts - pd.Timedelta(hours=48)) > cutoff
+        if "temperature_2m_previous_day2" in perturbed_weather.columns:
+            perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"] = (
+                perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"] + 40.0
             )
+
+        for col in perturbed_weather.columns:
+            if col not in (
+                "period_start_utc",
+                "local_date",
+                "temperature_2m_previous_day1",
+                "temperature_2m_previous_day2",
+            ):
+                perturbed_weather.loc[w_ts > cutoff, col] = 999.0
+
+        assert mask_int.any(), (
+            "Precondition failed: intensity mutation mask must not be empty"
+        )
+        assert_injection_changed(
+            intensity_df.loc[mask_int, "actual"],
+            perturbed_intensity.loc[mask_int, "actual"],
+            label="intensity actuals future perturbation",
+        )
+        assert mask_mix.any(), "Precondition failed: mix mutation mask must not be empty"
+        for fuel in MIX_FUELS:
+            if fuel in perturbed_mix.columns:
+                assert_injection_changed(
+                    mix_df.loc[mask_mix, fuel],
+                    perturbed_mix.loc[mask_mix, fuel],
+                    label=f"mix fuel {fuel} future perturbation",
+                )
+        if "temperature_2m_previous_day1" in perturbed_weather.columns and mask_wth_d1.any():
             assert_injection_changed(
-                intensity_df.loc[mask_int, "actual"],
-                perturbed_intensity.loc[mask_int, "actual"],
-                label="intensity actuals future perturbation",
+                weather_df.loc[mask_wth_d1, "temperature_2m_previous_day1"],
+                perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"],
+                label="weather previous_day1 future perturbation",
             )
-            assert mask_mix.any(), "Precondition failed: mix mutation mask must not be empty"
-            for fuel in MIX_FUELS:
-                if fuel in perturbed_mix.columns:
-                    assert_injection_changed(
-                        mix_df.loc[mask_mix, fuel],
-                        perturbed_mix.loc[mask_mix, fuel],
-                        label=f"mix fuel {fuel} future perturbation",
-                    )
-            if "temperature_2m_previous_day1" in perturbed_weather.columns and mask_wth_d1.any():
-                assert_injection_changed(
-                    weather_df.loc[mask_wth_d1, "temperature_2m_previous_day1"],
-                    perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"],
-                    label="weather previous_day1 future perturbation",
-                )
-            if "temperature_2m_previous_day2" in perturbed_weather.columns and mask_wth_d2.any():
-                assert_injection_changed(
-                    weather_df.loc[mask_wth_d2, "temperature_2m_previous_day2"],
-                    perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"],
-                    label="weather previous_day2 future perturbation",
-                )
-
-            # 3. Rebuild full multi-issue frame (7 dates x 96 horizons) from perturbed sources
-            rebuilt_frame = build_example_frame(
-                intensity_df=perturbed_intensity,
-                weather_df=perturbed_weather,
-                mix_df=perturbed_mix,
-                issue_times=schedule,
-                horizons=range(1, 97),
-                require_aux=False,
+        if "temperature_2m_previous_day2" in perturbed_weather.columns and mask_wth_d2.any():
+            assert_injection_changed(
+                weather_df.loc[mask_wth_d2, "temperature_2m_previous_day2"],
+                perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"],
+                label="weather previous_day2 future perturbation",
             )
-            assert rebuilt_frame["issue_time"].nunique() == 7 and len(rebuilt_frame) == 7 * 96
 
-            # 4. Assert all 96 horizons for the perturbed issue are strictly invariant
+        # 3. Rebuild full multi-issue frame (7 dates x 96 horizons) from perturbed sources
+        rebuilt_frame = build_example_frame(
+            intensity_df=perturbed_intensity,
+            weather_df=perturbed_weather,
+            mix_df=perturbed_mix,
+            issue_times=schedule,
+            horizons=range(1, 97),
+            require_aux=False,
+        )
+        assert rebuilt_frame["issue_time"].nunique() == 7 and len(rebuilt_frame) == 7 * 96
+
+        # 4. Assert every feature row at or before cutoff is unchanged
+        unchanged_issues = [it for it in schedule if it <= cutoff]
+        assert unchanged_issues, (
+            "Precondition failed: at least one issue must be at or before cutoff"
+        )
+
+        for issue_time in unchanged_issues:
             orig_slice = orig_frame[orig_frame["issue_time"] == issue_time]
             rebuilt_slice = rebuilt_frame[rebuilt_frame["issue_time"] == issue_time]
             assert len(orig_slice) == 96
@@ -1334,10 +1361,7 @@ class TestDenseValueGridOracle:
         assert grid_dates_set.issuperset(required_dates)
 
         # 2. Deleting any date from list fails suite (demonstrated with tail date)
-        issue_dates = sorted(
-            {ts.tz_convert(LONDON_TZ).date() for ts in canonical_frame["issue_time"]}
-        )
-        tail_date = issue_dates[-1].isoformat()
+        tail_date = derive_tail_issue_dates(canonical_frame, 1)[0]
         mutated_grid_set = grid_dates_set - {tail_date}
         assert not mutated_grid_set.issuperset(required_dates), (
             f"Deleting tail date '{tail_date}' must fail the superset coverage check"
@@ -1389,14 +1413,23 @@ class TestDenseValueGridOracle:
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
         dense_grid_frame: pd.DataFrame,
     ) -> None:
-        """Reproduction of Defect 1: target leak confined to issue dates >= 2026-10-26.
+        """Reproduction of Defect 1: target leak confined to tail issue dates.
 
         Asserts that injecting actual_recent_3h = y on tail dates is detected by the
         dense grid oracle check and raises an AssertionError with diagnostic naming
         date, horizon, column, expected and observed values.
         """
         intensity_df, weather_df, mix_df = curated_sample_data
-        leak_date_str = "2026-10-26"
+        tail_dates = derive_tail_issue_dates(_CANONICAL_FRAME, 7)
+        leak_date_str = tail_dates[0]
+        grid_dates = {
+            ts.tz_convert(LONDON_TZ).date().isoformat()
+            for ts in dense_grid_frame["issue_time"]
+        }
+        assert leak_date_str in grid_dates, (
+            f"Derived leak date '{leak_date_str}' is not present in dense_grid_frame dates: "
+            f"{sorted(grid_dates)}"
+        )
         leak_cutoff = issue_time_for_date(leak_date_str)
 
         leaked_frame = dense_grid_frame.copy()
@@ -1409,10 +1442,14 @@ class TestDenseValueGridOracle:
         assert_injection_changed(
             orig_vals,
             leaked_frame.loc[mask, "actual_recent_3h"],
-            label="tail target leak injection on issue dates >= 2026-10-26",
+            label=f"tail target leak injection on issue dates >= {leak_date_str}",
         )
 
         day_frame = leaked_frame[leaked_frame["issue_time"] == leak_cutoff]
+        assert not day_frame.empty, (
+            f"Dense grid frame has no rows for leak date '{leak_date_str}' "
+            f"at issue time {leak_cutoff}"
+        )
         with pytest.raises(AssertionError) as exc_info:
             for h in range(1, 97):
                 row = day_frame[day_frame["horizon"] == h].iloc[0]
@@ -1451,6 +1488,71 @@ class TestDenseValueGridOracle:
         assert "horizon 1" in diag
         assert "expected value" in diag
         assert "observed value" in diag
+
+    def test_derived_head_and_tail_dates_guard(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+        dense_grid_frame: pd.DataFrame,
+    ) -> None:
+        """Guard that neither test uses dates absent from the frame's derived head or tail sets.
+
+        Ensures that both the tail target leak test and the invariance windows use dates
+        derived from the frame's head and tail sets, and that all such dates are present
+        in the dense grid. A missing tail date fails this guard immediately with a clear message.
+        """
+        canonical_frame = _CANONICAL_FRAME
+        derived_head = derive_head_issue_dates(canonical_frame, 7)
+        derived_tail = derive_tail_issue_dates(canonical_frame, 7)
+        head_dates_set = set(derived_head)
+        tail_dates_set = set(derived_tail)
+
+        # 1. Tail leak test date must be in the derived tail set and in the grid
+        leak_date_str = derived_tail[0]
+        assert leak_date_str in tail_dates_set, (
+            f"Leak test date '{leak_date_str}' must be in derived tail set: "
+            f"{sorted(tail_dates_set)}"
+        )
+
+        grid_dates = {
+            ts.tz_convert(LONDON_TZ).date().isoformat()
+            for ts in dense_grid_frame["issue_time"]
+        }
+        assert leak_date_str in grid_dates, (
+            f"Leak test date '{leak_date_str}' must be present in dense grid dates"
+        )
+
+        # 2. Invariance window dates for head and tail weeks must match derived sets
+        head_window = [
+            w for w in REALISTIC_INVARIANCE_WINDOWS if w[2] == "first_seven_issue_dates_week"
+        ][0]
+        head_schedule_dates = {
+            ts.tz_convert(LONDON_TZ).date().isoformat()
+            for ts in default_issue_schedule(head_window[0], head_window[1])
+        }
+        assert head_schedule_dates == head_dates_set, (
+            f"Head invariance window dates {sorted(head_schedule_dates)} "
+            f"do not match derived head set {sorted(head_dates_set)}"
+        )
+
+        tail_window = [
+            w for w in REALISTIC_INVARIANCE_WINDOWS if w[2] == "last_seven_issue_dates_week"
+        ][0]
+        tail_schedule_dates = {
+            ts.tz_convert(LONDON_TZ).date().isoformat()
+            for ts in default_issue_schedule(tail_window[0], tail_window[1])
+        }
+        assert tail_schedule_dates == tail_dates_set, (
+            f"Tail invariance window dates {sorted(tail_schedule_dates)} "
+            f"do not match derived tail set {sorted(tail_dates_set)}"
+        )
+
+        # 3. Dense grid must contain all derived head and tail dates
+        missing_head = head_dates_set - grid_dates
+        assert not missing_head, f"Dense grid is missing derived head dates: {sorted(missing_head)}"
+        missing_tail = tail_dates_set - grid_dates
+        assert not missing_tail, (
+            f"Dense grid is missing derived tail dates: {sorted(missing_tail)}"
+        )
 
     @pytest.mark.parametrize(
         "test_date",

@@ -1,0 +1,17 @@
+{
+  "gate_value": 28.8701,
+  "operator_gate_value": 9.5234,
+  "persistence_gate_value": 68.7214,
+  "seasonal_naive_gate_value": 44.3984,
+  "overall_skill_vs_operator": -2.0315,
+  "skill_h2": -2.6645,
+  "skill_h48": -3.9004,
+  "skill_h96": -3.7804,
+  "intersection_size": 384,
+  "origins": [
+    "2025-06-04T23:00:00+00:00",
+    "2025-06-11T23:00:00+00:00",
+    "2025-06-18T23:00:00+00:00",
+    "2025-06-25T23:00:00+00:00"
+  ]
+}

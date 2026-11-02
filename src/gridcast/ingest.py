@@ -593,6 +593,7 @@ def payload_to_frame(
                 "index",
                 "ingested_at",
                 "first_seen_at",
+                "forecast_first_seen_at",
             ]
         )
         empty_df["period_start_utc"] = pd.to_datetime([], utc=True)
@@ -604,6 +605,7 @@ def payload_to_frame(
         empty_df["index"] = pd.Series([], dtype="string")
         empty_df["ingested_at"] = pd.to_datetime([], utc=True)
         empty_df["first_seen_at"] = pd.to_datetime([], utc=True)
+        empty_df["forecast_first_seen_at"] = pd.to_datetime([], utc=True)
         return empty_df
 
     rows = []
@@ -639,17 +641,22 @@ def payload_to_frame(
         first_seen_val = (
             ingested_ts if act_val is not None and not pd.isna(act_val) else pd.NaT
         )
+        fc_val = intensity.get("forecast")
+        forecast_first_seen_val = (
+            ingested_ts if fc_val is not None and not pd.isna(fc_val) else pd.NaT
+        )
         rows.append(
             {
                 "period_start_utc": start_utc,
                 "period_end_utc": end_utc,
                 "utc_date": start_utc.date(),
                 "local_date": row_local_date,
-                "forecast": intensity.get("forecast"),
+                "forecast": fc_val,
                 "actual": act_val,
                 "index": intensity.get("index"),
                 "ingested_at": ingested_ts,
                 "first_seen_at": first_seen_val,
+                "forecast_first_seen_at": forecast_first_seen_val,
             }
         )
 
@@ -658,6 +665,7 @@ def payload_to_frame(
     df["period_end_utc"] = pd.to_datetime(df["period_end_utc"], utc=True)
     df["ingested_at"] = pd.to_datetime(df["ingested_at"], utc=True)
     df["first_seen_at"] = pd.to_datetime(df["first_seen_at"], utc=True)
+    df["forecast_first_seen_at"] = pd.to_datetime(df["forecast_first_seen_at"], utc=True)
     df["forecast"] = df["forecast"].astype("Int32")
     df["actual"] = df["actual"].astype("Int32")
     df["index"] = df["index"].astype("string")
@@ -684,6 +692,10 @@ def read_partition(local_date: date | str, base_dir: Path | None = None) -> pd.D
         df["first_seen_at"] = pd.to_datetime(df["first_seen_at"], utc=True)
     else:
         df["first_seen_at"] = pd.Series([pd.NaT] * len(df), dtype="datetime64[ns, UTC]")
+    if "forecast_first_seen_at" in df.columns:
+        df["forecast_first_seen_at"] = pd.to_datetime(df["forecast_first_seen_at"], utc=True)
+    else:
+        df["forecast_first_seen_at"] = pd.Series([pd.NaT] * len(df), dtype="datetime64[ns, UTC]")
     df["forecast"] = df["forecast"].astype("Int32")
     df["actual"] = df["actual"].astype("Int32")
     df["index"] = df["index"].astype("string")
@@ -805,6 +817,22 @@ def upsert_day(
             deduped.loc[deduped["actual"].isna(), "first_seen_at"] = pd.NaT
             need_ts = deduped["actual"].notna() & deduped["first_seen_at"].isna()
             deduped.loc[need_ts, "first_seen_at"] = deduped.loc[need_ts, "ingested_at"]
+        if "forecast_first_seen_at" not in deduped.columns:
+            deduped["forecast_first_seen_at"] = pd.Series(
+                [pd.NaT] * len(deduped), dtype="datetime64[ns, UTC]"
+            )
+            deduped.loc[deduped["forecast"].notna(), "forecast_first_seen_at"] = deduped.loc[
+                deduped["forecast"].notna(), "ingested_at"
+            ]
+        else:
+            deduped["forecast_first_seen_at"] = pd.to_datetime(
+                deduped["forecast_first_seen_at"], utc=True
+            )
+            deduped.loc[deduped["forecast"].isna(), "forecast_first_seen_at"] = pd.NaT
+            need_fc_ts = deduped["forecast"].notna() & deduped["forecast_first_seen_at"].isna()
+            deduped.loc[need_fc_ts, "forecast_first_seen_at"] = deduped.loc[
+                need_fc_ts, "ingested_at"
+            ]
     else:
         rows_before = len(existing)
         existing_unique = existing["period_start_utc"].nunique()
@@ -824,7 +852,12 @@ def upsert_day(
             else:
                 prior = records[key]
                 if pd.notna(row_dict["forecast"]) and row_dict["forecast"] is not None:
+                    prior_forecast_was_null = pd.isna(prior.get("forecast"))
                     prior["forecast"] = row_dict["forecast"]
+                    if prior_forecast_was_null and pd.isna(prior.get("forecast_first_seen_at")):
+                        prior["forecast_first_seen_at"] = (
+                            row_dict.get("forecast_first_seen_at") or row_dict["ingested_at"]
+                        )
                 if pd.notna(row_dict["actual"]) and row_dict["actual"] is not None:
                     prior_actual_was_null = pd.isna(prior.get("actual"))
                     prior["actual"] = row_dict["actual"]
@@ -847,6 +880,13 @@ def upsert_day(
                         row_dict["first_seen_at"] = row_dict["ingested_at"]
                 else:
                     row_dict["first_seen_at"] = pd.NaT
+
+                if pd.notna(row_dict.get("forecast")) and row_dict["forecast"] is not None:
+                    fc_ts = row_dict.get("forecast_first_seen_at")
+                    if fc_ts is None or pd.isna(fc_ts):
+                        row_dict["forecast_first_seen_at"] = row_dict["ingested_at"]
+                else:
+                    row_dict["forecast_first_seen_at"] = pd.NaT
                 records[key] = row_dict
             else:
                 prior = records[key]
@@ -859,6 +899,12 @@ def upsert_day(
                     if pd.isna(prior_fc) or prior_fc != in_fc:
                         prior["forecast"] = in_fc
                         row_changed = True
+                    if pd.isna(prior_fc):
+                        # Transition null -> non-null: set forecast_first_seen_at to ingest instant
+                        prior["forecast_first_seen_at"] = row_dict["ingested_at"]
+                    else:
+                        # Already non-null: keep stored forecast_first_seen_at. Never overwrite it.
+                        pass
                 else:
                     if pd.notna(prior_fc) and prior_fc is not None:
                         conflicts.append((
@@ -925,6 +971,7 @@ def upsert_day(
         "index",
         "ingested_at",
         "first_seen_at",
+        "forecast_first_seen_at",
     ]
     deduped = deduped[columns]
 
@@ -932,12 +979,15 @@ def upsert_day(
     deduped["period_end_utc"] = pd.to_datetime(deduped["period_end_utc"], utc=True)
     deduped["ingested_at"] = pd.to_datetime(deduped["ingested_at"], utc=True)
     deduped["first_seen_at"] = pd.to_datetime(deduped["first_seen_at"], utc=True)
+    deduped["forecast_first_seen_at"] = pd.to_datetime(deduped["forecast_first_seen_at"], utc=True)
     deduped["forecast"] = deduped["forecast"].astype("Int32")
     deduped["actual"] = deduped["actual"].astype("Int32")
     deduped["index"] = deduped["index"].astype("string")
 
     # Invariant: null actual never carries a first_seen_at
     deduped.loc[deduped["actual"].isna(), "first_seen_at"] = pd.NaT
+    # Invariant: null forecast never carries a forecast_first_seen_at
+    deduped.loc[deduped["forecast"].isna(), "forecast_first_seen_at"] = pd.NaT
 
     # Sort strictly by period_start_utc
     deduped = deduped.sort_values(by="period_start_utc").reset_index(drop=True)

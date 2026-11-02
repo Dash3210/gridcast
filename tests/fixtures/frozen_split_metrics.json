@@ -1,0 +1,38 @@
+{
+  "run_date": "2026-11-02",
+  "origin_window": "frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run",
+  "start_date": "2026-09-05",
+  "end_date": "2026-11-01",
+  "origins_count": 15,
+  "first_origin": "2026-09-04 23:00 UTC",
+  "last_origin": "2026-10-31 00:00 UTC",
+  "scalars": {
+    "model": 39.043,
+    "operator": 11.666,
+    "persistence": 53.741,
+    "seasonal_naive": 51.495
+  },
+  "key_horizons": {
+    "2": {
+      "model": 13.93,
+      "operator": 7.67,
+      "persistence": 34.67,
+      "seasonal_naive": 30.13,
+      "periods": 15
+    },
+    "48": {
+      "model": 53.99,
+      "operator": 14.47,
+      "persistence": 63.6,
+      "seasonal_naive": 47.0,
+      "periods": 15
+    },
+    "96": {
+      "model": 40.17,
+      "operator": 8.47,
+      "persistence": 53.67,
+      "seasonal_naive": 54.93,
+      "periods": 15
+    }
+  }
+}

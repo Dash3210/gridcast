@@ -1,10 +1,10 @@
 # gridcast
 
-**Target.** gridcast is a containerised forecasting service for Great Britain's half-hourly grid carbon intensity, forecasting 48 hours ahead and will be gated in CI on forecast accuracy. It aims to answer whether a solo open-source model can beat the National Energy System Operator's (NESO) official day-ahead forecast on a permanent, public scoreboard.
+**Target.** gridcast is a containerised forecasting service for Great Britain's half-hourly grid carbon intensity, forecasting 48 hours ahead and will be gated in CI on forecast accuracy. It aims to answer whether a solo open-source model can beat the National Energy System Operator's (NESO) published forecast on a permanent, public scoreboard.
 
-> Phase P2 implemented and under review: the feature layer and its leakage tests exist and pass their gates, but the phase has not been signed off. The status table below is the honest state.
+> Phase P3 closes with no gate verdict (neither a pass nor a fail; ADR-020). The previously proposed 35.0 gCO2/kWh threshold was derived from the candidate's own validation score and was mathematically invalid to judge it. On the frozen evaluation split (frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run; 2026-09-04 23:00 UTC to 2026-10-31 00:00 UTC), the candidate model scores GATE_VALUE = 39.043 gCO2/kWh against persistence (53.741 gCO2/kWh), seasonal-naive (51.495 gCO2/kWh), and NESO operator (11.666 gCO2/kWh). An external gap-closure gate referencing persistence and operator baselines is defined in ADR-021 for Phase P4.
 
-> Note: Upon completion of Phase P7, this README will open with the live forecast-vs-actual scoreboard table comparing gridcast models against the NESO day-ahead baseline, positioned directly above the Quickstart.
+> Note: Upon completion of Phase P7, this README will open with the live forecast-vs-actual scoreboard table comparing gridcast models against the NESO baseline, positioned directly above the Quickstart.
 
 ## Status
 
@@ -12,9 +12,9 @@
 |---|---|---|
 | P0 | Setup: repository skeleton, environment, CLI gating, and smoke tests | done |
 | P1 | Ingest: half-hourly API fetch to append-only Parquet daily partitions | done |
-| P2 | Features: feature extraction and temporal leakage test suite | implemented, under review |
-| P3 | Models: baseline models, backtesting engine, and accuracy gate vs NESO | next |
-| P4 | Service: FastAPI prediction API and Prometheus metrics endpoint | not started |
+| P2 | Features: feature extraction and temporal leakage test suite | done |
+| P3 | Models: baseline models, backtesting engine, and evaluation gate | closed (no gate verdict; ADR-020) |
+| P4 | Service: FastAPI prediction API and Prometheus metrics endpoint | next |
 | P5 | Packaging: Docker containerisation and GitHub Actions CI workflow | not started |
 | P6 | Verification: deliberately failing pull request demonstrating accuracy gate | not started |
 | P7 | Deployment: automated schedule, documentation, and scoreboard publication | not started |
@@ -79,7 +79,7 @@ python -m gridcast version
 
 ## What works today
 
-Today (Phase P2), the working automation targets are:
+Today (Phase P3), the working automation targets are:
 - `make install` — creates the virtual environment and installs dependencies in editable mode
 - `make test` — runs the test suite with coverage enforcement (>= 85%) and temporal leakage validation
 - `make lint` — checks codebase formatting and linting rules with ruff
@@ -87,6 +87,8 @@ Today (Phase P2), the working automation targets are:
 - `make clean` — removes virtual environment, caches, and build artefacts
 - `make ingest` — runs the nightly half-hourly ingest CLI (`gridcast ingest --days 2` followed by `gridcast ingest --reconcile-recent`)
 - `make features` — builds and inspects the canonical example feature frame keyed by `(issue_time, horizon)`
+- `make train` — trains the native LightGBM model on settled features and writes artifact hash
+- `make eval` — runs the rolling-origin backtest across 15 origins and evaluates the single scalar accuracy gate
 - `make data-check` — asserts integrity and completeness of the committed curated dataset
 
 ### Features
@@ -143,6 +145,37 @@ print(f"y shape: {y.shape} (strictly non-null training labels)")
 
 `select_training_arrays(df)` drops unsettled target rows and verifies `y` contains no nulls before returning `(X, y)`. Model inputs `X` is a positive selection constructed via `select_model_inputs(df)` for inference, and `df.drop(columns=["y"])` is strictly forbidden.
 
+### Models and Evaluation (Phase P3)
+
+Phase P3 builds the forecast model, three comparison baselines, and the evaluation backtesting engine:
+- **Models**:
+  - *Candidate*: LightGBM regressor (`train_lgbm`) using the native `lgb.train` API (no scikit-learn dependency), trained deterministically (`seed=42`, `num_threads=1`) on the 29 canonical features.
+  - *Persistence Baseline*: Reads the most recent actual available at issue instant (`actual` at `issue_time - ACTUAL_AVAILABILITY_LAG`), held flat across all 96 horizons. Guarded by a strict non-tautological provenance assertion against the raw curated store (`source_period_start_utc == issue_time - ACTUAL_AVAILABILITY_LAG` and forecast equals raw store actual).
+  - *Seasonal-Naive Baseline*: Reads the realised actual from 24 hours before the target time (`target_time - 24h`) from history strictly available at `<= issue_time - ACTUAL_AVAILABILITY_LAG`.
+  - *Operator Baseline*: Published forecast from the National Energy System Operator (NESO). Vintage is unverified for historical archive rows (ADR-022); live snapshots at issue instant are recorded going forward.
+- **Evaluation Integrity Principles**:
+  - *Identical Period Scoring*: Models and baselines are scored exclusively on the exact intersection where model forecast, realised actual, and operator forecast are all present. Exclusion counts are audited per reason.
+  - *Division-Time Period Set Assertion*: All skill scores are evaluated strictly through `compute_skill_score`, asserting that numerator and denominator period sets are identical at the point of division on the live path.
+  - *Temporal Fold Isolation*: On every fold, the training set is asserted strictly to terminate before the fold issue origin: $\max(\text{train}[\text{target\_time}]) < T$.
+  - *Single Scalar Metric*: Avoids pool-weighting bias where middle horizons are evaluated three times more frequently than edge horizons by defining:
+    $$\text{MAE}_h = \text{mean absolute error at horizon } h$$
+    $$\text{GATE\_VALUE} = \frac{1}{96} \sum_{h=1}^{96} \text{MAE}_h$$
+    All 96 horizons are strictly required to contribute non-null MAEs (preventing silent denominator division by 95).
+- **Evaluation Verdict Status (ADR-020)**:
+  - The previously considered threshold of `35.000 gCO2/kWh` was derived from the candidate's own validation score (33.815 gCO2/kWh plus 3.5%) and was therefore invalid as an external gate. A model cannot be judged against a bar computed from itself; the first scoring is void, and Phase P3 closes with **no gate verdict (neither a pass nor a fail)**.
+  - On the frozen test split (frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run; `2026-09-04 23:00 UTC` to `2026-10-31 00:00 UTC`), the candidate scores `GATE_VALUE = 39.043 gCO2/kWh` vs persistence `53.741 gCO2/kWh`, seasonal-naive `51.495 gCO2/kWh`, and NESO operator `11.666 gCO2/kWh`. The candidate beats its own baselines by roughly a quarter and loses to the operator by about three times, on a fixed window, so any future number must be quoted beside its window. Do not describe this as accuracy, as a pass, or as meeting a standard.
+  - `make eval` (`python -m gridcast.cli backtest`) reports metrics on the frozen split, prints `GATE VERDICT: NONE - threshold invalid (ADR-020); no pass or fail is claimed`, and exits 0. Nothing failed, because nothing was judged.
+- **Phase P4 Gate Specification (ADR-021)**:
+  - Defined prior to Phase P4 training in terms of external quantities:
+    > On the frozen evaluation split, with candidate, persistence and operator measured on identical periods:
+    > the candidate must close at least 30 percent of the MAE gap between issue-anchored persistence and the
+    > operator.
+    >
+    > gap = MAE_persistence - MAE_operator
+    > required = MAE_persistence - 0.30 * gap
+    > passes only if MAE_candidate <= required
+  - Derived on the validation split only (`2026-06-05` to `2026-08-30`, 15 rolling origins: persistence 57.776, operator 9.649, gap 48.127, required 43.338). Gating in CI arrives in Phase P5.
+
 ### Ingest
 
 `gridcast` ingests half-hourly GB grid carbon intensity data, generation fuel mix, and previous-runs weather forecasts from official public APIs:
@@ -166,10 +199,12 @@ data/
   - `period_end_utc` (`datetime64[ns, UTC]`): Half-hour end timestamp in UTC (`to` exclusive).
   - `utc_date` (`object`, `datetime.date`): Calendar date of `period_start_utc` in UTC.
   - `local_date` (`object`, `datetime.date`): Calendar date of `period_start_utc` in `Europe/London`.
-  - `forecast` (`Int32`, nullable): Day-ahead intensity forecast in gCO2/kWh.
+  - `forecast` (`Int32`, nullable): Operator's published forecast for the period, vintage unverified, in gCO2/kWh.
   - `actual` (`Int32`, nullable): Realised half-hourly intensity in gCO2/kWh.
   - `index` (`string`, nullable): Intensity category descriptor (`very low`, `low`, `moderate`, `high`, `very high`).
   - `ingested_at` (`datetime64[ns, UTC]`): Timestamp of ingestion run.
+  - `first_seen_at` (`datetime64[ns, UTC]`, nullable): Timestamp when a realised actual was first observed for this period.
+  - `forecast_first_seen_at` (`datetime64[ns, UTC]`, nullable): Timestamp when a forecast was first observed for this period (stamped on first non-null forecast, never overwritten).
 
 - **Weather Schema Contract (`data/weather/date=YYYY-MM-DD.parquet`)**:
   - `period_start_utc` (`datetime64[ns, UTC]`): Hourly start timestamp in UTC.
@@ -243,9 +278,9 @@ Audit logs are stored in `data/audit/` and created lazily only when anomalies oc
 - `data/audit/source-gaps.csv`: Records settlement periods genuinely absent from auxiliary stores (`mix` or `weather`) where the upstream API returned empty responses (`upstream_empty`) after targeted boundary retries. Created lazily, automatically reconciled if data appears on subsequent re-ingestion, and strictly verified by `make data-check`.
 - `data/audit/conflicts.csv`: Records upstream retractions where an incoming payload presents a null value for a period where a non-null observation is already stored in curated partitions.
 
-Everything else fails on purpose:
-- `make train`, `make eval`, `make serve`, and `make docker` exit non-zero with explicit messages indicating the respective future phase in which they arrive.
-- Note: `make eval` maps to the `gridcast backtest` CLI subcommand (scheduled for P3).
+Phase milestones not yet arrived fail on purpose:
+- `make serve` and `make docker` exit non-zero with explicit messages indicating the future phase in which they arrive (P4 and P5).
+- `make train` and `make eval` are active automation targets for Phase P3.
 
 ## Layout
 

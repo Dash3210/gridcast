@@ -8,23 +8,24 @@ PYTHON ?= python3
 PY ?= .venv/bin/python
 endif
 
-.PHONY: help install test data-check clean ingest features train eval serve docker lint typecheck check
+.PHONY: help install test data-check clean ingest features train eval serve docker lint typecheck check metrics-fixture
 .DEFAULT_GOAL := help
 
 help:
 	@echo gridcast targets:
-	@echo   install    - Create virtual environment and install dependencies
-	@echo   test       - Run test suite
-	@echo   data-check - Assert integrity of committed curated dataset
-	@echo   clean      - Remove virtual environment, caches, and build artefacts
-	@echo   ingest     - Run ingest CLI
-	@echo   features   - Build and inspect the example feature frame
-	@echo   train      - Run model training CLI (arrives in P3)
-	@echo   eval       - Run model evaluation backtest (arrives in P3)
-	@echo   serve      - Run service API (arrives in P4)
-	@echo   docker     - Build Docker image (arrives in P5)
-	@echo   lint       - Run ruff linter
-	@echo   typecheck  - Run mypy type checker
+	@echo   install         - Create virtual environment and install dependencies
+	@echo   test            - Run test suite
+	@echo   data-check      - Assert integrity of committed curated dataset
+	@echo   clean           - Remove virtual environment, caches, and build artefacts
+	@echo   ingest          - Run ingest CLI
+	@echo   features        - Build and inspect the example feature frame
+	@echo   train           - Run model training CLI
+	@echo   eval            - Run model evaluation backtest and accuracy gate
+	@echo   metrics-fixture - Regenerate frozen split metrics fixture from eval run
+	@echo   serve           - Run service API (arrives in P4)
+	@echo   docker          - Build Docker image (arrives in P5)
+	@echo   lint            - Run ruff linter
+	@echo   typecheck       - Run mypy type checker
 
 install:
 	"$(PYTHON)" -c "import os, subprocess, sys; os.path.exists('.venv') or subprocess.run([sys.executable, '-m', 'venv', '.venv'], check=True)"
@@ -43,6 +44,8 @@ clean:
 ingest:
 	"$(PY)" -m gridcast ingest --days 2
 	"$(PY)" -m gridcast ingest --reconcile-recent
+	"$(PY)" -m gridcast ingest --weather --days 2
+	"$(PY)" -m gridcast ingest --mix --days 2
 
 features:
 	"$(PY)" -m gridcast.cli features
@@ -52,6 +55,10 @@ train:
 
 eval:
 	"$(PY)" -m gridcast.cli backtest
+
+metrics-fixture:
+	"$(PY)" -c "from tests.test_model_card_consistency import write_metrics_fixture; write_metrics_fixture()"
+
 
 serve:
 	"$(PY)" -m gridcast.cli serve

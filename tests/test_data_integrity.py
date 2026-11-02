@@ -27,6 +27,7 @@ EXPECTED_COLUMNS = [
     "index",
     "ingested_at",
     "first_seen_at",
+    "forecast_first_seen_at",
 ]
 
 
@@ -58,6 +59,7 @@ def _assert_schema(frame: pd.DataFrame, day: date) -> None:
     assert str(frame["period_end_utc"].dtype) == "datetime64[ns, UTC]"
     assert str(frame["ingested_at"].dtype) == "datetime64[ns, UTC]"
     assert str(frame["first_seen_at"].dtype) == "datetime64[ns, UTC]"
+    assert str(frame["forecast_first_seen_at"].dtype) == "datetime64[ns, UTC]"
     assert str(frame["forecast"].dtype) == "Int32"
     assert str(frame["actual"].dtype) == "Int32"
     assert str(frame["index"].dtype) in ("string", "string[python]")
@@ -66,6 +68,9 @@ def _assert_schema(frame: pd.DataFrame, day: date) -> None:
     )
     assert frame.loc[frame["first_seen_at"].notna(), "actual"].notna().all(), (
         f"Partition {day} has first_seen_at set for null actual"
+    )
+    assert frame.loc[frame["forecast"].isna(), "forecast_first_seen_at"].isna().all(), (
+        f"Partition {day} has non-null forecast_first_seen_at where forecast is null"
     )
     assert frame["period_start_utc"].is_unique, f"Partition {day} has duplicate period_start_utc"
     assert frame["local_date"].nunique() == 1, f"Partition {day} spans more than one local date"
@@ -565,6 +570,7 @@ def test_data_check_fails_on_unrecorded_mix_hole(tmp_path: Path) -> None:
             "index": "low",
             "ingested_at": start_utc,
             "first_seen_at": start_utc,
+            "forecast_first_seen_at": start_utc,
         }
         for p in periods
     ]
@@ -573,6 +579,7 @@ def test_data_check_fails_on_unrecorded_mix_hole(tmp_path: Path) -> None:
     df_c["period_end_utc"] = pd.to_datetime(df_c["period_end_utc"], utc=True)
     df_c["ingested_at"] = pd.to_datetime(df_c["ingested_at"], utc=True)
     df_c["first_seen_at"] = pd.to_datetime(df_c["first_seen_at"], utc=True)
+    df_c["forecast_first_seen_at"] = pd.to_datetime(df_c["forecast_first_seen_at"], utc=True)
     df_c["forecast"] = df_c["forecast"].astype("Int32")
     df_c["actual"] = df_c["actual"].astype("Int32")
     df_c["index"] = df_c["index"].astype("string")
@@ -653,6 +660,7 @@ def test_data_check_fails_on_gap_overlapping_store_row(tmp_path: Path) -> None:
             "index": "low",
             "ingested_at": start_utc,
             "first_seen_at": start_utc,
+            "forecast_first_seen_at": start_utc,
         }
         for p in periods
     ]
@@ -661,6 +669,7 @@ def test_data_check_fails_on_gap_overlapping_store_row(tmp_path: Path) -> None:
     df_c["period_end_utc"] = pd.to_datetime(df_c["period_end_utc"], utc=True)
     df_c["ingested_at"] = pd.to_datetime(df_c["ingested_at"], utc=True)
     df_c["first_seen_at"] = pd.to_datetime(df_c["first_seen_at"], utc=True)
+    df_c["forecast_first_seen_at"] = pd.to_datetime(df_c["forecast_first_seen_at"], utc=True)
     df_c["forecast"] = df_c["forecast"].astype("Int32")
     df_c["actual"] = df_c["actual"].astype("Int32")
     df_c["index"] = df_c["index"].astype("string")
