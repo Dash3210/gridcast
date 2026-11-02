@@ -20,6 +20,8 @@ from gridcast.features import (
     FEATURE_COLUMNS,
     MIX_FUELS,
     build_example_frame,
+    default_issue_schedule,
+    issue_time_for_date,
     load_feature_sources,
     max_source_timestamp_allowed,
 )
@@ -219,7 +221,9 @@ class TestFeatureContractAndInvariants:
         # and downstream slicing would then carry it into a model.
         allowed = {"issue_time", "horizon", "target_time", "y", *FEATURE_COLUMNS}
         unexpected = set(features.columns) - allowed
-        assert not unexpected, f"Undeclared columns emitted by the frame builder: {sorted(unexpected)}"
+        assert not unexpected, (
+            f"Undeclared columns emitted by the frame builder: {sorted(unexpected)}"
+        )
 
     def test_no_column_named_or_derived_from_target(
         self,
@@ -522,3 +526,47 @@ class TestFeatureContractAndInvariants:
             build_example_frame(pd.DataFrame({"actual": [100]}))
         with pytest.raises(ValueError, match="actual"):
             build_example_frame(pd.DataFrame({"period_start_utc": [pd.Timestamp.now()]}))
+
+
+class TestIssueAnchorEuropeLondon:
+    """Validate 00:00 Europe/London issue anchor invariants (Section 1)."""
+
+    def test_issue_instants_bst_and_gmt(self) -> None:
+        """In BST the instant is 23:00Z of the previous UTC date; in GMT it is 00:00Z."""
+        # BST day: 2025-06-01 (Europe/London is UTC+1)
+        bst_issue = issue_time_for_date("2025-06-01")
+        assert bst_issue == pd.Timestamp("2025-05-31 23:00:00+00:00")
+        assert bst_issue.strftime("%Y-%m-%d %H:%M:%SZ") == "2025-05-31 23:00:00Z"
+
+        # GMT day: 2025-01-01 (Europe/London is UTC+0)
+        gmt_issue = issue_time_for_date("2025-01-01")
+        assert gmt_issue == pd.Timestamp("2025-01-01 00:00:00+00:00")
+        assert gmt_issue.strftime("%Y-%m-%d %H:%M:%SZ") == "2025-01-01 00:00:00Z"
+
+    def test_consecutive_issue_instants_spacing(self) -> None:
+        """Consecutive issue instants across the schedule are 23, 24, or 25 hours apart."""
+        schedule = default_issue_schedule(date(2024, 11, 1), date(2026, 11, 1))
+        diffs = [schedule[i + 1] - schedule[i] for i in range(len(schedule) - 1)]
+        distinct_diff_hours = {int(d.total_seconds() / 3600) for d in diffs}
+        assert distinct_diff_hours == {23, 24, 25}
+
+    def test_default_frame_issue_times_anchored_to_london_midnight(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """The default frame issues must be anchored to 00:00 Europe/London for each local date."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        # Sample two dates: one GMT, one BST
+        gmt_issue = issue_time_for_date("2025-01-15")
+        bst_issue = issue_time_for_date("2025-07-15")
+        features = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=[gmt_issue, bst_issue],
+            horizons=[1],
+            require_aux=True,
+        )
+        assert features["issue_time"].iloc[0] == pd.Timestamp("2025-01-15 00:00:00+00:00")
+        assert features["issue_time"].iloc[1] == pd.Timestamp("2025-07-14 23:00:00+00:00")
+

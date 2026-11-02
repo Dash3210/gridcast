@@ -17,6 +17,7 @@ Core Properties:
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import date, datetime
 from pathlib import Path
 from typing import Final
 from zoneinfo import ZoneInfo
@@ -89,9 +90,34 @@ __all__: list[str] = [
     "FEATURE_COLUMNS",
     "MIX_FUELS",
     "build_example_frame",
+    "default_issue_schedule",
+    "issue_time_for_date",
     "load_feature_sources",
     "max_source_timestamp_allowed",
 ]
+
+
+def issue_time_for_date(d: date | str) -> pd.Timestamp:
+    """Return the issue instant (00:00 Europe/London) converted to UTC.
+
+    - In BST the instant is 23:00Z of the previous UTC date.
+    - In GMT it is 00:00Z.
+    """
+    if isinstance(d, str):
+        target_d = date.fromisoformat(d)
+    elif isinstance(d, (datetime, pd.Timestamp)):
+        target_d = d.date()
+    else:
+        target_d = d
+    local_midnight = datetime(target_d.year, target_d.month, target_d.day, 0, 0, tzinfo=LONDON_TZ)
+    return pd.Timestamp(local_midnight).tz_convert("UTC")
+
+
+def default_issue_schedule(start_date: date | str, end_date: date | str) -> pd.DatetimeIndex:
+    """Generate daily issue instants at 00:00 Europe/London across date range in UTC."""
+    s = date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
+    e = date.fromisoformat(end_date) if isinstance(end_date, str) else end_date
+    return pd.date_range(start=s, end=e, freq="D", tz=LONDON_TZ).tz_convert("UTC")
 
 
 def load_feature_sources(
@@ -284,13 +310,23 @@ def build_example_frame(
         index=intensity_ts,
     ).sort_index()
 
-    # 1. Resolve issue times
+    # 1. Resolve issue times: anchored to 00:00 Europe/London for each local date (ADR-012)
     if issue_times is None:
-        min_dt = intensity_ts.min().floor("D")
-        max_dt = intensity_ts.max().floor("D")
-        issue_dt_index = pd.date_range(start=min_dt, end=max_dt, freq="D", tz="UTC")
+        min_date = intensity_ts.min().tz_convert(LONDON_TZ).date()
+        max_date = intensity_ts.max().tz_convert(LONDON_TZ).date()
+        issue_dt_index = default_issue_schedule(min_date, max_date)
     else:
-        issue_dt_index = pd.DatetimeIndex(pd.to_datetime(list(issue_times), utc=True))
+        resolved_issues: list[pd.Timestamp] = []
+        for it in issue_times:
+            if isinstance(it, (str, date)) and not isinstance(it, (datetime, pd.Timestamp)):
+                resolved_issues.append(issue_time_for_date(it))
+            else:
+                ts = pd.Timestamp(it)
+                if ts.tzinfo is None:
+                    resolved_issues.append(ts.tz_localize(LONDON_TZ).tz_convert("UTC"))
+                else:
+                    resolved_issues.append(ts.tz_convert("UTC"))
+        issue_dt_index = pd.DatetimeIndex(resolved_issues)
 
     if len(issue_dt_index) == 0:
         raise ValueError("issue_times resolved to an empty schedule")

@@ -203,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         n_horizons = df["horizon"].nunique()
         print("\nFeature frame constructed successfully:")
         print(f"  Shape:             {df.shape[0]:,} rows x {df.shape[1]} columns")
-        print(f"  Distinct issues:   {n_issues:,} (daily at 00:00 UTC)")
+        print(f"  Distinct issues:   {n_issues:,} (daily at 00:00 Europe/London)")
         print(f"  Distinct horizons: {n_horizons} (range 1..96 half-hours ahead)")
         print(f"  Feature count (X): {len(FEATURE_COLUMNS)} columns")
         print(f"  Target column (y): 'y' ({df['y'].notna().sum():,} non-null)")

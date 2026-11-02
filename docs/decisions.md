@@ -221,3 +221,19 @@
 - Alternatives rejected:
   - Relying on target-based invariance tests alone (rejected: blind to operational leakage when horizon > 1).
   - Documenting horizon constraints solely in comments (rejected: permitted operational leakage through two review rounds).
+
+## ADR-012 — Issue anchor: 00:00 Europe/London for local-day alignment
+- Status: accepted
+- Date: 2026-11-02
+- Context:
+  The curated carbon intensity dataset and public scoreboard are partitioned by Europe/London local calendar day (`data/curated/date=<YYYY-MM-DD>.parquet`). Previously, issue times defaulted to 00:00 UTC. In British Summer Time (BST, UTC+1), 00:00 UTC corresponds to 01:00 local time. This left the first local hour of each summer day (00:00 to 01:00 local) uncovered by that day's own issue. Local midnight is the only anchor at which a day's issue and a day's partition begin at the same instant.
+- Decision:
+  Anchor daily forecast issue times `issue_time` to 00:00 Europe/London for each local day rather than 00:00 UTC.
+  1. In BST (UTC+1), the issue instant is 23:00Z of the previous UTC calendar date.
+  2. In GMT (UTC+0), the issue instant is 00:00Z of the same calendar date.
+  3. Consecutive issue instants are 23, 24, or 25 hours apart in absolute time across DST boundaries.
+  4. The forecast horizon remains an absolute half-hour offset from `issue_time` (`target_time = issue_time + horizon * 30min`), ensuring DST clock changes never alter the 96-horizon sequence.
+- Consequences:
+  Each day's issue begins at the exact instant of that local day's partition, fully covering all settlement periods in summer without unforecasted leading hours.
+- Alternatives rejected:
+  - 00:00 UTC anchor (rejected: sits at 01:00 local for half the year, leaving the first hour of every summer day uncovered by that day's forecast).
