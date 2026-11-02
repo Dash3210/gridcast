@@ -101,6 +101,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not require auxiliary stores (weather and mix) to be present.",
     )
 
+    forecast_parser = subparsers.add_parser(
+        "forecast",
+        help="Issue day-ahead half-hourly carbon intensity forecast curve.",
+    )
+    forecast_parser.add_argument(
+        "--date",
+        type=str,
+        default=None,
+        help="Local date for issue time (YYYY-MM-DD, 00:00 Europe/London).",
+    )
+    forecast_parser.add_argument(
+        "--issue-time",
+        type=str,
+        default=None,
+        help="Specific UTC or ISO issue timestamp.",
+    )
+    forecast_parser.add_argument(
+        "--curated-dir",
+        type=str,
+        default="data/curated",
+        help="Path to curated archive directory.",
+    )
+    forecast_parser.add_argument(
+        "--output",
+        type=str,
+        default="data/scoreboard/forecasts.parquet",
+        help="Path to forecasts parquet store.",
+    )
+
+    score_parser = subparsers.add_parser(
+        "score",
+        help="Score settled forecasts against actuals and update scoreboard.",
+    )
+    score_parser.add_argument(
+        "--curated-dir",
+        type=str,
+        default="data/curated",
+        help="Path to curated archive directory.",
+    )
+    score_parser.add_argument(
+        "--forecasts-path",
+        type=str,
+        default="data/scoreboard/forecasts.parquet",
+        help="Path to forecasts parquet store.",
+    )
+    score_parser.add_argument(
+        "--scores-path",
+        type=str,
+        default="data/scoreboard/scores.csv",
+        help="Path to scores CSV store.",
+    )
+    score_parser.add_argument(
+        "--scoreboard-md-path",
+        type=str,
+        default="docs/scoreboard.md",
+        help="Path to scoreboard markdown documentation.",
+    )
+
     subparsers.add_parser("train", help="Train carbon intensity forecast models.")
     subparsers.add_parser("backtest", help="Run backtest against NESO baseline.")
     subparsers.add_parser("serve", help="Run forecast API service.")
@@ -232,6 +290,30 @@ def main(argv: list[str] | None = None) -> int:
         print("  X = select_model_inputs(df)")
         print("  y = df['y']")
         return 0
+
+    if args.subcommand == "forecast":
+        from pathlib import Path
+
+        from gridcast.scoreboard import run_forecast_cli
+
+        return run_forecast_cli(
+            date_str=args.date,
+            issue_time_str=args.issue_time,
+            curated_dir=Path(args.curated_dir),
+            output_path=Path(args.output),
+        )
+
+    if args.subcommand == "score":
+        from pathlib import Path
+
+        from gridcast.scoreboard import run_score_cli
+
+        return run_score_cli(
+            curated_dir=Path(args.curated_dir),
+            forecasts_path=Path(args.forecasts_path),
+            scores_path=Path(args.scores_path),
+            scoreboard_md_path=Path(args.scoreboard_md_path),
+        )
 
     if args.subcommand == "train":
         todo("P3", "train")
