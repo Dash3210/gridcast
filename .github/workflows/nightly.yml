@@ -1,15 +1,21 @@
-# Note: P5 will extend this workflow into the full CI/CD pipeline (Docker build, eval gate, lint).
-# This minimal workflow runs the nightly ingest, baseline forecast issue, and scoreboard scoring.
-
 name: Nightly Forecast & Scoreboard
+
+# Minimal by design: ingest, issue the baseline, score what has settled, commit the record.
+# Phase P5 extends this into the full pipeline (Docker build, accuracy gate, lint). This is not CI.
 
 on:
   schedule:
-    - cron: "0 2 * * *"
+    # Deliberately off the hour: scheduled workflows queue behind load and drift, and GitHub
+    # runs cron in UTC. Nothing downstream depends on the run timestamp.
+    - cron: "17 2 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
 
 jobs:
   nightly:
@@ -17,6 +23,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
@@ -24,6 +32,8 @@ jobs:
           python-version: "3.10"
 
       - name: Install dependencies
+        # The Makefile resolves its interpreter to .venv/bin/python, so create that venv rather
+        # than installing into the runner's system Python.
         run: make install PYTHON=python
 
       - name: Put the virtual environment on PATH
@@ -32,16 +42,36 @@ jobs:
       - name: Ingest recent data
         run: make ingest
 
-      - name: Issue persistence baseline forecast
+      - name: Issue baseline forecast
+        # The issue date is derived inside gridcast from the archive and the Europe/London
+        # calendar, never from the run timestamp, so a delayed or re-run job cannot stamp a
+        # forecast for the wrong day.
         run: gridcast forecast
 
-      - name: Score settled forecasts and update scoreboard
+      - name: Score settled forecasts and update the scoreboard
         run: gridcast score
 
-      - name: Commit and push updates
+      - name: Commit and push the record
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/curated data/weather data/mix data/scoreboard docs/scoreboard.md
-          git diff --staged --quiet || git commit -m "chore(data): nightly ingest and scoreboard update for $(date -u +'%Y-%m-%d')"
-          git push
+          if git diff --staged --quiet; then
+            echo "Nothing to commit: no new data and no new scores."
+            exit 0
+          fi
+          # Label the commit with the latest issue date present in the data, not the wall clock.
+          ISSUE_DATE=$(python -c "import pandas as pd; print(pd.read_parquet('data/scoreboard/forecasts.parquet')['issue_time'].max().tz_convert('Europe/London').date().isoformat())")
+          git commit -m "chore(data): nightly ingest and scoreboard update for ${ISSUE_DATE}"
+          # Refuse to overwrite a main that moved while this job ran. A missed night is
+          # recoverable; a force-push over someone else's day of work is not.
+          git fetch origin main
+          if [ "$(git rev-parse origin/main)" != "$(git merge-base HEAD origin/main)" ]; then
+            echo "::error::origin/main moved during this run; refusing to push. Re-run the job."
+            exit 1
+          fi
+          git push origin HEAD:main
+
+      - name: Report the record so far
+        run: grep -i "consecutive days recorded" docs/scoreboard.md || echo "not yet reported"
