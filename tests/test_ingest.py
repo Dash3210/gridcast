@@ -2130,6 +2130,7 @@ def test_is_weather_day_complete(tmp_path: Path) -> None:
     df_nan = pd.DataFrame({
         "period_start_utc": hours_24,
         "local_date": target_date,
+        "temperature_2m_previous_day1": [16.0] * 24,
         "temperature_2m_previous_day2": temps_nan,
     })
     upsert_weather_day(df_nan, target_date, base_dir=tmp_path)
@@ -2139,6 +2140,7 @@ def test_is_weather_day_complete(tmp_path: Path) -> None:
     df_valid = pd.DataFrame({
         "period_start_utc": hours_24,
         "local_date": target_date,
+        "temperature_2m_previous_day1": [16.0] * 24,
         "temperature_2m_previous_day2": [15.0] * 24,
     })
     upsert_weather_day(df_valid, target_date, base_dir=tmp_path)
@@ -2180,26 +2182,30 @@ def test_weather_payload_to_frame() -> None:
     assert list(empty.columns) == [
         "period_start_utc",
         "local_date",
+        "temperature_2m_previous_day1",
         "temperature_2m_previous_day2",
     ]
 
     valid_payload = {
         "hourly": {
             "time": ["2025-05-01T00:00", "2025-05-01T01:00"],
+            "temperature_2m_previous_day1": [13.0, 13.5],
             "temperature_2m_previous_day2": [12.0, 12.5],
         }
     }
     df = weather_payload_to_frame(valid_payload)
     assert len(df) == 2
+    assert df["temperature_2m_previous_day1"].iloc[0] == 13.0
     assert df["temperature_2m_previous_day2"].iloc[0] == 12.0
 
     bad_payload = {
         "hourly": {
             "time": ["2025-05-01T00:00"],
-            "temperature_2m_previous_day2": [None],
+            "temperature_2m_previous_day1": [None],
+            "temperature_2m_previous_day2": [12.0],
         }
     }
-    with pytest.raises(ValueError, match="null temperature"):
+    with pytest.raises(ValueError, match="null temperature_2m_previous_day1"):
         weather_payload_to_frame(bad_payload)
 
 
@@ -2236,6 +2242,7 @@ def test_fetch_weather_and_mix_chunk_cache(tmp_path: Path) -> None:
     mock_client.get_weather_previous_runs.return_value = {
         "hourly": {
             "time": ["2025-05-01T00:00"],
+            "temperature_2m_previous_day1": [16.0],
             "temperature_2m_previous_day2": [15.0],
         }
     }
@@ -2281,6 +2288,7 @@ def test_ingest_weather_and_mix_day(tmp_path: Path) -> None:
     mock_client.get_weather_previous_runs.return_value = {
         "hourly": {
             "time": hours,
+            "temperature_2m_previous_day1": [15.0] * 24,
             "temperature_2m_previous_day2": [14.0] * 24,
         }
     }
@@ -2372,7 +2380,8 @@ def test_client_weather_and_mix_methods() -> None:
     client.get_weather_previous_runs(date(2025, 5, 1), date(2025, 5, 2))
     called_url = session_mock.get.call_args[0][0]
     assert "previous-runs-api.open-meteo.com" in called_url
-    assert "hourly=temperature_2m_previous_day2" in called_url
+    assert "temperature_2m_previous_day1" in called_url
+    assert "temperature_2m_previous_day2" in called_url
     assert "start_date=2025-05-01" in called_url
 
 

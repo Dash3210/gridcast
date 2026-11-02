@@ -100,7 +100,8 @@ Phase P2 provides a bounded, leakage-free feature construction pipeline in `grid
   - *Actual Lags*: `actual_lag_1h`, `actual_lag_2h`, `actual_lag_3h`, `actual_lag_24h`, `actual_lag_48h`, `actual_lag_168h` relative to `issue_time`.
   - *Actual Rolling Stats*: 3h, 24h, and 168h rolling mean and std, each window strictly ending at `issue_time - 30min`.
   - *Calendar*: `hour_of_day`, `day_of_week`, `month`, `is_weekend`, `is_uk_bank_holiday` (from static 2024-2027 register), plus sin/cos cyclical encodings of hour and day-of-year evaluated at `target_time`.
-  - *Weather*: Open-Meteo previous-runs day-2 forecast temperature at `target_time` (forecast issued at `target_time - 48h <= issue_time`; reanalysis strictly forbidden), mapped via containing hour `target_time.floor("h")` (ADR-008), plus 24h rolling mean and min.
+  - *Weather*: Open-Meteo previous-runs forecast temperature at `target_time`, using a per-horizon lead: short horizons (`h <= 48`, <= 24h) consume a 24-hour-old forecast (`temperature_2m_previous_day1`), while long horizons (`h > 48`, > 24h) consume a 48-hour-old forecast (`temperature_2m_previous_day2`), and that is by design. Both satisfy the horizon contract (`forecast_issue_time <= issue_time`), mapped via containing hour `target_time.floor("h")` (ADR-008), plus 24h rolling mean and min computed from the per-horizon series.
+  <!-- Model Card Reference: Weather features use a per-horizon lead: short horizons (h <= 48) consume a 24-hour-old forecast (temperature_2m_previous_day1), long horizons (h > 48) consume a 48-hour-old one (temperature_2m_previous_day2), and that is by design. -->
   - *Generation Mix*: Observed fuel shares for `wind`, `solar`, `gas`, `coal`, `nuclear`, and `biomass` lagged to `issue_time - 48h`.
 
 #### How to Build and Inspect Features
@@ -144,7 +145,7 @@ Model input `X` is a positive selection constructed via `select_model_inputs(df)
 `gridcast` ingests half-hourly GB grid carbon intensity data, generation fuel mix, and previous-runs weather forecasts from official public APIs:
 - **Carbon Intensity**: Official NESO Carbon Intensity API (`api.carbonintensity.org.uk/intensity`)
 - **Generation Mix**: Official NESO Generation Mix API (`api.carbonintensity.org.uk/generation`)
-- **Weather Forecasts**: Open-Meteo previous-runs API (`previous-runs-api.open-meteo.com/v1/forecast`), strictly `temperature_2m_previous_day2` (issued 48 hours prior; reanalysis is rejected)
+- **Weather Forecasts**: Open-Meteo previous-runs API (`previous-runs-api.open-meteo.com/v1/forecast`), strictly previous-runs forecasts `temperature_2m_previous_day1` (day 1, issued 24h prior) and `temperature_2m_previous_day2` (day 2, issued 48h prior; reanalysis is rejected)
 
 #### Data Layout
 
@@ -170,7 +171,8 @@ data/
 - **Weather Schema Contract (`data/weather/date=YYYY-MM-DD.parquet`)**:
   - `period_start_utc` (`datetime64[ns, UTC]`): Hourly start timestamp in UTC.
   - `local_date` (`object`, `datetime.date`): Calendar date in `Europe/London`.
-  - `temperature_2m_previous_day2` (`float64`): Numerical weather prediction 2-meter air temperature (°C) forecasted 48h prior.
+  - `temperature_2m_previous_day1` (`float64`): NWP 2-meter air temperature (°C) forecasted 24h prior (consumed by horizons h <= 48).
+  - `temperature_2m_previous_day2` (`float64`): NWP 2-meter air temperature (°C) forecasted 48h prior (consumed by horizons h > 48).
 
 - **Generation Mix Schema Contract (`data/mix/date=YYYY-MM-DD.parquet`)**:
   - `period_start_utc` (`datetime64[ns, UTC]`): Half-hourly start timestamp in UTC.

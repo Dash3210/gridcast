@@ -145,17 +145,48 @@ class TestTemporalLeakageInvariance:
                     perturbed_mix.loc[mask_mix, fuel].to_numpy(), shift=1
                 )
 
-        # Weather previous-runs day-2 forecast was issued at period_start_utc - 48h.
-        # A weather forecast was issued after issue_time if period_start_utc - 48h > issue_time.
+        # Weather previous-runs forecasts:
+        # Day 1 forecast was issued at period_start_utc - 24h.
+        # Day 2 forecast was issued at period_start_utc - 48h.
         w_ts = pd.to_datetime(perturbed_weather["period_start_utc"], utc=True)
-        mask_wth = (w_ts - pd.Timedelta(hours=48)) > issue_time
-        perturbed_weather.loc[mask_wth, "temperature_2m_previous_day2"] = (
-            perturbed_weather.loc[mask_wth, "temperature_2m_previous_day2"] + 40.0
-        )
+        mask_wth_d1 = (w_ts - pd.Timedelta(hours=24)) > issue_time
+        if "temperature_2m_previous_day1" in perturbed_weather.columns:
+            perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"] = (
+                perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"] + 40.0
+            )
+
+        mask_wth_d2 = (w_ts - pd.Timedelta(hours=48)) > issue_time
+        if "temperature_2m_previous_day2" in perturbed_weather.columns:
+            perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"] = (
+                perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"] + 40.0
+            )
+
         # Also perturb any contemporaneous weather columns if injected
         for col in perturbed_weather.columns:
-            if col not in ("period_start_utc", "local_date", "temperature_2m_previous_day2"):
+            if col not in (
+                "period_start_utc",
+                "local_date",
+                "temperature_2m_previous_day1",
+                "temperature_2m_previous_day2",
+            ):
                 perturbed_weather.loc[w_ts > issue_time, col] = 999.0
+
+        # Prove the injection landed (ADR-015): assert mutations actually took effect
+        assert mask_int.any(), "Precondition failed: intensity mutation mask must not be empty"
+        assert (
+            perturbed_intensity.loc[mask_int, "actual"] != intensity_df.loc[mask_int, "actual"]
+        ).any(), "Precondition failed: intensity actuals must be modified"
+        assert mask_mix.any(), "Precondition failed: mix mutation mask must not be empty"
+        if "temperature_2m_previous_day1" in perturbed_weather.columns and mask_wth_d1.any():
+            assert (
+                perturbed_weather.loc[mask_wth_d1, "temperature_2m_previous_day1"]
+                != weather_df.loc[mask_wth_d1, "temperature_2m_previous_day1"]
+            ).any(), "Precondition failed: weather day 1 values must be modified"
+        if "temperature_2m_previous_day2" in perturbed_weather.columns and mask_wth_d2.any():
+            assert (
+                perturbed_weather.loc[mask_wth_d2, "temperature_2m_previous_day2"]
+                != weather_df.loc[mask_wth_d2, "temperature_2m_previous_day2"]
+            ).any(), "Precondition failed: weather day 2 values must be modified"
 
         # 3. Rebuild feature row for (issue_time, horizon)
         rebuilt_frame = build_example_frame(
@@ -357,7 +388,7 @@ class TestFeatureContractAndInvariants:
         """Weather feature matches stored previous-runs and differs from reanalysis."""
         intensity_df, weather_df, mix_df = curated_sample_data
         sample_issue = pd.Timestamp("2025-01-20 00:00:00+00:00")
-        sample_horizons = [1, 16, 48]
+        sample_horizons = [1, 16, 48, 72]
         features = build_example_frame(
             intensity_df,
             weather_df,
@@ -368,7 +399,11 @@ class TestFeatureContractAndInvariants:
         )
 
         w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
-        w_series = pd.Series(
+        w_s_d1 = pd.Series(
+            weather_df["temperature_2m_previous_day1"].to_numpy(dtype=float),
+            index=w_ts,
+        )
+        w_s_d2 = pd.Series(
             weather_df["temperature_2m_previous_day2"].to_numpy(dtype=float),
             index=w_ts,
         )
@@ -378,7 +413,8 @@ class TestFeatureContractAndInvariants:
             containing_hour = target_time.floor("h")
             row = features[features["horizon"] == h].iloc[0]
             feat_val = row["temperature"]
-            stored_val = w_series.loc[containing_hour]
+            expected_series = w_s_d1 if h <= 48 else w_s_d2
+            stored_val = expected_series.loc[containing_hour]
 
             assert feat_val == pytest.approx(stored_val, rel=1e-5)
             # Reanalysis divergence test
@@ -823,6 +859,70 @@ class TestLeadingDateTrimming:
         # 3. Target y may still have nulls at the tail
         tail_nulls = frame["y"].isna().sum()
         assert tail_nulls > 0, "Expected unsettled targets at the tail of the dataset to be null"
+
+
+class TestPerHorizonWeatherLead:
+    """Validate per-horizon weather lead: previous_day1 for h <= 48, previous_day2 for h > 48."""
+
+    def test_weather_lead_selection_per_horizon(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        intensity_df, weather_df, mix_df = curated_sample_data
+        sample_issue = pd.Timestamp("2025-01-20 00:00:00+00:00")
+        sample_horizons = [24, 72]
+        features = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=[sample_issue],
+            horizons=sample_horizons,
+            require_aux=True,
+        )
+
+        w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
+        s_d1 = pd.Series(
+            weather_df["temperature_2m_previous_day1"].to_numpy(dtype=float),
+            index=w_ts,
+        )
+        s_d2 = pd.Series(
+            weather_df["temperature_2m_previous_day2"].to_numpy(dtype=float),
+            index=w_ts,
+        )
+
+        # At h = 24 (<= 48): equals previous_day1 and differs from previous_day2
+        row_24 = features[features["horizon"] == 24].iloc[0]
+        t_24 = sample_issue + pd.Timedelta(minutes=30 * 24)
+        ch_24 = t_24.floor("h")
+        assert s_d1.loc[ch_24] != s_d2.loc[ch_24], (
+            "Precondition failed: day1 and day2 must differ at h=24"
+        )
+        assert row_24["temperature"] == pytest.approx(s_d1.loc[ch_24], rel=1e-5)
+        assert row_24["temperature"] != pytest.approx(s_d2.loc[ch_24], rel=1e-5)
+
+        # At h = 72 (> 48): equals previous_day2
+        row_72 = features[features["horizon"] == 72].iloc[0]
+        t_72 = sample_issue + pd.Timedelta(minutes=30 * 72)
+        ch_72 = t_72.floor("h")
+        assert row_72["temperature"] == pytest.approx(s_d2.loc[ch_72], rel=1e-5)
+
+    def test_deliberate_build_with_day1_at_h72_raises_contract_violation(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        intensity_df, weather_df, mix_df = curated_sample_data
+        sample_issue = pd.Timestamp("2025-01-20 00:00:00+00:00")
+        with pytest.raises(ValueError, match="Horizon contract violation"):
+            build_example_frame(
+                intensity_df,
+                weather_df,
+                mix_df,
+                issue_times=[sample_issue],
+                horizons=[72],
+                require_aux=True,
+                weather_series_by_horizon={72: "temperature_2m_previous_day1"},
+            )
+
 
 
 

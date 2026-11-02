@@ -8,8 +8,10 @@ Core Properties:
   stamped after issue_time.
 - All lags and rolling statistics are keyed and resolved by timestamp lookup,
   never by row position, preserving temporal correctness across DST transitions.
-- Weather is Open-Meteo previous-runs day-2 forecast at target_time (issued 48 hours
-  prior at target_time - 48h <= issue_time), mapped via containing hour target_time.floor("h").
+- Weather lead is per-horizon: short horizons (h <= 48) consume a 24-hour-old forecast
+  (temperature_2m_previous_day1), long horizons (h > 48) consume a 48-hour-old forecast
+  (temperature_2m_previous_day2). Both satisfy the horizon contract (issued at or before
+  issue_time), and that is by design.
 - Generation mix fuel shares are lagged to issue_time - 48h.
 - Target column 'y' is the realized actual at target_time (nullable for unsettled targets).
 """
@@ -269,14 +271,15 @@ def load_feature_sources(
 
     w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
     post_cutoff = w_ts >= pd.Timestamp("2024-11-01 00:00:00+00:00")
-    if "temperature_2m_previous_day2" in weather_df.columns:
-        null_mask = post_cutoff & weather_df["temperature_2m_previous_day2"].isna()
-        if null_mask.any():
-            bad_date = weather_df.loc[null_mask, "period_start_utc"].iloc[0]
-            raise ValueError(
-                f"Previous-runs weather has null value at or after 2024-11-01 (date: {bad_date}). "
-                "Silent reanalysis fallback is strictly prohibited."
-            )
+    for col in ("temperature_2m_previous_day1", "temperature_2m_previous_day2"):
+        if col in weather_df.columns:
+            null_mask = post_cutoff & weather_df[col].isna()
+            if null_mask.any():
+                bad_date = weather_df.loc[null_mask, "period_start_utc"].iloc[0]
+                raise ValueError(
+                    f"Previous-runs weather has null {col} at or after 2024-11-01 "
+                    f"(date: {bad_date}). Silent reanalysis fallback is strictly prohibited."
+                )
 
     # Report source gaps if recorded
     a_path = (
@@ -349,7 +352,8 @@ def max_source_timestamp_allowed(
         return issue_ts - pd.Timedelta(hours=48)
 
     if feature_name in ("temperature", "temperature_24h_mean", "temperature_24h_min"):
-        return target_ts - pd.Timedelta(hours=48)
+        lead_h = 24 if (target_ts - issue_ts) <= pd.Timedelta(hours=24) else 48
+        return target_ts - pd.Timedelta(hours=lead_h)
 
     if feature_name == "horizon" or feature_name in (
         "hour_of_day",
@@ -375,6 +379,7 @@ def build_example_frame(
     horizons: Sequence[int] | range = DEFAULT_HORIZONS,
     require_aux: bool = True,
     trim_leading: bool | None = None,
+    weather_series_by_horizon: dict[int, str] | None = None,
 ) -> pd.DataFrame:
     """Build the example frame keyed by (issue_time, horizon) without leakage.
 
@@ -448,11 +453,31 @@ def build_example_frame(
     target_times_rep = issue_times_rep + pd.to_timedelta(horizons_rep * 30, unit="m")
 
     # 4. Enforce Horizon Contract in code (ADR-011)
-    # The day-2 weather forecast for target_time was issued at target_time - 48h.
-    # If horizon > 96 (48 hours), target_time - 48h > issue_time, which violates the contract.
-    w_forecast_issue_ts = target_times_rep - pd.Timedelta(hours=48)
-    if (w_forecast_issue_ts > issue_times_rep).any():
-        bad_idx = (w_forecast_issue_ts > issue_times_rep).argmax()
+    # The weather forecast series used depends on the horizon:
+    # h <= 48: Open-Meteo previous-runs day-1 forecast (temperature_2m_previous_day1),
+    #          issued at target_time - 24h.
+    # h > 48:  Open-Meteo previous-runs day-2 forecast (temperature_2m_previous_day2),
+    #          issued at target_time - 48h.
+    # Short horizons consume a 24-hour-old forecast, long horizons a 48-hour-old one,
+    # and that is by design.
+    lead_hours_by_h: dict[int, int] = {}
+    for h in np.unique(horizons_arr):
+        s_name = (weather_series_by_horizon or {}).get(
+            int(h),
+            "temperature_2m_previous_day1" if h <= 48 else "temperature_2m_previous_day2",
+        )
+        if s_name == "temperature_2m_previous_day1":
+            lead_hours_by_h[int(h)] = 24
+        elif s_name == "temperature_2m_previous_day2":
+            lead_hours_by_h[int(h)] = 48
+        else:
+            raise ValueError(f"Unknown weather series name: {s_name}")
+
+    lead_hours_rep = pd.to_timedelta([lead_hours_by_h[int(h)] for h in horizons_rep], unit="h")
+    w_forecast_issue_ts = target_times_rep - lead_hours_rep
+    bad_mask = w_forecast_issue_ts > issue_times_rep
+    if bad_mask.any():
+        bad_idx = int(bad_mask.argmax())
         bad_issue = issue_times_rep[bad_idx]
         bad_target = target_times_rep[bad_idx]
         bad_h = horizons_rep[bad_idx]
@@ -527,7 +552,9 @@ def build_example_frame(
     result["sin_day_of_year"] = np.sin(2.0 * np.pi * doy_continuous / 365.25)
     result["cos_day_of_year"] = np.cos(2.0 * np.pi * doy_continuous / 365.25)
 
-    # 9. Weather features (Open-Meteo previous-runs day-2 forecast at target_time)
+    # 9. Weather features (Open-Meteo previous-runs per-horizon forecast at target_time)
+    # Short horizons consume a 24-hour-old forecast, long horizons a 48-hour-old one,
+    # and that is by design.
     if weather_df is not None:
         reanalysis_cols = [
             c for c in weather_df.columns if "reanalysis" in c.lower() or "archive" in c.lower()
@@ -535,30 +562,42 @@ def build_example_frame(
         if reanalysis_cols:
             raise ValueError(
                 f"Weather from archive-api reanalysis is forbidden (found {reanalysis_cols}). "
-                "Must use Open-Meteo previous-runs day 2 forecast (temperature_2m_previous_day2)."
+                "Must use Open-Meteo previous-runs forecast "
+                "(temperature_2m_previous_day1 / previous_day2)."
             )
 
-        if "temperature_2m_previous_day2" in weather_df.columns:
-            w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
-            w_series = pd.Series(
-                weather_df["temperature_2m_previous_day2"].to_numpy(dtype=float),
-                index=w_ts,
-            ).sort_index()
+        w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
+        weather_stats: dict[str, tuple[pd.Series, pd.Series, pd.Series]] = {}
+        for col_name in ["temperature_2m_previous_day1", "temperature_2m_previous_day2"]:
+            if col_name in weather_df.columns:
+                s = pd.Series(
+                    weather_df[col_name].to_numpy(dtype=float),
+                    index=w_ts,
+                ).sort_index()
+                s_roll = s.rolling("24h", min_periods=1)
+                weather_stats[col_name] = (s, s_roll.mean(), s_roll.min())
 
-            # ADR-008: Map half-hour target_time to discrete containing hour target_time.floor("h")
-            containing_hours = target_times_rep.floor("h")
-            result["temperature"] = containing_hours.map(w_series).to_numpy(dtype=float)
+        containing_hours = target_times_rep.floor("h")
+        temps = np.full(len(result), np.nan, dtype=float)
+        means = np.full(len(result), np.nan, dtype=float)
+        mins = np.full(len(result), np.nan, dtype=float)
 
-            w_roll_24h = w_series.rolling("24h", min_periods=1)
-            w_24h_mean = w_roll_24h.mean()
-            w_24h_min = w_roll_24h.min()
+        for h in np.unique(horizons_arr):
+            h_mask = horizons_rep == h
+            series_name = (weather_series_by_horizon or {}).get(
+                int(h),
+                "temperature_2m_previous_day1" if h <= 48 else "temperature_2m_previous_day2",
+            )
+            if series_name in weather_stats:
+                s, s_mean, s_min = weather_stats[series_name]
+                ch_for_h = containing_hours[h_mask]
+                temps[h_mask] = ch_for_h.map(s).to_numpy(dtype=float)
+                means[h_mask] = ch_for_h.map(s_mean).to_numpy(dtype=float)
+                mins[h_mask] = ch_for_h.map(s_min).to_numpy(dtype=float)
 
-            result["temperature_24h_mean"] = containing_hours.map(w_24h_mean).to_numpy(dtype=float)
-            result["temperature_24h_min"] = containing_hours.map(w_24h_min).to_numpy(dtype=float)
-        else:
-            result["temperature"] = np.nan
-            result["temperature_24h_mean"] = np.nan
-            result["temperature_24h_min"] = np.nan
+        result["temperature"] = temps
+        result["temperature_24h_mean"] = means
+        result["temperature_24h_min"] = mins
     else:
         result["temperature"] = np.nan
         result["temperature_24h_mean"] = np.nan

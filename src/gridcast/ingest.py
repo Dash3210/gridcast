@@ -335,12 +335,13 @@ class Client:
         latitude: float = 51.5074,
         longitude: float = -0.1278,
     ) -> dict:
-        """Fetch hourly temperature_2m_previous_day2 from Open-Meteo previous-runs API."""
+        """Fetch hourly previous_day1 and previous_day2 from Open-Meteo previous-runs API."""
         s_str = start_date.isoformat() if isinstance(start_date, date) else str(start_date)
         e_str = end_date.isoformat() if isinstance(end_date, date) else str(end_date)
         url = (
             f"{OPEN_METEO_BASE_URL}?"
-            f"latitude={latitude}&longitude={longitude}&hourly=temperature_2m_previous_day2&"
+            f"latitude={latitude}&longitude={longitude}&"
+            f"hourly=temperature_2m_previous_day1,temperature_2m_previous_day2&"
             f"start_date={s_str}&end_date={e_str}&timezone=UTC"
         )
         return self._fetch_url(url)
@@ -1603,7 +1604,11 @@ def is_weather_day_complete(
 
         if rows + gaps_count != expected_weather_row_count(d):
             return False
+        if "temperature_2m_previous_day1" not in df.columns:
+            return False
         if "temperature_2m_previous_day2" not in df.columns:
+            return False
+        if df["temperature_2m_previous_day1"].isna().any():
             return False
         return not df["temperature_2m_previous_day2"].isna().any()
     except Exception:
@@ -1663,20 +1668,32 @@ def weather_payload_to_frame(payload: dict) -> pd.DataFrame:
     """Normalise Open-Meteo previous-runs weather payload to DataFrame."""
     h = payload.get("hourly", {})
     times = h.get("time", [])
-    temps = h.get("temperature_2m_previous_day2", [])
+    temps_d1 = h.get("temperature_2m_previous_day1", [])
+    temps_d2 = h.get("temperature_2m_previous_day2", [])
     if not times:
         empty_df = pd.DataFrame(
-            columns=["period_start_utc", "local_date", "temperature_2m_previous_day2"]
+            columns=[
+                "period_start_utc",
+                "local_date",
+                "temperature_2m_previous_day1",
+                "temperature_2m_previous_day2",
+            ]
         )
         empty_df["period_start_utc"] = pd.to_datetime([], utc=True)
         empty_df["local_date"] = pd.Series([], dtype="object")
+        empty_df["temperature_2m_previous_day1"] = pd.Series([], dtype="float64")
         empty_df["temperature_2m_previous_day2"] = pd.Series([], dtype="float64")
         return empty_df
 
-    df = pd.DataFrame({
+    data_dict: dict[str, object] = {
         "period_start_utc": pd.to_datetime(times, utc=True),
-        "temperature_2m_previous_day2": pd.Series(temps, dtype="float64"),
-    })
+    }
+    if temps_d1:
+        data_dict["temperature_2m_previous_day1"] = pd.Series(temps_d1, dtype="float64")
+    if temps_d2:
+        data_dict["temperature_2m_previous_day2"] = pd.Series(temps_d2, dtype="float64")
+
+    df = pd.DataFrame(data_dict)
     df["local_date"] = df["period_start_utc"].dt.tz_convert(LONDON_TZ).dt.date
     df = (
         df.sort_values("period_start_utc")
@@ -1686,15 +1703,27 @@ def weather_payload_to_frame(payload: dict) -> pd.DataFrame:
 
     # Check for null previous-runs temperature at or after 2024-11-01
     post_cutoff = df["period_start_utc"] >= pd.Timestamp("2024-11-01 00:00:00+00:00")
-    null_temps = post_cutoff & df["temperature_2m_previous_day2"].isna()
-    if null_temps.any():
-        bad_date = df.loc[null_temps, "period_start_utc"].iloc[0]
-        raise ValueError(
-            f"Open-Meteo previous-runs returned null temperature for period {bad_date}. "
-            "Reanalysis fallback is strictly prohibited."
-        )
+    for col in ("temperature_2m_previous_day1", "temperature_2m_previous_day2"):
+        if col in df.columns:
+            null_temps = post_cutoff & df[col].isna()
+            if null_temps.any():
+                bad_date = df.loc[null_temps, "period_start_utc"].iloc[0]
+                raise ValueError(
+                    f"Open-Meteo previous-runs returned null {col} for period {bad_date}. "
+                    "Reanalysis fallback is strictly prohibited."
+                )
 
-    return df[["period_start_utc", "local_date", "temperature_2m_previous_day2"]]
+    out_cols = [
+        c
+        for c in [
+            "period_start_utc",
+            "local_date",
+            "temperature_2m_previous_day1",
+            "temperature_2m_previous_day2",
+        ]
+        if c in df.columns
+    ]
+    return df[out_cols]
 
 
 def mix_payload_to_frame(payload: dict) -> pd.DataFrame:
@@ -1744,7 +1773,13 @@ def fetch_weather_chunk(
     if c_path.exists() and not force:
         try:
             with gzip.open(c_path, "rt", encoding="utf-8") as f:
-                return json.load(f)
+                cached_data = json.load(f)
+                h_data = cached_data.get("hourly", {})
+                if (
+                    "temperature_2m_previous_day1" in h_data
+                    and "temperature_2m_previous_day2" in h_data
+                ):
+                    return cached_data
         except Exception:
             logger.warning("Corrupted weather cache %s; refetching", c_path)
 
@@ -1838,6 +1873,14 @@ def upsert_weather_day(
 
     combined = pd.concat([existing, df_to_write], ignore_index=True)
     combined = combined.drop_duplicates(subset=["period_start_utc"], keep="last")
+    target_cols = [
+        "period_start_utc",
+        "local_date",
+        "temperature_2m_previous_day1",
+        "temperature_2m_previous_day2",
+    ]
+    present_cols = [c for c in target_cols if c in combined.columns]
+    combined = combined[present_cols]
     combined = combined.sort_values("period_start_utc").reset_index(drop=True)
 
     if len(existing) == len(combined) and existing.equals(combined):
