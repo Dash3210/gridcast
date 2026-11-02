@@ -214,6 +214,13 @@ class TestFeatureContractAndInvariants:
         for expected_col in FEATURE_COLUMNS:
             assert expected_col in features.columns, f"Missing feature column: {expected_col}"
 
+        # The frame must carry exactly the declared contract, no more. An undeclared
+        # column can smuggle a value past a check that only inspects FEATURE_COLUMNS,
+        # and downstream slicing would then carry it into a model.
+        allowed = {"issue_time", "horizon", "target_time", "y", *FEATURE_COLUMNS}
+        unexpected = set(features.columns) - allowed
+        assert not unexpected, f"Undeclared columns emitted by the frame builder: {sorted(unexpected)}"
+
     def test_no_column_named_or_derived_from_target(
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
