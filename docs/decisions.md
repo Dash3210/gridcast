@@ -322,4 +322,23 @@
 - Alternatives rejected:
   - Validating contract functions against their own declared return values (rejected: permits false green test suites when declarations lie about their bounds).
 
+## ADR-018 — Serving risk: train/serve lead distribution mismatch on weather features
+- Status: open
+- Date: 2026-11-02
+- Context:
+  This is the fourth time the same bug class has appeared in this phase: target-anchored, then issue-anchored, then availability-anchored, now servability.
+  At inference the targets are in the future, and the previous-runs series has no future values. The weather available for `T+h` at serve time is the current model run with lead `h`, not the day-1/day-2 series the frame trains on with lead `>= 24h`.
+  Training and serving therefore use different lead distributions, so "the model has weather features" is true in training and not true as stated for the service.
+- Decision:
+  Record this serving risk with status `open`. Decided at Phase P3 (model training and backtest), not now.
+  Nothing in the repository may claim that weather ships in the service without this caveat.
+- Options and Trade-offs (as far as known today):
+  a. **Restrict the product to horizons `>= 24h`**: where the trained lead is closest to the served lead.
+     Trade-off: reduces lead distribution divergence between training and serving, but forfeits the short-horizon forecast product (`h < 48`) which is operationally critical for intraday balancing.
+  b. **Keep all horizons, document the mismatch, and bound the damage by scoring day-1 features against day-2 features on the same frame**:
+     Trade-off: preserves the full 1–96 horizon product, but accepts train/serve distribution mismatch and requires continuous empirical quantification of lead sensitivity.
+  c. **Drop weather entirely, removing the class of problem at some accuracy cost**:
+     Trade-off: eliminates the entire defect class and upstream weather dependencies cleanly, at the expense of potentially sacrificing model accuracy during weather-driven demand and renewable supply extremes.
+
+
 

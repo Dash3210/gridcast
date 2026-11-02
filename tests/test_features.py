@@ -39,23 +39,80 @@ UTC_TZ = timezone.utc
 CURATED_PATH = Path("data/curated")
 
 
+_CANONICAL_SOURCES = load_feature_sources()
+_CANONICAL_FRAME = build_example_frame(
+    intensity_df=_CANONICAL_SOURCES[0],
+    weather_df=_CANONICAL_SOURCES[1],
+    mix_df=_CANONICAL_SOURCES[2],
+    require_aux=True,
+)
+
+
 @pytest.fixture(scope="module")
 def curated_sample_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load curated carbon intensity and real auxiliary test sources."""
-    return load_feature_sources()
+    return _CANONICAL_SOURCES
 
 
-# Realistic multi-issue frame test windows (at least 7 consecutive issue dates x 96 horizons)
-REALISTIC_INVARIANCE_WINDOWS: list[tuple[str, str, str]] = [
-    # Standard summer week
-    ("2025-06-01", "2025-06-07", "summer_week"),
-    # DST spring-forward week (contains 2025-03-30)
-    ("2025-03-27", "2025-04-02", "dst_spring_forward_week"),
-    # DST autumn-back week (contains 2025-10-26)
-    ("2025-10-23", "2025-10-29", "dst_autumn_back_week"),
-    # Source-gap adjacent week
-    ("2025-08-08", "2025-08-14", "gap_adjacent_week"),
+# Explicit special dates: all four DST transition days and gap-adjacent dates
+DST_TRANSITION_DATES: list[str] = [
+    "2025-03-30",
+    "2025-10-26",
+    "2026-03-29",
+    "2026-10-25",
 ]
+
+GAP_ADJACENT_DATES: list[str] = [
+    "2025-01-12",
+    "2025-01-13",
+    "2025-08-10",
+    "2025-08-11",
+    "2025-08-12",
+    "2025-08-13",
+]
+
+EXPLICIT_SPECIAL_DATES: list[str] = DST_TRANSITION_DATES + GAP_ADJACENT_DATES
+
+
+def derive_required_grid_dates(frame: pd.DataFrame) -> set[str]:
+    """Derive required test grid dates as a computed property from the frame itself.
+
+    Rule: first seven and last seven issue dates present in the frame, plus the four
+    DST transition days, plus the gap-adjacent dates already covered.
+    """
+    issue_dates = sorted({ts.tz_convert(LONDON_TZ).date() for ts in frame["issue_time"]})
+    if len(issue_dates) < 14:
+        raise ValueError(f"Frame has fewer than 14 issue dates ({len(issue_dates)})")
+    first_seven = {d.isoformat() for d in issue_dates[:7]}
+    last_seven = {d.isoformat() for d in issue_dates[-7:]}
+    return first_seven | last_seven | set(EXPLICIT_SPECIAL_DATES)
+
+
+def derive_invariance_windows(frame: pd.DataFrame) -> list[tuple[str, str, str]]:
+    """Derive realistic multi-issue frame test windows including first 7 and last 7 issue dates."""
+    issue_dates = sorted({ts.tz_convert(LONDON_TZ).date() for ts in frame["issue_time"]})
+    first_7_start = issue_dates[0].isoformat()
+    first_7_end = issue_dates[6].isoformat()
+    last_7_start = issue_dates[-7].isoformat()
+    last_7_end = issue_dates[-1].isoformat()
+    return [
+        (first_7_start, first_7_end, "first_seven_issue_dates_week"),
+        # Standard summer week
+        ("2025-06-01", "2025-06-07", "summer_week"),
+        # DST spring-forward week (contains 2025-03-30)
+        ("2025-03-27", "2025-04-02", "dst_spring_forward_week"),
+        # DST autumn-back week (contains 2025-10-26)
+        ("2025-10-23", "2025-10-29", "dst_autumn_back_week"),
+        # Source-gap adjacent week
+        ("2025-08-08", "2025-08-14", "gap_adjacent_week"),
+        (last_7_start, last_7_end, "last_seven_issue_dates_week"),
+    ]
+
+
+DENSE_GRID_TEST_DATES: list[str] = sorted(derive_required_grid_dates(_CANONICAL_FRAME))
+REALISTIC_INVARIANCE_WINDOWS: list[tuple[str, str, str]] = (
+    derive_invariance_windows(_CANONICAL_FRAME)
+)
 
 
 class TestTemporalLeakageInvariance:
@@ -111,9 +168,11 @@ class TestTemporalLeakageInvariance:
             mask_mix = pd.to_datetime(perturbed_mix["period_start_utc"], utc=True) > issue_time
             for fuel in MIX_FUELS:
                 if fuel in perturbed_mix.columns:
-                    perturbed_mix.loc[mask_mix, fuel] = np.roll(
-                        perturbed_mix.loc[mask_mix, fuel].to_numpy(), shift=1
-                    )
+                    arr = perturbed_mix.loc[mask_mix, fuel].to_numpy()
+                    rolled = np.roll(arr, shift=1)
+                    if np.array_equal(arr, rolled):
+                        rolled = arr + 10.0
+                    perturbed_mix.loc[mask_mix, fuel] = rolled
 
             # Weather previous-runs forecasts:
             # Day 1 forecast was issued at period_start_utc - 24h.
@@ -1193,11 +1252,17 @@ def naive_feature_oracle(
             if horizon <= 48
             else "temperature_2m_previous_day2"
         )
+        target_rows = weather_df.loc[weather_df["period_start_utc"] == target_hour, col]
+        # Boundary semantics: when the hour containing the target is absent from the
+        # weather store or null, the weather feature and both rolling statistics are null.
+        # A 24-hour mean computed over a shorter window is a different statistic and must
+        # not be substituted.
+        if target_rows.empty or pd.isna(target_rows.iloc[0]):
+            return float("nan"), target_hour
+
         if feature_name == "temperature":
-            rows = weather_df.loc[weather_df["period_start_utc"] == target_hour, col]
-            if rows.empty or pd.isna(rows.iloc[0]):
-                return float("nan"), target_hour
-            return float(rows.iloc[0]), target_hour
+            return float(target_rows.iloc[0]), target_hour
+
         t_start = target_hour - pd.Timedelta(hours=24)
         window_rows = weather_df.loc[
             (weather_df["period_start_utc"] > t_start)
@@ -1221,22 +1286,6 @@ def naive_feature_oracle(
     raise ValueError(f"Unknown feature: {feature_name}")
 
 
-DENSE_GRID_TEST_DATES: list[str] = [
-    # All four DST transition days
-    "2025-03-30",
-    "2025-10-26",
-    "2026-03-29",
-    "2026-10-25",
-    # Each date adjacent to a recorded source gap
-    "2025-01-12",
-    "2025-01-13",
-    "2025-08-10",
-    "2025-08-11",
-    "2025-08-12",
-    "2025-08-13",
-]
-
-
 @pytest.fixture(scope="module")
 def dense_grid_frame(
     curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
@@ -1256,6 +1305,152 @@ def dense_grid_frame(
 
 class TestDenseValueGridOracle:
     """Validate builder values against naive raw store lookups across dense grid."""
+
+    def test_dense_grid_coverage_property(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """The grid's date set must be a superset of the computed coverage property.
+
+        Rule: first seven + last seven issue dates in the frame, plus the four DST
+        transition days, plus the gap-adjacent dates already covered. Deleting any
+        date from the grid's date set must fail this assertion.
+        """
+        intensity_df, weather_df, mix_df = curated_sample_data
+        canonical_frame = build_example_frame(
+            intensity_df=intensity_df,
+            weather_df=weather_df,
+            mix_df=mix_df,
+            require_aux=True,
+        )
+        required_dates = derive_required_grid_dates(canonical_frame)
+        grid_dates_set = set(DENSE_GRID_TEST_DATES)
+
+        # 1. Assert the grid's date set is a superset of all required dates
+        missing_dates = required_dates - grid_dates_set
+        assert not missing_dates, (
+            f"Dense grid fails coverage rule: missing required dates: {sorted(missing_dates)}"
+        )
+        assert grid_dates_set.issuperset(required_dates)
+
+        # 2. Deleting any date from list fails suite (demonstrated with tail date)
+        issue_dates = sorted(
+            {ts.tz_convert(LONDON_TZ).date() for ts in canonical_frame["issue_time"]}
+        )
+        tail_date = issue_dates[-1].isoformat()
+        mutated_grid_set = grid_dates_set - {tail_date}
+        assert not mutated_grid_set.issuperset(required_dates), (
+            f"Deleting tail date '{tail_date}' must fail the superset coverage check"
+        )
+
+    def test_weather_store_boundary_target_hour_absent_yields_null(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """For issue 2026-10-31 at h=96, target_time is 2026-11-02T00:00Z (past store end).
+
+        Assert builder and oracle both yield null and agree for temperature and both
+        rolling statistics (temperature_24h_mean, temperature_24h_min).
+        """
+        intensity_df, weather_df, mix_df = curated_sample_data
+        issue_time = issue_time_for_date("2026-10-31")
+        h = 96
+
+        frame = build_example_frame(
+            intensity_df=intensity_df,
+            weather_df=weather_df,
+            mix_df=mix_df,
+            issue_times=[issue_time],
+            horizons=range(1, 97),
+            require_aux=True,
+        )
+        row_96 = frame[frame["horizon"] == h].iloc[0]
+
+        for col in ("temperature", "temperature_24h_mean", "temperature_24h_min"):
+            builder_val = row_96[col]
+            oracle_val, source_ts = naive_feature_oracle(
+                intensity_df,
+                weather_df,
+                mix_df,
+                issue_time,
+                h,
+                col,
+            )
+            assert pd.isna(builder_val), (
+                f"Builder must yield null for '{col}' at 2026-10-31 h=96, got {builder_val}"
+            )
+            assert pd.isna(oracle_val), (
+                f"Oracle must yield null for '{col}' at 2026-10-31 h=96, got {oracle_val}"
+            )
+            assert math.isnan(float(builder_val)) and math.isnan(float(oracle_val))
+
+    def test_tail_target_leak_reproduction_detected_by_dense_grid(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+        dense_grid_frame: pd.DataFrame,
+    ) -> None:
+        """Reproduction of Defect 1: target leak confined to issue dates >= 2026-10-26.
+
+        Asserts that injecting actual_recent_3h = y on tail dates is detected by the
+        dense grid oracle check and raises an AssertionError with diagnostic naming
+        date, horizon, column, expected and observed values.
+        """
+        intensity_df, weather_df, mix_df = curated_sample_data
+        leak_date_str = "2026-10-26"
+        leak_cutoff = issue_time_for_date(leak_date_str)
+
+        leaked_frame = dense_grid_frame.copy()
+        mask = leaked_frame["issue_time"] >= leak_cutoff
+        assert mask.any(), "Precondition failed: tail leak mask must not be empty"
+
+        orig_vals = leaked_frame.loc[mask, "actual_recent_3h"].copy()
+        leaked_frame.loc[mask, "actual_recent_3h"] = leaked_frame.loc[mask, "y"]
+
+        assert_injection_changed(
+            orig_vals,
+            leaked_frame.loc[mask, "actual_recent_3h"],
+            label="tail target leak injection on issue dates >= 2026-10-26",
+        )
+
+        day_frame = leaked_frame[leaked_frame["issue_time"] == leak_cutoff]
+        with pytest.raises(AssertionError) as exc_info:
+            for h in range(1, 97):
+                row = day_frame[day_frame["horizon"] == h].iloc[0]
+                for feat in FEATURE_COLUMNS:
+                    builder_val = row[feat]
+                    oracle_val, source_ts = naive_feature_oracle(
+                        intensity_df,
+                        weather_df,
+                        mix_df,
+                        leak_cutoff,
+                        h,
+                        feat,
+                    )
+                    if pd.isna(builder_val) and pd.isna(oracle_val):
+                        continue
+                    if pd.isna(builder_val) or pd.isna(oracle_val) or not math.isclose(
+                        float(builder_val),
+                        float(oracle_val),
+                        rel_tol=1e-5,
+                        abs_tol=1e-7,
+                    ):
+                        raise AssertionError(
+                            f"Dense grid mismatch for column '{feat}' at issue date "
+                            f"{leak_date_str}, horizon {h}:\n"
+                            f"  issue_date:       {leak_date_str}\n"
+                            f"  horizon:          {h}\n"
+                            f"  column:           {feat}\n"
+                            f"  expected value:   {oracle_val}\n"
+                            f"  observed value:   {builder_val}\n"
+                            f"  source timestamp: {source_ts}"
+                        )
+
+        diag = str(exc_info.value)
+        assert "column 'actual_recent_3h'" in diag
+        assert f"issue date {leak_date_str}" in diag
+        assert "horizon 1" in diag
+        assert "expected value" in diag
+        assert "observed value" in diag
 
     @pytest.mark.parametrize(
         "test_date",

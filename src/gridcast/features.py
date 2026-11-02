@@ -12,6 +12,16 @@ Core Properties:
   (temperature_2m_previous_day1), long horizons (h > 48) consume a 48-hour-old forecast
   (temperature_2m_previous_day2). Both satisfy the horizon contract (issued at or before
   issue_time), and that is by design.
+- Weather boundary semantics: when the hour containing the target is absent from the
+  weather store, the weather feature and both rolling statistics are null. A 24-hour mean
+  computed over a shorter window (e.g. 23 hours) is a different quantity and must never
+  be substituted silently; the frame must not manufacture one.
+- Serving caveat (ADR-018): at inference the targets are in the future, and the
+  previous-runs series has no future values. The weather available for T+h at serve time
+  is the current model run with lead h, not the day-1/day-2 series the frame trains on
+  with lead >= 24h. Training and serving therefore use different lead distributions, so
+  weather features cannot be claimed to ship in the service without resolving this
+  train/serve mismatch in Phase P3.
 - Generation mix fuel shares are lagged to issue_time - 48h.
 - Target column 'y' is the realized actual at target_time (nullable for unsettled targets).
 """
@@ -636,9 +646,19 @@ def build_example_frame(
             if series_name in weather_stats:
                 s, s_mean, s_min = weather_stats[series_name]
                 ch_for_h = containing_hours[h_mask]
-                temps[h_mask] = ch_for_h.map(s).to_numpy(dtype=float)
-                means[h_mask] = ch_for_h.map(s_mean).to_numpy(dtype=float)
-                mins[h_mask] = ch_for_h.map(s_min).to_numpy(dtype=float)
+                temp_vals = ch_for_h.map(s).to_numpy(dtype=float)
+                mean_vals = ch_for_h.map(s_mean).to_numpy(dtype=float)
+                min_vals = ch_for_h.map(s_min).to_numpy(dtype=float)
+                # When the hour containing the target is absent from the weather store
+                # or null, the weather feature and both rolling statistics are null.
+                # A 24-hour mean computed over a shorter window is a different statistic
+                # and must not be substituted.
+                missing_mask = np.isnan(temp_vals)
+                mean_vals[missing_mask] = np.nan
+                min_vals[missing_mask] = np.nan
+                temps[h_mask] = temp_vals
+                means[h_mask] = mean_vals
+                mins[h_mask] = min_vals
 
         result["temperature"] = temps
         result["temperature_24h_mean"] = means

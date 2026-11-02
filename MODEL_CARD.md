@@ -43,7 +43,17 @@ tightened from that distribution once enough nights have accumulated.
 freshest forecast that genuinely existed at the issue instant, and it caps short-horizon weather skill
 by design.
 
+**Serving caveat on weather features (open risk, ADR-018):** At inference the targets are in the future,
+and the previous-runs series has no future values. The weather available for `T+h` at serve time is the
+current model run with lead `h`, not the day-1/day-2 series the frame trains on with lead `>= 24h`.
+Training and serving therefore use different lead distributions, so "the model has weather features" is
+true in training and not true as stated for the service. Whether weather ships in the service will be
+decided at Phase P3.
+
 ## Evaluation
+
+Leakage and value correctness are checked on a grid covering DST transitions, gap-adjacent dates, and
+the first and last week of the archive. Dates outside that grid are sampled, not exhaustive.
 
 - Gate policy: the accuracy threshold is fixed from the validation split before the test split is
   scored; the test split is scored once per candidate and never used to tune.
