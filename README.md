@@ -2,7 +2,7 @@
 
 **Target.** gridcast is a containerised forecasting service for Great Britain's half-hourly grid carbon intensity, forecasting 48 hours ahead and will be gated in CI on forecast accuracy. It aims to answer whether a solo open-source model can beat the National Energy System Operator's (NESO) official day-ahead forecast on a permanent, public scoreboard.
 
-> Phase P2 complete: feature extraction layer and temporal leakage test suite are operational; downstream modeling and service phases arrive in subsequent milestones. The status table below is the honest state.
+> Phase P2 implemented and under review: the feature layer and its leakage tests exist and pass their gates, but the phase has not been signed off. The status table below is the honest state.
 
 > Note: Upon completion of Phase P7, this README will open with the live forecast-vs-actual scoreboard table comparing gridcast models against the NESO day-ahead baseline, positioned directly above the Quickstart.
 
@@ -12,7 +12,7 @@
 |---|---|---|
 | P0 | Setup: repository skeleton, environment, CLI gating, and smoke tests | done |
 | P1 | Ingest: half-hourly API fetch to append-only Parquet daily partitions | done |
-| P2 | Features: feature extraction and temporal leakage test suite | done |
+| P2 | Features: feature extraction and temporal leakage test suite | implemented, under review |
 | P3 | Models: baseline models, backtesting engine, and accuracy gate vs NESO | next |
 | P4 | Service: FastAPI prediction API and Prometheus metrics endpoint | not started |
 | P5 | Packaging: Docker containerisation and GitHub Actions CI workflow | not started |
@@ -91,7 +91,7 @@ Today (Phase P2), the working automation targets are:
 
 ### Features
 
-Phase P2 provides a bounded, leakage-free feature construction pipeline in `gridcast.features`:
+Phase P2 provides a bounded feature construction pipeline in `gridcast.features`, with two leakage properties checked separately: **temporal** (no value stamped after the target period) and **operational** (no value that did not exist at the issue instant). The evidence is a horizon contract enforced in code, invariance tests on multi-issue frames, and a value grid compared against an independent naive oracle:
 - **Issue-Time Framing (ADR-011, ADR-012)**: Forecasts Great Britain's carbon intensity 48 hours ahead from a single issue time. The canonical frame is keyed by `(issue_time, horizon)` where `issue_time` is anchored to `00:00 Europe/London` for each local day (`target_time = issue_time + horizon * 30min` for `horizon in range(1, 97)`). In BST, the issue instant is 23:00Z of the previous UTC date; in GMT, it is 00:00Z. Consecutive issue instants are 23, 24, or 25 hours apart across clock changes, and the horizon is an absolute half-hour offset so DST never changes the horizon count. The issue schedule is configurable via the `issue_times` parameter.
 - **Horizon Contract Enforced in Code (ADR-011)**: Every feature declares the maximum source timestamp it is permitted to read, asserting directly in code that all values are computable strictly from information available at `<= issue_time`. Any feature build attempting to read source data timestamped after `issue_time` raises `ValueError`.
 - **Temporal and Operational Leakage Guard**: Guarded by a sampled per-row perturbation invariance test across 25+ `(issue_time, horizon)` pairs covering dataset endpoints, DST transition days, and horizon limits (h=1 and h=96), asserting strict invariance when source rows stamped after `issue_time` are altered.
