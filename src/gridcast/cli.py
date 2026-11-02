@@ -215,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"  {col:<26}:      0 nulls")
         print("\nTo extract feature matrix X and target y:")
-        print("  X = df[FEATURE_COLUMNS]")
+        print("  X = select_model_inputs(df)")
         print("  y = df['y']")
         return 0
 

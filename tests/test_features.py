@@ -24,6 +24,7 @@ from gridcast.features import (
     issue_time_for_date,
     load_feature_sources,
     max_source_timestamp_allowed,
+    select_model_inputs,
     split_by_issue_date,
 )
 from gridcast.holidays import UK_BANK_HOLIDAYS, is_uk_bank_holiday
@@ -713,6 +714,78 @@ class TestSplitByIssueDate:
         # max(target_time) of validation < min(target_time) of test - 48h
         assert train["target_time"].max() < val["target_time"].min() - pd.Timedelta(hours=48)
         assert val["target_time"].max() < test["target_time"].min() - pd.Timedelta(hours=48)
+
+
+class TestPositiveModelInputSelection:
+    """Validate select_model_inputs as the only positive selection of X (Section 4)."""
+
+    def test_select_model_inputs_exact_columns_and_order(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """select_model_inputs returns exactly FEATURE_COLUMNS in exact order."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        sample_issues = [pd.Timestamp("2025-01-01 00:00:00+00:00")]
+        frame = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=sample_issues,
+            horizons=[1, 48],
+            require_aux=True,
+        )
+
+        X = select_model_inputs(frame)
+        assert list(X.columns) == FEATURE_COLUMNS
+        assert len(X) == len(frame)
+        assert "y" not in X.columns
+        assert "issue_time" not in X.columns
+        assert "target_time" not in X.columns
+
+    def test_model_feature_columns_is_subset_of_feature_columns(self) -> None:
+        """The model feature list must be a subset of FEATURE_COLUMNS for P3 compatibility."""
+        from gridcast.features import MODEL_FEATURE_COLUMNS
+
+        assert isinstance(MODEL_FEATURE_COLUMNS, list)
+        assert set(MODEL_FEATURE_COLUMNS).issubset(set(FEATURE_COLUMNS))
+
+    def test_select_model_inputs_raises_on_missing_column(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """select_model_inputs raises ValueError when a declared feature column is missing."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        frame = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=[pd.Timestamp("2025-01-01 00:00:00+00:00")],
+            horizons=[1],
+            require_aux=True,
+        )
+        bad_frame = frame.drop(columns=["temperature"])
+        with pytest.raises(ValueError, match="(?i)(missing.*column|temperature)"):
+            select_model_inputs(bad_frame)
+
+    def test_select_model_inputs_raises_on_extra_column(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """select_model_inputs raises ValueError when the frame carries an undeclared column."""
+        intensity_df, weather_df, mix_df = curated_sample_data
+        frame = build_example_frame(
+            intensity_df,
+            weather_df,
+            mix_df,
+            issue_times=[pd.Timestamp("2025-01-01 00:00:00+00:00")],
+            horizons=[1],
+            require_aux=True,
+        )
+        bad_frame = frame.copy()
+        bad_frame["sneaky_extra_column"] = 42.0
+        with pytest.raises(ValueError, match="(?i)(undeclared.*column|sneaky_extra_column)"):
+            select_model_inputs(bad_frame)
+
 
 
 

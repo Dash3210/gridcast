@@ -115,7 +115,12 @@ make features
 
 **In Python**:
 ```python
-from gridcast.features import FEATURE_COLUMNS, build_example_frame, load_feature_sources
+from gridcast.features import (
+    FEATURE_COLUMNS,
+    build_example_frame,
+    load_feature_sources,
+    select_model_inputs,
+)
 
 # 1. Load source datasets
 intensity_df, weather_df, mix_df = load_feature_sources()
@@ -124,13 +129,15 @@ intensity_df, weather_df, mix_df = load_feature_sources()
 df = build_example_frame(intensity_df, weather_df, mix_df, require_aux=True)
 
 # 3. Extract feature matrix X and target y
-X = df[FEATURE_COLUMNS]
+X = select_model_inputs(df)
 y = df["y"]
 
 print(f"Dataset: {len(df):,} examples across {df['issue_time'].nunique()} issue times.")
 print(f"X shape: {X.shape} ({len(FEATURE_COLUMNS)} features)")
 print(f"y shape: {y.shape} ({y.notna().sum():,} settled targets)")
 ```
+
+Model input `X` is a positive selection constructed via `select_model_inputs(df)`, and `df.drop(columns=["y"])` is forbidden.
 
 ### Ingest
 

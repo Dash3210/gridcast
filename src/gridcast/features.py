@@ -85,15 +85,28 @@ FEATURE_COLUMNS: Final[list[str]] = [
     "mix_share_biomass",
 ]
 
+MODEL_FEATURE_COLUMNS: Final[list[str]] = list(FEATURE_COLUMNS)
+
+ALLOWED_FRAME_COLUMNS: Final[set[str]] = {
+    "issue_time",
+    "horizon",
+    "target_time",
+    "y",
+    *FEATURE_COLUMNS,
+}
+
 __all__: list[str] = [
+    "ALLOWED_FRAME_COLUMNS",
     "DEFAULT_HORIZONS",
     "FEATURE_COLUMNS",
     "MIX_FUELS",
+    "MODEL_FEATURE_COLUMNS",
     "build_example_frame",
     "default_issue_schedule",
     "issue_time_for_date",
     "load_feature_sources",
     "max_source_timestamp_allowed",
+    "select_model_inputs",
     "split_by_issue_date",
 ]
 
@@ -178,6 +191,33 @@ def split_by_issue_date(
     test = frame[test_mask & valid_y].copy()
 
     return train, val, test
+
+
+def select_model_inputs(frame: pd.DataFrame) -> pd.DataFrame:
+    """Extract model feature matrix X as a positive selection of FEATURE_COLUMNS.
+
+    This is the only supported way to build X. Negative selection (such as
+    df.drop(columns=['y'])) is strictly forbidden.
+
+    Args:
+        frame: DataFrame produced by build_example_frame or split_by_issue_date.
+
+    Returns:
+        pd.DataFrame containing exactly FEATURE_COLUMNS in declared order.
+
+    Raises:
+        ValueError: If any declared feature column is missing or if frame carries
+                    undeclared columns not in ALLOWED_FRAME_COLUMNS.
+    """
+    missing = [c for c in FEATURE_COLUMNS if c not in frame.columns]
+    if missing:
+        raise ValueError(f"Frame is missing declared feature columns: {missing}")
+
+    extra = set(frame.columns) - ALLOWED_FRAME_COLUMNS
+    if extra:
+        raise ValueError(f"Frame carries undeclared columns: {sorted(extra)}")
+
+    return frame[FEATURE_COLUMNS].copy()
 
 
 def load_feature_sources(

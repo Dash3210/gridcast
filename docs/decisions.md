@@ -254,3 +254,18 @@
 - Alternatives rejected:
   - Splitting on target_time (rejected: scrambles multi-horizon forecasts from a single issue across train and test).
   - Contiguous issue-date splits without an embargo (rejected: 48-hour target horizon creates 2-day target overlap across boundaries).
+
+## ADR-014 — Positive model input selection: enforcing explicit feature matrix extraction
+- Status: accepted
+- Date: 2026-11-02
+- Context:
+  Machine learning workflows frequently extract feature matrix `X` via negative column dropping, e.g. `df.drop(columns=["y"])` or `df.drop(columns=["target_time"])`. This practice is dangerous: any auxiliary metadata, intermediate computation, leaked label column, or upstream schema expansion added to `df` is silently passed into model training and inference.
+- Decision:
+  1. Define `select_model_inputs(frame) -> pd.DataFrame` as the only documented and supported way to construct `X`.
+  2. `select_model_inputs` strictly enforces a positive selection: it returns exactly `frame[FEATURE_COLUMNS]` in declared order.
+  3. It validates schema integrity by raising `ValueError` if any declared feature column is missing or if `frame` carries any undeclared column outside `ALLOWED_FRAME_COLUMNS`.
+  4. Negative column dropping (`df.drop(columns=["y"])`) is strictly forbidden across the codebase and user documentation.
+- Consequences:
+  Guarantees that downstream model inputs remain strictly bounded, predictable, and immune to undeclared column leakage.
+- Alternatives rejected:
+  - Negative selection via `df.drop(columns=["y"])` (rejected: silently leaks unexpected or undeclared columns directly into model features).
