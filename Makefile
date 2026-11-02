@@ -8,7 +8,7 @@ PYTHON ?= python3
 PY ?= .venv/bin/python
 endif
 
-.PHONY: help install test data-check clean ingest features train eval serve docker lint typecheck
+.PHONY: help install test data-check clean ingest features train eval serve docker lint typecheck check
 .DEFAULT_GOAL := help
 
 help:
@@ -64,3 +64,5 @@ lint:
 
 typecheck:
 	"$(PY)" -m mypy
+
+check: lint typecheck test data-check

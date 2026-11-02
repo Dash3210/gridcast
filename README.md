@@ -54,6 +54,10 @@ make typecheck
 
 `make test` runs pytest with coverage reporting and strictly enforces the 85% code coverage gate.
 
+### Quality gates
+
+`make check` runs lint, typecheck, test, and data-check; nothing is committed without it.
+
 ### Running the CLI
 
 Run subcommands using the virtual environment interpreter without needing manual shell activation:
