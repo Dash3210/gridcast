@@ -28,6 +28,7 @@ import pandas as pd
 
 from gridcast.features import (
     FEATURE_COLUMNS,
+    WEATHER_FEATURE_COLUMNS,
     build_example_frame,
     default_issue_schedule,
     issue_time_for_date,
@@ -77,12 +78,12 @@ __all__: list[str] = [
     "verify_fixture_integrity",
 ]
 
-DEFAULT_EVAL_FIXTURE_PARQUET: Final[Path] = Path("data/eval/frozen_split_v1.parquet")
-DEFAULT_EVAL_FIXTURE_SIDECAR: Final[Path] = Path("data/eval/frozen_split_v1.json")
+DEFAULT_EVAL_FIXTURE_PARQUET: Final[Path] = Path("data/eval/frozen_split_v2.parquet")
+DEFAULT_EVAL_FIXTURE_SIDECAR: Final[Path] = Path("data/eval/frozen_split_v2.json")
 
 # Byte hash (SHA-256 over raw file bytes, not git's object id).
 PINNED_EVAL_FIXTURE_SHA256: Final[str] = (
-    "205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4"
+    "87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51"
 )
 
 REQUIRED_FIXTURE_COLUMNS: Final[list[str]] = [
@@ -383,6 +384,7 @@ def run_rolling_origin_backtest(
     lgbm_params: dict[str, object] | None = None,
     num_boost_round: int = 100,
     verbose: bool = True,
+    feature_columns: Sequence[str] | None = None,
 ) -> BacktestResults:
     """Execute rolling-origin backtest over the specified origins.
 
@@ -481,10 +483,16 @@ def run_rolling_origin_backtest(
                   f"train rows: {len(train_slice):5d} | max(train target_time): {max_train_tt} < T")
 
         # 2. Extract X, y positively using production selector
-        X_train, y_train = select_training_arrays(train_slice)
+        X_train, y_train = select_training_arrays(train_slice, feature_columns=feature_columns)
 
         # 3. Train LightGBM model
-        booster = train_lgbm(X_train, y_train, params=lgbm_params, num_boost_round=num_boost_round)
+        booster = train_lgbm(
+            X_train,
+            y_train,
+            params=lgbm_params,
+            num_boost_round=num_boost_round,
+            feature_columns=feature_columns,
+        )
 
         # 4. Slice test fold at origin_T
         test_fold = frame[frame["issue_time"] == origin_T].copy()
@@ -492,7 +500,7 @@ def run_rolling_origin_backtest(
             raise ValueError(f"Origin {origin_T} has {len(test_fold)} horizons (expected 96)")
 
         # 5. Predict model
-        m_preds = predict_lgbm(booster, test_fold)
+        m_preds = predict_lgbm(booster, test_fold, feature_columns=feature_columns)
 
         # 6. Predict baselines
         pers_df = predict_persistence(test_fold, raw_store=raw_curated_store)
@@ -864,7 +872,7 @@ def evaluate_from_fixture(
 
 
 def refresh_eval_fixture(
-    version: str = "v1",
+    version: str = "v2",
     output_dir: Path | str = "data/eval",
     start_date: str = TEST_SPLIT_START_DATE,
     end_date: str = TEST_SPLIT_END_DATE,
@@ -943,16 +951,50 @@ def refresh_eval_fixture(
     )
 
     scored_df = results.predictions.copy()
-    fixture_df = pd.DataFrame({
-        "issue_time": pd.to_datetime(scored_df["issue_time"], utc=True),
-        "horizon": scored_df["horizon"].astype(int),
-        "target_time": pd.to_datetime(scored_df["target_time"], utc=True),
-        "actual": scored_df["actual"].astype(float),
-        "neso_forecast": scored_df["operator_forecast"].astype(float),
-        "persistence_pred": scored_df["persistence_forecast"].astype(float),
-        "seasonal_naive_pred": scored_df["seasonal_naive_forecast"].astype(float),
-        "candidate_pred": scored_df["forecast"].astype(float),
-    })
+    scored_df["issue_time"] = pd.to_datetime(scored_df["issue_time"], utc=True)
+    scored_df["target_time"] = pd.to_datetime(scored_df["target_time"], utc=True)
+    scored_df = scored_df.sort_values(["issue_time", "horizon"]).reset_index(drop=True)
+
+    v1_parquet_file = out_p / "frozen_split_v1.parquet"
+    if version == "v2" and v1_parquet_file.exists():
+        v1_df = pd.read_parquet(v1_parquet_file)
+        v1_df["issue_time"] = pd.to_datetime(v1_df["issue_time"], utc=True)
+        v1_df["target_time"] = pd.to_datetime(v1_df["target_time"], utc=True)
+        v1_df = v1_df.sort_values(["issue_time", "horizon"]).reset_index(drop=True)
+
+        fixture_df = pd.DataFrame({
+            "issue_time": v1_df["issue_time"],
+            "horizon": v1_df["horizon"],
+            "target_time": v1_df["target_time"],
+            "actual": v1_df["actual"],
+            "neso_forecast": v1_df["neso_forecast"],
+            "persistence_pred": v1_df["persistence_pred"],
+            "seasonal_naive_pred": v1_df["seasonal_naive_pred"],
+            "candidate_pred": scored_df["forecast"].astype(float).values,
+        })
+        truth_cols = [
+            "issue_time",
+            "horizon",
+            "target_time",
+            "actual",
+            "neso_forecast",
+            "persistence_pred",
+            "seasonal_naive_pred",
+        ]
+        for col in truth_cols:
+            if not fixture_df[col].equals(v1_df[col]):
+                raise AssertionError(f"Truth column '{col}' differs from v1 fixture")
+    else:
+        fixture_df = pd.DataFrame({
+            "issue_time": scored_df["issue_time"],
+            "horizon": scored_df["horizon"].astype(int),
+            "target_time": scored_df["target_time"],
+            "actual": scored_df["actual"].astype(float),
+            "neso_forecast": scored_df["operator_forecast"].astype(float),
+            "persistence_pred": scored_df["persistence_forecast"].astype(float),
+            "seasonal_naive_pred": scored_df["seasonal_naive_forecast"].astype(float),
+            "candidate_pred": scored_df["forecast"].astype(float),
+        })
     fixture_df = fixture_df.sort_values(["issue_time", "horizon"]).reset_index(drop=True)
 
     if len(fixture_df) != 1440:
@@ -1307,12 +1349,12 @@ def run_weather_ablation(
         weather_df=weather_df,
         mix_df=mix_df,
         issue_times=schedule,
+        include_weather=True,
         require_aux=True,
     )
 
-    control_feature_cols = list(FEATURE_COLUMNS)
-    weather_cols = ["temperature", "temperature_24h_mean", "temperature_24h_min"]
-    treatment_feature_cols = [c for c in FEATURE_COLUMNS if c not in weather_cols]
+    control_feature_cols = list(FEATURE_COLUMNS) + list(WEATHER_FEATURE_COLUMNS)
+    treatment_feature_cols = [c for c in FEATURE_COLUMNS if c not in WEATHER_FEATURE_COLUMNS]
 
     num_boost_round = int(meta.get("num_boost_round", 100))
     lgbm_params = meta.get("lgbm_params")

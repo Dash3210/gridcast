@@ -457,7 +457,12 @@ def test_golden_backtest_metrics_stability() -> None:
     intensity_df, weather_df, mix_df = load_feature_sources()
     schedule = default_issue_schedule("2024-11-08", "2025-07-15")
     frame = build_example_frame(
-        intensity_df, weather_df, mix_df, issue_times=schedule, require_aux=True
+        intensity_df,
+        weather_df,
+        mix_df,
+        issue_times=schedule,
+        require_aux=True,
+        include_weather=True,
     )
 
     operator_forecasts = pd.Series(
@@ -467,12 +472,45 @@ def test_golden_backtest_metrics_stability() -> None:
 
     frozen_origins = ["2025-06-05", "2025-06-12", "2025-06-19", "2025-06-26"]
 
+    v1_features = [
+        "horizon",
+        "actual_recent_3h",
+        "actual_lag_24h",
+        "actual_lag_48h",
+        "actual_lag_168h",
+        "actual_rolling_3h_mean",
+        "actual_rolling_3h_std",
+        "actual_rolling_24h_mean",
+        "actual_rolling_24h_std",
+        "actual_rolling_168h_mean",
+        "actual_rolling_168h_std",
+        "hour_of_day",
+        "day_of_week",
+        "month",
+        "is_weekend",
+        "is_uk_bank_holiday",
+        "sin_hour",
+        "cos_hour",
+        "sin_day_of_year",
+        "cos_day_of_year",
+        "temperature",
+        "temperature_24h_mean",
+        "temperature_24h_min",
+        "mix_share_wind",
+        "mix_share_solar",
+        "mix_share_gas",
+        "mix_share_coal",
+        "mix_share_nuclear",
+        "mix_share_biomass",
+    ]
+
     res = run_rolling_origin_backtest(
         frame=frame,
         origins=frozen_origins,
         operator_forecasts=operator_forecasts,
         num_boost_round=30,
         verbose=False,
+        feature_columns=v1_features,
     )
 
     assert round(res.gate_value, 4) == golden["gate_value"], (

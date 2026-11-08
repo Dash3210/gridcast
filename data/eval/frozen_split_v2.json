@@ -1,0 +1,51 @@
+{
+  "schema_version": "v2",
+  "created_at": "2026-11-08T00:00:41Z",
+  "archive_commit": "3617143",
+  "archive_newest_period": "2026-11-07 23:30 UTC",
+  "window_start": "2026-09-05",
+  "window_end": "2026-11-01",
+  "origin_window": "frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins",
+  "origins": [
+    "2026-09-04 23:00 UTC",
+    "2026-09-08 23:00 UTC",
+    "2026-09-12 23:00 UTC",
+    "2026-09-16 23:00 UTC",
+    "2026-09-20 23:00 UTC",
+    "2026-09-24 23:00 UTC",
+    "2026-09-28 23:00 UTC",
+    "2026-10-02 23:00 UTC",
+    "2026-10-06 23:00 UTC",
+    "2026-10-10 23:00 UTC",
+    "2026-10-14 23:00 UTC",
+    "2026-10-18 23:00 UTC",
+    "2026-10-22 23:00 UTC",
+    "2026-10-27 00:00 UTC",
+    "2026-10-31 00:00 UTC"
+  ],
+  "row_count": 1440,
+  "sha256": "87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51",
+  "parquet_sha256": "87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51",
+  "model_artifact_sha256": "1cd13471d793735748f81d17fb195e34f6f784e8f642ac60a16f016280c45310",
+  "training_window": "2024-11-08 00:00:00+00:00 to 2026-11-01 00:00:00+00:00",
+  "lgbm_params": {
+    "objective": "regression_l1",
+    "metric": "mae",
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "min_child_samples": 20,
+    "feature_fraction": 0.8,
+    "seed": 42,
+    "deterministic": true,
+    "force_col_wise": true,
+    "verbose": -1,
+    "num_threads": 1
+  },
+  "num_boost_round": 100,
+  "versions": {
+    "python": "3.10.11",
+    "lightgbm": "4.7.0",
+    "pandas": "2.3.3",
+    "numpy": "2.2.6"
+  }
+}

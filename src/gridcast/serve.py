@@ -16,7 +16,6 @@ import pandas as pd
 from gridcast.features import (
     CURATED_DIR_DEFAULT,
     MIX_DIR_DEFAULT,
-    WEATHER_DIR_DEFAULT,
     build_example_frame,
     issue_time_for_date,
 )
@@ -111,7 +110,7 @@ def resolve_features_for_issue(
     booster: lgb.Booster | None = None,
     model_path: Path | str = "data/models/lgbm_model.txt",
     curated_dir: Path | str | None = CURATED_DIR_DEFAULT,
-    weather_dir: Path | str | None = WEATHER_DIR_DEFAULT,
+    weather_dir: Path | str | None = None,
     mix_dir: Path | str | None = MIX_DIR_DEFAULT,
     intensity_df: pd.DataFrame | None = None,
     weather_df: pd.DataFrame | None = None,
@@ -176,12 +175,14 @@ def resolve_features_for_issue(
         mix_dir=mix_dir,
     )
 
+    has_weather_features = any(f.startswith("temperature") for f in declared_features)
     try:
         frame = build_example_frame(
             intensity_df=int_df,
             weather_df=w_df,
             mix_df=m_df,
             issue_times=[issue_ts],
+            include_weather=has_weather_features,
             require_aux=False,
         )
     except Exception as e:
@@ -211,7 +212,7 @@ def check_startup_servability(
     booster: lgb.Booster | None = None,
     model_path: Path | str = "data/models/lgbm_model.txt",
     curated_dir: Path | str | None = CURATED_DIR_DEFAULT,
-    weather_dir: Path | str | None = WEATHER_DIR_DEFAULT,
+    weather_dir: Path | str | None = None,
     mix_dir: Path | str | None = MIX_DIR_DEFAULT,
     intensity_df: pd.DataFrame | None = None,
     weather_df: pd.DataFrame | None = None,

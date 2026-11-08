@@ -235,14 +235,14 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument(
         "--fixture",
         type=str,
-        default="data/eval/frozen_split_v1.parquet",
-        help="Path to frozen split parquet fixture (default: data/eval/frozen_split_v1.parquet).",
+        default="data/eval/frozen_split_v2.parquet",
+        help="Path to frozen split parquet fixture (default: data/eval/frozen_split_v2.parquet).",
     )
     eval_parser.add_argument(
         "--sidecar",
         type=str,
-        default="data/eval/frozen_split_v1.json",
-        help="Path to fixture sidecar metadata JSON (default: data/eval/frozen_split_v1.json).",
+        default="data/eval/frozen_split_v2.json",
+        help="Path to fixture sidecar metadata JSON (default: data/eval/frozen_split_v2.json).",
     )
     eval_parser.add_argument(
         "--no-verbose",
@@ -259,8 +259,8 @@ def build_parser() -> argparse.ArgumentParser:
     eval_refresh_parser.add_argument(
         "--version",
         type=str,
-        default="v1",
-        help="Fixture version identifier (default: v1; write v2 if model changes).",
+        default="v2",
+        help="Fixture version identifier (default: v2).",
     )
     eval_refresh_parser.add_argument(
         "--output-dir",
@@ -306,14 +306,14 @@ def build_parser() -> argparse.ArgumentParser:
     eval_reproduce_parser.add_argument(
         "--fixture",
         type=str,
-        default="data/eval/frozen_split_v1.parquet",
-        help="Path to frozen split parquet fixture (default: data/eval/frozen_split_v1.parquet).",
+        default="data/eval/frozen_split_v2.parquet",
+        help="Path to frozen split parquet fixture (default: data/eval/frozen_split_v2.parquet).",
     )
     eval_reproduce_parser.add_argument(
         "--sidecar",
         type=str,
-        default="data/eval/frozen_split_v1.json",
-        help="Path to fixture sidecar metadata JSON (default: data/eval/frozen_split_v1.json).",
+        default="data/eval/frozen_split_v2.json",
+        help="Path to fixture sidecar metadata JSON (default: data/eval/frozen_split_v2.json).",
     )
     eval_reproduce_parser.add_argument(
         "--max-pred-tolerance",
@@ -407,7 +407,7 @@ def run_train_cli(
     print("Loading feature sources (intensity, weather, mix)...")
     intensity_df, weather_df, mix_df = load_feature_sources()
     latest_date = intensity_df["period_start_utc"].max().tz_convert("Europe/London").date()
-    if not weather_df.empty:
+    if weather_df is not None and not weather_df.empty:
         max_weather_date = weather_df["period_start_utc"].max().tz_convert("Europe/London").date()
         if max_weather_date < latest_date:
             latest_date = max_weather_date
@@ -521,8 +521,8 @@ def run_backtest_cli(
 
 
 def run_eval_cli(
-    fixture_path: Path | str = "data/eval/frozen_split_v1.parquet",
-    sidecar_path: Path | str = "data/eval/frozen_split_v1.json",
+    fixture_path: Path | str = "data/eval/frozen_split_v2.parquet",
+    sidecar_path: Path | str = "data/eval/frozen_split_v2.json",
     verbose: bool = True,
     pinned_sha256: str | None = None,
 ) -> int:
@@ -545,8 +545,8 @@ def run_eval_cli(
 
 
 def run_eval_reproduce_cli(
-    fixture_path: Path | str = "data/eval/frozen_split_v1.parquet",
-    sidecar_path: Path | str = "data/eval/frozen_split_v1.json",
+    fixture_path: Path | str = "data/eval/frozen_split_v2.parquet",
+    sidecar_path: Path | str = "data/eval/frozen_split_v2.json",
     max_pred_tolerance: float = 0.0,
     gate_value_tolerance: float = 0.0,
     verbose: bool = True,

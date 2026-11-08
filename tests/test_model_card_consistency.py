@@ -18,15 +18,15 @@ import pytest
 
 from gridcast.models import get_model_artifact_hash
 
-EVAL_PARQUET_PATH = Path("data/eval/frozen_split_v1.parquet")
-EVAL_SIDECAR_PATH = Path("data/eval/frozen_split_v1.json")
+EVAL_PARQUET_PATH = Path("data/eval/frozen_split_v2.parquet")
+EVAL_SIDECAR_PATH = Path("data/eval/frozen_split_v2.json")
 HASHES_FIXTURE_PATH = Path("tests/fixtures/frozen_split_metrics.json")
 MODEL_CARD_PATH = Path("MODEL_CARD.md")
 README_PATH = Path("README.md")
 DECISIONS_PATH = Path("docs/decisions.md")
 
 REQUIRED_WINDOW_TEXT = (
-    "frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, "
+    "frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, "
     "archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins"
 )
 
@@ -338,26 +338,43 @@ def _assert_line_valid_for_fixture_hash(line: str, location: str) -> None:
     Rule: Every published number is either the fixture value, or explicitly marked
     as superseded, with the commit it came from.
     """
-    if "205222ce" not in line:
-        return
+    if "87d32223" in line:
+        # Check any 39.xxx score on this line for v2 fixture
+        for score in re.findall(r"\b39\.\d{3}\b", line):
+            if score == "39.118":
+                continue
+            assert _is_superseded_with_commit(line, score), (
+                f"{location} pairs fixture hash 87d32223 with unsourced score {score} "
+                f"not explicitly marked as superseded with its commit: {line}"
+            )
 
-    # Check any 39.xxx score on this line
-    for score in re.findall(r"\b39\.\d{3}\b", line):
-        if score == "39.032":
-            continue
-        assert _is_superseded_with_commit(line, score), (
-            f"{location} pairs fixture hash 205222ce with unsourced score {score} "
-            f"not explicitly marked as superseded with its commit: {line}"
-        )
+        # Any GATE_VALUE match on this line must be 39.118 or explicitly marked as superseded
+        for gv in re.findall(r"GATE_VALUE\s*=\s*`?([0-9]+\.[0-9]+)`?", line):
+            if gv in ("39.118", "39.118459"):
+                continue
+            assert _is_superseded_with_commit(line, gv), (
+                f"{location} pairs fixture hash 87d32223 with unsourced GATE_VALUE {gv} "
+                f"not explicitly marked as superseded with its commit: {line}"
+            )
 
-    # Any GATE_VALUE match on this line must be 39.032 or explicitly marked as superseded
-    for gv in re.findall(r"GATE_VALUE\s*=\s*`?([0-9]+\.[0-9]+)`?", line):
-        if gv in ("39.032", "39.032478"):
-            continue
-        assert _is_superseded_with_commit(line, gv), (
-            f"{location} pairs fixture hash 205222ce with unsourced GATE_VALUE {gv} "
-            f"not explicitly marked as superseded with its commit: {line}"
-        )
+    if "205222ce" in line:
+        # Check any 39.xxx score on this line for v1 fixture
+        for score in re.findall(r"\b39\.\d{3}\b", line):
+            if score in ("39.032", "39.118"):
+                continue
+            assert _is_superseded_with_commit(line, score), (
+                f"{location} pairs fixture hash 205222ce with unsourced score {score} "
+                f"not explicitly marked as superseded with its commit: {line}"
+            )
+
+        # Any GATE_VALUE match on this line must be 39.032 or explicitly marked as superseded
+        for gv in re.findall(r"GATE_VALUE\s*=\s*`?([0-9]+\.[0-9]+)`?", line):
+            if gv in ("39.032", "39.032478"):
+                continue
+            assert _is_superseded_with_commit(line, gv), (
+                f"{location} pairs fixture hash 205222ce with unsourced GATE_VALUE {gv} "
+                f"not explicitly marked as superseded with its commit: {line}"
+            )
 
 
 def test_no_line_pairs_fixture_hash_with_non_fixture_score() -> None:
@@ -413,7 +430,7 @@ def test_pinned_eval_fixture_sha256_matches_docs() -> None:
 
     assert len(PINNED_EVAL_FIXTURE_SHA256) == 64
     assert PINNED_EVAL_FIXTURE_SHA256 == (
-        "205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4"
+        "87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51"
     )
 
     model_card_text = MODEL_CARD_PATH.read_text(encoding="utf-8")
@@ -435,9 +452,9 @@ def test_model_artifact_hash_commands_and_object_id_documented() -> None:
     assert "git hash-object data/models/lgbm_model.txt" in card_text
     assert "python -c" in card_text and "read_text" in card_text and "sha256" in card_text
 
-    # Both hash values
-    assert "8f841a6f048242085a36c33ed8b92b7acdf6d8e7" in card_text
-    assert "5ddfe624a05dee49fa2ec339f6d22ba4ad6783dfcb1ea30eb7bca4a501e19e15" in card_text
+    # Both hash values for v2
+    assert "fe838f87dac4cb5412f5118600353b5293d52cd4" in card_text
+    assert "1cd13471d793735748f81d17fb195e34f6f784e8f642ac60a16f016280c45310" in card_text
 
     # Statement of which one GET /model returns
     assert "GET /model" in card_text

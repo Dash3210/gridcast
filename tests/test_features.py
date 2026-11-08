@@ -477,6 +477,7 @@ class TestFeatureContractAndInvariants:
             mix_df,
             issue_times=[sample_issue],
             horizons=sample_horizons,
+            include_weather=True,
             require_aux=True,
         )
 
@@ -663,6 +664,30 @@ class TestFeatureContractAndInvariants:
         with pytest.raises(ValueError, match="(?i)(auxiliary|weather|mix|null)"):
             build_example_frame(intensity_df, require_aux=True)
 
+    def test_build_example_frame_without_weather_inputs_succeeds(
+        self,
+        curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    ) -> None:
+        """Build frame without weather inputs and verify 26 features without weather columns."""
+        intensity_df, _, mix_df = curated_sample_data
+        frame = build_example_frame(
+            intensity_df=intensity_df,
+            weather_df=None,
+            mix_df=mix_df,
+            issue_times=[pd.Timestamp("2026-06-01 00:00:00+00:00")],
+            horizons=[1, 48, 96],
+            require_aux=True,
+        )
+        assert len(frame) == 3
+        X = select_model_inputs(frame)
+        assert len(X.columns) == 26
+        assert list(X.columns) == FEATURE_COLUMNS
+        assert "temperature" not in frame.columns
+        assert "temperature_24h_mean" not in frame.columns
+        assert "temperature_24h_min" not in frame.columns
+        for col in FEATURE_COLUMNS:
+            assert not X[col].isna().any(), f"Declared feature '{col}' has nulls"
+
     def test_weather_source_must_be_previous_runs_not_reanalysis(
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
@@ -684,7 +709,12 @@ class TestFeatureContractAndInvariants:
             (ValueError, KeyError),
             match="(?i)(previous_day2|previous-runs|reanalysis)",
         ):
-            build_example_frame(intensity_df, weather_df=bad_weather, mix_df=mix_df)
+            build_example_frame(
+                intensity_df,
+                weather_df=bad_weather,
+                mix_df=mix_df,
+                include_weather=True,
+            )
 
     def test_dst_spring_forward_lag_lookup(
         self,
@@ -814,6 +844,7 @@ class TestHorizonAbsoluteOffsetDST:
             mix_df=mix_df,
             issue_times=[t_issue],
             horizons=range(1, 97),
+            include_weather=True,
             require_aux=True,
         )
 
@@ -1041,13 +1072,13 @@ class TestPositiveModelInputSelection:
             horizons=[1],
             require_aux=True,
         )
-        bad_frame = frame.drop(columns=["temperature"])
+        bad_frame = frame.drop(columns=["actual_recent_3h"])
         assert_injection_changed(
             list(frame.columns),
             list(bad_frame.columns),
-            label="model inputs missing temperature column",
+            label="model inputs missing actual_recent_3h column",
         )
-        with pytest.raises(ValueError, match="(?i)(missing.*column|temperature)"):
+        with pytest.raises(ValueError, match="(?i)(missing.*column|actual_recent_3h)"):
             select_model_inputs(bad_frame)
 
     def test_select_model_inputs_raises_on_extra_column(
@@ -1129,6 +1160,7 @@ class TestPerHorizonWeatherLead:
             mix_df,
             issue_times=[sample_issue],
             horizons=sample_horizons,
+            include_weather=True,
             require_aux=True,
         )
 
@@ -1177,6 +1209,7 @@ class TestPerHorizonWeatherLead:
                 mix_df,
                 issue_times=[sample_issue],
                 horizons=[72],
+                include_weather=True,
                 require_aux=True,
                 weather_series_by_horizon=override,
             )
@@ -1407,6 +1440,7 @@ class TestDenseValueGridOracle:
             mix_df=mix_df,
             issue_times=[issue_time],
             horizons=range(1, 97),
+            include_weather=True,
             require_aux=True,
         )
         row_96 = frame[frame["horizon"] == h].iloc[0]

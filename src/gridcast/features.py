@@ -87,10 +87,6 @@ FEATURE_COLUMNS: Final[list[str]] = [
     "cos_hour",
     "sin_day_of_year",
     "cos_day_of_year",
-    # Weather features: previous-runs day-2 forecast at target_time (issued <= issue_time)
-    "temperature",
-    "temperature_24h_mean",
-    "temperature_24h_min",
     # Generation mix features (lagged to issue_time - 48h)
     "mix_share_wind",
     "mix_share_solar",
@@ -98,6 +94,12 @@ FEATURE_COLUMNS: Final[list[str]] = [
     "mix_share_coal",
     "mix_share_nuclear",
     "mix_share_biomass",
+]
+
+WEATHER_FEATURE_COLUMNS: Final[list[str]] = [
+    "temperature",
+    "temperature_24h_mean",
+    "temperature_24h_min",
 ]
 
 MODEL_FEATURE_COLUMNS: Final[list[str]] = list(FEATURE_COLUMNS)
@@ -108,6 +110,7 @@ ALLOWED_FRAME_COLUMNS: Final[set[str]] = {
     "target_time",
     "y",
     *FEATURE_COLUMNS,
+    *WEATHER_FEATURE_COLUMNS,
 }
 
 __all__: list[str] = [
@@ -117,6 +120,7 @@ __all__: list[str] = [
     "FEATURE_COLUMNS",
     "MIX_FUELS",
     "MODEL_FEATURE_COLUMNS",
+    "WEATHER_FEATURE_COLUMNS",
     "build_example_frame",
     "default_issue_schedule",
     "issue_time_for_date",
@@ -210,23 +214,28 @@ def split_by_issue_date(
     return train, val, test
 
 
-def select_model_inputs(frame: pd.DataFrame) -> pd.DataFrame:
-    """Extract model feature matrix X as a positive selection of FEATURE_COLUMNS.
+def select_model_inputs(
+    frame: pd.DataFrame,
+    feature_columns: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """Extract model feature matrix X as a positive selection of feature columns.
 
     This is the only supported way to build X. Negative selection (such as
     df.drop(columns=['y'])) is strictly forbidden.
 
     Args:
         frame: DataFrame produced by build_example_frame or split_by_issue_date.
+        feature_columns: Sequence of feature column names (defaults to FEATURE_COLUMNS).
 
     Returns:
-        pd.DataFrame containing exactly FEATURE_COLUMNS in declared order.
+        pd.DataFrame containing exactly declared feature columns in specified order.
 
     Raises:
         ValueError: If any declared feature column is missing or if frame carries
                     undeclared columns not in ALLOWED_FRAME_COLUMNS.
     """
-    missing = [c for c in FEATURE_COLUMNS if c not in frame.columns]
+    target_cols = list(feature_columns) if feature_columns is not None else list(FEATURE_COLUMNS)
+    missing = [c for c in target_cols if c not in frame.columns]
     if missing:
         raise ValueError(f"Frame is missing declared feature columns: {missing}")
 
@@ -234,10 +243,13 @@ def select_model_inputs(frame: pd.DataFrame) -> pd.DataFrame:
     if extra:
         raise ValueError(f"Frame carries undeclared columns: {sorted(extra)}")
 
-    return frame[FEATURE_COLUMNS].copy()
+    return frame[target_cols].copy()
 
 
-def select_training_arrays(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+def select_training_arrays(
+    frame: pd.DataFrame,
+    feature_columns: Sequence[str] | None = None,
+) -> tuple[pd.DataFrame, pd.Series]:
     """Extract model feature matrix X and target y for training, safely dropping unsettled targets.
 
     Drops all rows where label y is null, asserts no null remains in y (raising ValueError if
@@ -249,10 +261,12 @@ def select_training_arrays(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series
 
     Args:
         frame: DataFrame produced by build_example_frame or split_by_issue_date.
+        feature_columns: Sequence of feature column names (defaults to FEATURE_COLUMNS).
 
     Returns:
         tuple[pd.DataFrame, pd.Series]: (X, y) where X contains exactly FEATURE_COLUMNS
-                                       and y contains strictly non-null float values.
+                                       (or requested feature_columns) and y contains strictly
+                                       non-null float values.
 
     Raises:
         ValueError: If y is not in frame, if no valid training rows remain, or if any null
@@ -270,39 +284,41 @@ def select_training_arrays(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series
         raise ValueError("Target array 'y' contains null values after dropping unsettled rows")
     assert not y.isna().any()
 
-    X = select_model_inputs(clean_frame)
+    X = select_model_inputs(clean_frame, feature_columns=feature_columns)
     return X, y
 
 
 def load_feature_sources(
     curated_dir: Path | str = CURATED_DIR_DEFAULT,
-    weather_dir: Path | str = WEATHER_DIR_DEFAULT,
+    weather_dir: Path | str | None = WEATHER_DIR_DEFAULT,
     mix_dir: Path | str = MIX_DIR_DEFAULT,
     audit_dir: Path | str | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    require_weather: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame]:
     """Load curated carbon intensity, weather, and generation mix DataFrames.
 
     Args:
         curated_dir: Directory containing curated carbon intensity partitions.
-        weather_dir: Directory containing weather partitions.
+        weather_dir: Directory containing weather partitions (optional if require_weather is False).
         mix_dir: Directory containing generation mix partitions.
         audit_dir: Directory containing audit files (such as source-gaps.csv).
+        require_weather: If True, weather_dir must exist and be non-empty with no nulls
+                         for periods at or after 2024-11-01.
 
     Returns:
-        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: (intensity_df, weather_df, mix_df)
+        tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame]: (intensity_df, weather_df, mix_df)
 
     Raises:
-        FileNotFoundError: If any directory does not exist or contains no parquet partitions.
-        ValueError: If any dataset is empty or if previous-runs weather contains nulls
-                    for periods at or after 2024-11-01.
+        FileNotFoundError: If curated or mix directory does not exist or contains no partitions,
+                           or if weather_dir is required and missing/empty.
+        ValueError: If any required dataset is empty or if previous-runs weather contains nulls
+                    for periods at or after 2024-11-01 when require_weather is True.
     """
     c_path = Path(curated_dir)
-    w_path = Path(weather_dir)
     m_path = Path(mix_dir)
 
     for p, name in [
         (c_path, "curated intensity"),
-        (w_path, "weather"),
         (m_path, "generation mix"),
     ]:
         if not p.exists() or not any(p.glob("date=*.parquet")):
@@ -311,27 +327,39 @@ def load_feature_sources(
             )
 
     intensity_df = pd.read_parquet(c_path)
-    weather_df = pd.read_parquet(w_path)
     mix_df = pd.read_parquet(m_path)
 
     if intensity_df.empty:
         raise ValueError(f"Curated intensity dataset at '{c_path}' is empty.")
-    if weather_df.empty:
-        raise ValueError(f"Weather dataset at '{w_path}' is empty.")
     if mix_df.empty:
         raise ValueError(f"Generation mix dataset at '{m_path}' is empty.")
 
-    w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
-    post_cutoff = w_ts >= pd.Timestamp("2024-11-01 00:00:00+00:00")
-    for col in ("temperature_2m_previous_day1", "temperature_2m_previous_day2"):
-        if col in weather_df.columns:
-            null_mask = post_cutoff & weather_df[col].isna()
-            if null_mask.any():
-                bad_date = weather_df.loc[null_mask, "period_start_utc"].iloc[0]
-                raise ValueError(
-                    f"Previous-runs weather has null {col} at or after 2024-11-01 "
-                    f"(date: {bad_date}). Silent reanalysis fallback is strictly prohibited."
+    weather_df: pd.DataFrame | None = None
+    if weather_dir is not None:
+        w_path = Path(weather_dir)
+        if not w_path.exists() or not any(w_path.glob("date=*.parquet")):
+            if require_weather:
+                raise FileNotFoundError(
+                    f"Source store 'weather' at '{w_path}' is missing or has no partition files."
                 )
+        else:
+            weather_df = pd.read_parquet(w_path)
+            if weather_df.empty and require_weather:
+                raise ValueError(f"Weather dataset at '{w_path}' is empty.")
+            if not weather_df.empty and require_weather:
+                w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
+                post_cutoff = w_ts >= pd.Timestamp("2024-11-01 00:00:00+00:00")
+                for col in ("temperature_2m_previous_day1", "temperature_2m_previous_day2"):
+                    if col in weather_df.columns:
+                        null_mask = post_cutoff & weather_df[col].isna()
+                        if null_mask.any():
+                            bad_date = weather_df.loc[null_mask, "period_start_utc"].iloc[0]
+                            raise ValueError(
+                                f"Previous-runs weather has null {col} at or after 2024-11-01 "
+                                f"(date: {bad_date}). Silent reanalysis fallback is forbidden."
+                            )
+    elif require_weather:
+        raise FileNotFoundError("Weather store is required but weather_dir is None.")
 
     # Report source gaps if recorded
     a_path = (
@@ -425,6 +453,7 @@ def build_example_frame(
     mix_df: pd.DataFrame | None = None,
     issue_times: Sequence[pd.Timestamp] | pd.DatetimeIndex | None = None,
     horizons: Sequence[int] | range = DEFAULT_HORIZONS,
+    include_weather: bool = False,
     require_aux: bool = True,
     trim_leading: bool | None = None,
     weather_series_by_horizon: dict[int, str] | None = None,
@@ -442,12 +471,13 @@ def build_example_frame(
         issue_times: Schedule of issue timestamps. Defaults to one per day at 00:00 UTC
                      across the intensity window.
         horizons: Sequence of horizon steps in half-hours ahead (default: 1..96).
-        require_aux: If True, raises ValueError if any weather or mix column is entirely null
+        include_weather: If True, include weather forecast features in the generated frame.
+        require_aux: If True, raises ValueError if any required auxiliary column is entirely null
                      or if any previous-runs temperature is null at or after 2024-11-01.
 
     Returns:
         pd.DataFrame with keys ('issue_time', 'horizon', 'target_time'), target 'y',
-        and FEATURE_COLUMNS.
+        and FEATURE_COLUMNS (plus WEATHER_FEATURE_COLUMNS if include_weather is True).
     """
     if "period_start_utc" not in intensity_df.columns:
         raise ValueError("intensity_df must contain 'period_start_utc'")
@@ -502,13 +532,6 @@ def build_example_frame(
     target_times_rep = issue_times_rep + pd.to_timedelta(horizons_rep * 30, unit="m")
 
     # 4. Enforce Horizon Contract in code (ADR-011)
-    # The weather forecast series used depends on the horizon:
-    # h <= 48: Open-Meteo previous-runs day-1 forecast (temperature_2m_previous_day1),
-    #          issued at target_time - 24h.
-    # h > 48:  Open-Meteo previous-runs day-2 forecast (temperature_2m_previous_day2),
-    #          issued at target_time - 48h.
-    # Short horizons consume a 24-hour-old forecast, long horizons a 48-hour-old one,
-    # and that is by design.
     lead_hours_by_h: dict[int, int] = {}
     for h in np.unique(horizons_arr):
         s_name = (weather_series_by_horizon or {}).get(
@@ -610,63 +633,64 @@ def build_example_frame(
     # 9. Weather features (Open-Meteo previous-runs per-horizon forecast at target_time)
     # Short horizons consume a 24-hour-old forecast, long horizons a 48-hour-old one,
     # and that is by design.
-    if weather_df is not None:
-        reanalysis_cols = [
-            c for c in weather_df.columns if "reanalysis" in c.lower() or "archive" in c.lower()
-        ]
-        if reanalysis_cols:
-            raise ValueError(
-                f"Weather from archive-api reanalysis is forbidden (found {reanalysis_cols}). "
-                "Must use Open-Meteo previous-runs forecast "
-                "(temperature_2m_previous_day1 / previous_day2)."
-            )
+    if include_weather:
+        if weather_df is not None:
+            reanalysis_cols = [
+                c for c in weather_df.columns if "reanalysis" in c.lower() or "archive" in c.lower()
+            ]
+            if reanalysis_cols:
+                raise ValueError(
+                    f"Weather from archive-api reanalysis is forbidden (found {reanalysis_cols}). "
+                    "Must use Open-Meteo previous-runs forecast "
+                    "(temperature_2m_previous_day1 / previous_day2)."
+                )
 
-        w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
-        weather_stats: dict[str, tuple[pd.Series, pd.Series, pd.Series]] = {}
-        for col_name in ["temperature_2m_previous_day1", "temperature_2m_previous_day2"]:
-            if col_name in weather_df.columns:
-                s = pd.Series(
-                    weather_df[col_name].to_numpy(dtype=float),
-                    index=w_ts,
-                ).sort_index()
-                s_roll = s.rolling("24h", min_periods=1)
-                weather_stats[col_name] = (s, s_roll.mean(), s_roll.min())
+            w_ts = pd.to_datetime(weather_df["period_start_utc"], utc=True)
+            weather_stats: dict[str, tuple[pd.Series, pd.Series, pd.Series]] = {}
+            for col_name in ["temperature_2m_previous_day1", "temperature_2m_previous_day2"]:
+                if col_name in weather_df.columns:
+                    s = pd.Series(
+                        weather_df[col_name].to_numpy(dtype=float),
+                        index=w_ts,
+                    ).sort_index()
+                    s_roll = s.rolling("24h", min_periods=1)
+                    weather_stats[col_name] = (s, s_roll.mean(), s_roll.min())
 
-        containing_hours = target_times_rep.floor("h")
-        temps = np.full(len(result), np.nan, dtype=float)
-        means = np.full(len(result), np.nan, dtype=float)
-        mins = np.full(len(result), np.nan, dtype=float)
+            containing_hours = target_times_rep.floor("h")
+            temps = np.full(len(result), np.nan, dtype=float)
+            means = np.full(len(result), np.nan, dtype=float)
+            mins = np.full(len(result), np.nan, dtype=float)
 
-        for h in np.unique(horizons_arr):
-            h_mask = horizons_rep == h
-            series_name = (weather_series_by_horizon or {}).get(
-                int(h),
-                "temperature_2m_previous_day1" if h <= 48 else "temperature_2m_previous_day2",
-            )
-            if series_name in weather_stats:
-                s, s_mean, s_min = weather_stats[series_name]
-                ch_for_h = containing_hours[h_mask]
-                temp_vals = ch_for_h.map(s).to_numpy(dtype=float)
-                mean_vals = ch_for_h.map(s_mean).to_numpy(dtype=float)
-                min_vals = ch_for_h.map(s_min).to_numpy(dtype=float)
-                # When the hour containing the target is absent from the weather store
-                # or null, the weather feature and both rolling statistics are null.
-                # A 24-hour mean computed over a shorter window is a different statistic
-                # and must not be substituted.
-                missing_mask = np.isnan(temp_vals)
-                mean_vals[missing_mask] = np.nan
-                min_vals[missing_mask] = np.nan
-                temps[h_mask] = temp_vals
-                means[h_mask] = mean_vals
-                mins[h_mask] = min_vals
+            for h in np.unique(horizons_arr):
+                h_mask = horizons_rep == h
+                series_name = (weather_series_by_horizon or {}).get(
+                    int(h),
+                    "temperature_2m_previous_day1" if h <= 48 else "temperature_2m_previous_day2",
+                )
+                if series_name in weather_stats:
+                    s, s_mean, s_min = weather_stats[series_name]
+                    ch_for_h = containing_hours[h_mask]
+                    temp_vals = ch_for_h.map(s).to_numpy(dtype=float)
+                    mean_vals = ch_for_h.map(s_mean).to_numpy(dtype=float)
+                    min_vals = ch_for_h.map(s_min).to_numpy(dtype=float)
+                    # When the hour containing the target is absent from the weather store
+                    # or null, the weather feature and both rolling statistics are null.
+                    # A 24-hour mean computed over a shorter window is a different statistic
+                    # and must not be substituted.
+                    missing_mask = np.isnan(temp_vals)
+                    mean_vals[missing_mask] = np.nan
+                    min_vals[missing_mask] = np.nan
+                    temps[h_mask] = temp_vals
+                    means[h_mask] = mean_vals
+                    mins[h_mask] = min_vals
 
-        result["temperature"] = temps
-        result["temperature_24h_mean"] = means
-        result["temperature_24h_min"] = mins
-    else:
-        result["temperature"] = np.nan
-        result["temperature_24h_mean"] = np.nan
-        result["temperature_24h_min"] = np.nan
+            result["temperature"] = temps
+            result["temperature_24h_mean"] = means
+            result["temperature_24h_min"] = mins
+        else:
+            result["temperature"] = np.nan
+            result["temperature_24h_mean"] = np.nan
+            result["temperature_24h_min"] = np.nan
 
     # 10. Generation mix features (fuel shares lagged to issue_time - 48h)
     mix_lagged_ts = issue_dt_index - pd.Timedelta(hours=48)
@@ -696,19 +720,20 @@ def build_example_frame(
 
     # 11. Auxiliary requirements validation
     if require_aux:
-        for col in ["temperature", "temperature_24h_mean", "temperature_24h_min"]:
-            if result[col].isna().all():
-                raise ValueError(
-                    f"Weather feature column '{col}' is entirely null with require_aux=True."
-                )
+        if include_weather:
+            for col in ["temperature", "temperature_24h_mean", "temperature_24h_min"]:
+                if col in result.columns and result[col].isna().all():
+                    raise ValueError(
+                        f"Weather feature column '{col}' is entirely null with require_aux=True."
+                    )
         for fuel in MIX_FUELS:
             col_name = f"mix_share_{fuel}"
-            if result[col_name].isna().all():
+            if col_name in result.columns and result[col_name].isna().all():
                 raise ValueError(
                     f"Mix feature column '{col_name}' is entirely null with require_aux=True."
                 )
 
-        if weather_df is not None:
+        if include_weather and weather_df is not None:
             w_ts_valid = pd.to_datetime(weather_df["period_start_utc"], utc=True)
             max_available_weather = w_ts_valid.max()
             post_cutoff = (target_times_rep >= pd.Timestamp("2024-11-01 00:00:00+00:00")) & (
@@ -762,13 +787,17 @@ def build_example_frame(
         issue_dates = result["issue_time"].dt.tz_convert(LONDON_TZ).dt.date
         unique_dates = sorted(issue_dates.unique())
 
+        cols_to_check = list(FEATURE_COLUMNS)
+        if include_weather:
+            cols_to_check += [c for c in WEATHER_FEATURE_COLUMNS if c in result.columns]
+
         first_complete_date = None
         for d in unique_dates:
             day_mask = issue_dates == d
             day_df = result[day_mask]
 
             is_complete = True
-            for col in FEATURE_COLUMNS:
+            for col in cols_to_check:
                 null_mask = day_df[col].isna()
                 if not null_mask.any():
                     continue
@@ -800,7 +829,11 @@ def build_example_frame(
             if dropped_dates:
                 result = result[issue_dates >= first_complete_date].copy()
 
-    # Enforce exact column ordering: keys + target y + FEATURE_COLUMNS
+    # Enforce exact column ordering: keys + target y + feature columns
     feature_cols_rest = [c for c in FEATURE_COLUMNS if c != "horizon"]
+    if include_weather:
+        for c in WEATHER_FEATURE_COLUMNS:
+            if c in result.columns and c not in feature_cols_rest:
+                feature_cols_rest.append(c)
     final_cols = ["issue_time", "horizon", "target_time", "y"] + feature_cols_rest
     return result[final_cols].copy()

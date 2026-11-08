@@ -626,3 +626,47 @@ def test_cli_eval_reproduce_subcommand(
     assert "Reproduction check failed: Delta exceeded tolerance" in captured
 
 
+def test_v2_fixture_retains_v1_and_shares_truth_columns() -> None:
+    """Verify v1 is retained on disk and v2 shares truth columns byte-for-byte with v1."""
+    v1_parquet = Path("data/eval/frozen_split_v1.parquet")
+    v1_sidecar = Path("data/eval/frozen_split_v1.json")
+    assert v1_parquet.exists(), "v1 fixture must be retained on disk"
+    assert v1_sidecar.exists(), "v1 sidecar must be retained on disk"
+
+    v2_parquet = Path("data/eval/frozen_split_v2.parquet")
+    v2_sidecar = Path("data/eval/frozen_split_v2.json")
+    assert v2_parquet.exists(), "v2 fixture must exist on disk"
+    assert v2_sidecar.exists(), "v2 sidecar must exist on disk"
+
+    v1_df = pd.read_parquet(v1_parquet)
+    v2_df = pd.read_parquet(v2_parquet)
+
+    truth_columns = [
+        "issue_time",
+        "horizon",
+        "target_time",
+        "actual",
+        "neso_forecast",
+        "persistence_pred",
+        "seasonal_naive_pred",
+    ]
+    for col in truth_columns:
+        assert v1_df[col].equals(v2_df[col]), f"Truth column {col} mismatch between v1 and v2"
+        if pd.api.types.is_datetime64_any_dtype(v1_df[col]):
+            b1 = v1_df[col].astype("int64").to_numpy().tobytes()
+            b2 = v2_df[col].astype("int64").to_numpy().tobytes()
+        else:
+            b1 = v1_df[col].to_numpy().tobytes()
+            b2 = v2_df[col].to_numpy().tobytes()
+        assert hashlib.sha256(b1).hexdigest() == hashlib.sha256(b2).hexdigest(), (
+            f"Truth column {col} byte hash mismatch between v1 and v2"
+        )
+
+    # Assert candidate_pred changed
+    assert not v1_df["candidate_pred"].equals(v2_df["candidate_pred"])
+
+    # Evaluate v2
+    res = evaluate_from_fixture(parquet_path=v2_parquet, sidecar_path=v2_sidecar, verbose=False)
+    assert math.isclose(res.gate_value, 39.118459, abs_tol=1e-5)
+
+

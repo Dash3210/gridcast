@@ -1,5 +1,5 @@
 {
   "archive_commit": "3617143",
-  "parquet_sha256": "205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4",
-  "model_artifact_sha256": "5ddfe624a05dee49fa2ec339f6d22ba4ad6783dfcb1ea30eb7bca4a501e19e15"
+  "parquet_sha256": "87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51",
+  "model_artifact_sha256": "1cd13471d793735748f81d17fb195e34f6f784e8f642ac60a16f016280c45310"
 }

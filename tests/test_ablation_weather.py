@@ -28,7 +28,7 @@ from gridcast.backtest import (
     run_weather_ablation,
 )
 from gridcast.cli import main, run_ablation_weather_cli
-from gridcast.features import FEATURE_COLUMNS
+from gridcast.features import FEATURE_COLUMNS, WEATHER_FEATURE_COLUMNS
 
 
 def test_ablation_decision_rule_logic() -> None:
@@ -86,7 +86,8 @@ def test_treatment_arm_feature_selection() -> None:
     weather_cols = ["temperature", "temperature_24h_mean", "temperature_24h_min"]
     treatment_cols = [c for c in FEATURE_COLUMNS if c not in weather_cols]
 
-    assert len(treatment_cols) == len(FEATURE_COLUMNS) - 3
+    assert len(treatment_cols) == 26
+    assert len(FEATURE_COLUMNS) == 26
     for col in weather_cols:
         assert col not in treatment_cols
     assert "horizon" in treatment_cols
@@ -113,7 +114,7 @@ def test_control_arm_precondition_guard_failure(monkeypatch: pytest.MonkeyPatch)
         "target_time": fixture_df["target_time"],
         "y": fixture_df["actual"],
     })
-    for col in FEATURE_COLUMNS:
+    for col in list(FEATURE_COLUMNS) + list(WEATHER_FEATURE_COLUMNS):
         if col != "horizon":
             dummy_frame[col] = 1.0
 
@@ -164,7 +165,7 @@ def test_ablation_mocked_clean_execution(monkeypatch: pytest.MonkeyPatch) -> Non
         "target_time": fixture_df["target_time"],
         "y": fixture_df["actual"],
     })
-    for col in FEATURE_COLUMNS:
+    for col in list(FEATURE_COLUMNS) + list(WEATHER_FEATURE_COLUMNS):
         if col != "horizon":
             dummy_frame[col] = 1.0
 
@@ -188,7 +189,7 @@ def test_ablation_mocked_clean_execution(monkeypatch: pytest.MonkeyPatch) -> Non
         booster = MagicMock()
 
         def mock_predict(X: pd.DataFrame) -> np.ndarray:
-            is_control = len(X.columns) == len(FEATURE_COLUMNS)
+            is_control = len(X.columns) > len(FEATURE_COLUMNS)
             origin_val = unique_origins[current_fold_idx]
             fold_sub = fixture_df[fixture_df["issue_time"] == origin_val].sort_values("horizon")
             preds = fold_sub["candidate_pred"].to_numpy(dtype=float)

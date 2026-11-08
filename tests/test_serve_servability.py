@@ -33,24 +33,65 @@ def test_resolved_feature_set_equals_booster_declared_set_exactly() -> None:
         assert not resolved_df[col].isna().all(), f"Feature '{col}' is entirely null"
 
 
-def test_startup_fails_naming_missing_feature_when_weather_source_removed(
+def test_startup_succeeds_when_weather_source_absent(
     tmp_path: Path,
 ) -> None:
-    """Assert startup refuses to start naming 'temperature' when weather is removed."""
+    """Assert startup servability check succeeds when weather store is absent."""
     booster = load_model_booster()
-    assert "temperature" in booster.feature_name(), (
-        "Precondition: booster must declare 'temperature'"
+    assert "temperature" not in booster.feature_name(), (
+        "Precondition: booster artifact lgbm-v2 must not declare 'temperature'"
     )
+    assert len(booster.feature_name()) == 26
 
     empty_weather_dir = tmp_path / "empty_weather"
     empty_weather_dir.mkdir(parents=True)
-    # Assert injection took effect: empty directory has no partitions
     assert not list(empty_weather_dir.glob("date=*.parquet"))
+
+    # Service startup check succeeds with empty weather dir and weather_df=None
+    resolved_df = check_startup_servability(
+        issue_time=SAMPLE_ISSUE_DATE,
+        booster=booster,
+        weather_dir=empty_weather_dir,
+        weather_df=None,
+    )
+    assert isinstance(resolved_df, pd.DataFrame)
+    assert len(resolved_df) == 96
+    assert list(resolved_df.columns) == booster.feature_name()
+
+    # Service startup check also succeeds with weather_dir=None
+    resolved_none = check_startup_servability(
+        issue_time=SAMPLE_ISSUE_DATE,
+        booster=booster,
+        weather_dir=None,
+        weather_df=None,
+    )
+    assert list(resolved_none.columns) == booster.feature_name()
+
+
+def test_startup_refuses_when_booster_declares_unobtainable_weather_feature(
+    tmp_path: Path,
+) -> None:
+    """Assert startup refuses if booster artifact declares weather but source is missing."""
+    X = pd.DataFrame({
+        "horizon": [1.0, 2.0],
+        "temperature": [15.0, 16.0],
+    })
+    y = np.array([100.0, 120.0])
+    ds = lgb.Dataset(X, label=y)
+    weather_declaring_booster = lgb.train(
+        {"objective": "regression_l1", "verbose": -1, "min_data_in_bin": 1, "min_data_in_leaf": 1},
+        ds,
+        num_boost_round=1,
+    )
+    assert "temperature" in weather_declaring_booster.feature_name()
+
+    empty_weather_dir = tmp_path / "empty_weather"
+    empty_weather_dir.mkdir(parents=True)
 
     with pytest.raises(RuntimeError) as excinfo:
         check_startup_servability(
             issue_time=SAMPLE_ISSUE_DATE,
-            booster=booster,
+            booster=weather_declaring_booster,
             weather_dir=empty_weather_dir,
             weather_df=None,
         )

@@ -9,6 +9,7 @@ Provides:
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
@@ -224,6 +225,7 @@ def train_lgbm(
     y_train: pd.Series | np.ndarray,
     params: dict[str, object] | None = None,
     num_boost_round: int = 100,
+    feature_columns: Sequence[str] | None = None,
 ) -> lgb.Booster:
     """Train native LightGBM regressor on feature matrix X and target y.
 
@@ -232,11 +234,12 @@ def train_lgbm(
         y_train: Non-null target series of carbon intensity actuals.
         params: LightGBM training hyperparameters (defaults to DEFAULT_LGBM_PARAMS).
         num_boost_round: Number of boosting iterations.
+        feature_columns: Optional explicit feature columns sequence (defaults to FEATURE_COLUMNS).
 
     Returns:
         Trained LightGBM Booster artifact.
     """
-    X_mat = select_model_inputs(X_train)
+    X_mat = select_model_inputs(X_train, feature_columns=feature_columns)
     y_vec = np.asarray(y_train, dtype=float)
 
     if np.isnan(y_vec).any():
@@ -255,17 +258,22 @@ def train_lgbm(
     return booster
 
 
-def predict_lgbm(booster: lgb.Booster, X_test: pd.DataFrame) -> np.ndarray:
+def predict_lgbm(
+    booster: lgb.Booster,
+    X_test: pd.DataFrame,
+    feature_columns: Sequence[str] | None = None,
+) -> np.ndarray:
     """Generate predictions from native LightGBM booster.
 
     Args:
         booster: Trained LightGBM Booster artifact.
         X_test: Test features DataFrame containing FEATURE_COLUMNS.
+        feature_columns: Optional explicit feature columns sequence (defaults to FEATURE_COLUMNS).
 
     Returns:
         Array of predicted carbon intensity values.
     """
-    X_mat = select_model_inputs(X_test)
+    X_mat = select_model_inputs(X_test, feature_columns=feature_columns)
     preds: np.ndarray = np.asarray(booster.predict(X_mat), dtype=float)
     return preds
 
@@ -280,7 +288,7 @@ def model_artifact_hash(booster: lgb.Booster) -> str:
     return hashlib.sha256(model_str.encode("utf-8")).hexdigest()
 
 
-MODEL_VERSION: Final[str] = "lgbm-v1"
+MODEL_VERSION: Final[str] = "lgbm-v2"
 
 
 def get_model_version() -> str:

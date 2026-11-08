@@ -323,8 +323,8 @@
   - Validating contract functions against their own declared return values (rejected: permits false green test suites when declarations lie about their bounds).
 
 ## ADR-018 — Serving risk: train/serve lead distribution mismatch on weather features
-- Status: accepted (weather features dropped per pre-registered ablation; removal implementation queued for next round)
-- Date: 2026-11-02 (opened 2026-11-02, review updated 2026-11-07, ablation concluded 2026-11-08)
+- Status: implemented
+- Date: 2026-11-02 (opened 2026-11-02, review updated 2026-11-07, ablation concluded 2026-11-08, implemented 2026-11-08)
 - Context:
   At inference the targets are in the future, and the previous-runs series has no future values. The weather available for `T+h` at serve time is the current model run with lead `h`, not the day-1/day-2 series the frame trains on with lead `>= 24h`.
   Training and serving therefore use different lead distributions, so "the model has weather features" is true in training and not true as stated for the service.
@@ -368,11 +368,13 @@
      - Weather is better across roughly `h = 82..93` (+11% to +15% degradation without weather, e.g., h=82 is +12.44%, h=88 is +13.73%, h=89 is +14.56%).
      The pre-registered rule is an unweighted mean test across horizons and it says DROP. A horizon-weighted rule that placed high premium on day-2 evening peak hours (h=82..93) would have decided differently. However, we do not re-decide after observing the data: the rule was fixed in advance as an unweighted mean test, both aggregate and tail conditions hold, and DROP stands.
 - Decision:
-  DROP weather features from the production feature set, implemented in the next round.
-  ADR-018 stays (weather does buy something in a band), so it is closed by rule, not deleted.
-  In this round (Phase P4-c), the decision is formally recorded without modifying the production model, serve feature list, or frozen fixture. Code changes to remove weather columns, refreeze fixture v2, and update documentation will execute in the subsequent round.
-- Caveat:
-  Until the removal implementation round is completed, models in the repository remain on v1 feature set.
+  DROP weather features from the production feature set.
+  Implementation details (Phase P4-d):
+  - Dropped `temperature`, `temperature_24h_mean`, and `temperature_24h_min` from `FEATURE_COLUMNS`, reducing feature count from 29 to 26.
+  - `build_example_frame` updated with `include_weather=False` as default, constructing the canonical feature frame without requiring weather inputs or store (`weather_df=None` supported).
+  - Serving servability check `check_startup_servability` and `resolve_features_for_issue` in `src/gridcast/serve.py` no longer declare or require weather dependencies, enabling the service to start with the weather store absent.
+  - Retrained production model artifact `data/models/lgbm_model.txt` with 26 features across full window as `lgbm-v2` (content SHA-256 `1cd13471d793735748f81d17fb195e34f6f784e8f642ac60a16f016280c45310`, git object `fe838f87dac4cb5412f5118600353b5293d52cd4`).
+  - Refrozen evaluation fixture as `data/eval/frozen_split_v2.parquet` + sidecar JSON with candidate GATE_VALUE `39.118459` (SHA-256 `87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51`, archive commit `3617143`, window 2026-09-05 to 2026-11-01, 15 origins).
 - Alternatives rejected:
   - Keeping weather features (rejected: buys only 0.086 gCO2/kWh or 0.22% overall and +0.86% over h >= 48, satisfying both DROP conditions; creates serving complexity and irreconcilable train/serve lead distribution mismatch).
   - Deleting ADR-018 (rejected: weather does buy something in a band; ADR-018 is retained and closed by rule).
@@ -514,7 +516,8 @@
      The candidate and baseline predictions are frozen alongside the realised actuals (`candidate_pred`, `neso_forecast`, `persistence_pred`, `seasonal_naive_pred`). The fixture pins the metric and the ground truth, not the training run; only `make eval-refresh` can regenerate predictions, and the sidecar's environment versions (python, lightgbm, pandas, numpy) and hyperparameters make that reproducible. If the model or feature set changes, a new version file (`v2`) must be written; `v1` is never edited.
   5. Published number authority and guard blind spot: `data/eval/` is the single authority for all published figures. `tests/test_model_card_consistency.py` computes numbers from `data/eval/` at test time. The fixture file `tests/fixtures/frozen_split_metrics.json` is reduced to recorded hashes only. Previously, the consistency guard had a blind spot: comparing against a static metrics JSON could not detect when live backtests drifted against an updated archive; pinning the frozen fixture directly eliminates the blind spot against silent live run drift.
   6. All published numbers are restated with full provenance:
-     `frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins`.
+     `frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins`.
+     Fixture v2 was refrozen after dropping weather features per ADR-018. Fixture v1 is retired but retained on disk. Ground truth is shared and asserted identical byte-for-byte (`actual`, `neso_forecast`, `persistence_pred`, `seasonal_naive_pred`); only `candidate_pred` was updated for the 26-feature retrain (GATE_VALUE 39.118459).
   7. Model reproduction check (`make eval-reproduce`):
      Retraining the 15 folds on the frozen origins from the canonical feature frame reproduces the fixture bitwise identically:
      - Per-row `candidate_pred` max absolute difference: 0.0 (tolerance pinned to 0.0)
