@@ -98,8 +98,11 @@ def test_health_endpoint_healthy(client: TestClient) -> None:
     assert "interval_sha256" in data
     assert "served_issue_time" in data
     assert "is_current_issue" in data
-    assert data.get("served_issue_time") == "2026-11-07T00:00:00+00:00"
-    assert data.get("is_current_issue") is False
+    served = pd.Timestamp(data["served_issue_time"])
+    assert served == issue_time_for_date(served.tz_convert(LONDON_TZ).date())
+    assert data.get("is_current_issue") == (
+        served == issue_time_for_date(datetime.now(LONDON_TZ).date())
+    )
 
 
 def test_health_endpoint_stays_200_when_data_older_than_48h(tmp_path: Path) -> None:
@@ -725,18 +728,24 @@ def test_serve_additional_coverage(client: TestClient, tmp_path: Path) -> None:
 
 
 def test_forecast_default_serves_fallback_with_named_gap(client: TestClient) -> None:
-    """GET /forecast on default date serves newest buildable issue and labels fallback."""
-    response = client.get("/forecast")
+    """With a future 'today', the default serves the newest issue and labels the fallback."""
+    from unittest.mock import patch
+
+    class FutureDateTime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> FutureDateTime:
+            return cls(2026, 12, 1, 0, 0, 0, tzinfo=tz or timezone.utc)
+
+    with patch("gridcast.serve.datetime", FutureDateTime):
+        response = client.get("/forecast")
     assert response.status_code == 200
     data = response.json()
 
     assert "issue_time" in data
-    assert data["issue_time"] == "2026-11-07T00:00:00+00:00"
-    assert "generated_at" in data
     assert data["is_current_issue"] is False
     assert "fallback_reason" in data
     assert "actual_recent_3h" in data["fallback_reason"]
-    assert "2026-11-08" in data["fallback_reason"]
+    assert "2026-12-01" in data["fallback_reason"]
     assert "retrospective_horizons" in data
     assert data["retrospective_horizons"] > 0
     gen_ts = pd.Timestamp(data["generated_at"])
@@ -751,13 +760,13 @@ def test_forecast_default_serves_fallback_with_named_gap(client: TestClient) -> 
 
 
 def test_forecast_explicit_today_unbuildable_returns_503(client: TestClient) -> None:
-    """GET /forecast?date=2026-11-08 returns 503 FeatureSourceGapError without falling back."""
-    response = client.get("/forecast?date=2026-11-08")
+    """GET /forecast?date=<future> returns 503 FeatureSourceGapError without falling back."""
+    response = client.get("/forecast?date=2027-01-01")
     assert response.status_code == 503
     data = response.json()
     assert data.get("error") == "FeatureSourceGapError"
     assert "actual_recent_3h" in str(data.get("detail"))
-    assert "2026-11-08" in str(data.get("detail"))
+    assert "2027-01-01" in str(data.get("detail"))
 
 
 def test_served_issue_anchor_always_local_midnight(client: TestClient) -> None:
@@ -1106,17 +1115,33 @@ def test_ready_endpoint_returns_200_and_503_based_on_served_issue_age() -> None:
 
     app_instance = create_app()
 
-    # 1. Fresh issue: simulate time within 27h of served issue (e.g. 20h) -> 200
-    class FreshDateTime(datetime):
-        @classmethod
-        def now(cls, tz: Any = None) -> FreshDateTime:
-            # 20 hours after 2026-11-07 00:00:00 is 2026-11-07 20:00:00 (< 27h)
-            if tz is not None:
-                return cls(2026, 11, 7, 20, 0, 0, tzinfo=tz)
-            return cls(2026, 11, 7, 20, 0, 0, tzinfo=timezone.utc)
+    # Derive the clock from the issue the app actually serves, not from a fixed calendar date.
+    with TestClient(app_instance) as c0:
+        served = pd.Timestamp(c0.get("/ready").json()["served_issue_time"])
 
+    def make_clock(offset_hours: int) -> type[datetime]:
+        moment = served.to_pydatetime() + timedelta(hours=offset_hours)
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz: Any = None) -> Clock:
+                target = moment.astimezone(tz) if tz is not None else moment
+                return cls(
+                    target.year,
+                    target.month,
+                    target.day,
+                    target.hour,
+                    target.minute,
+                    target.second,
+                    target.microsecond,
+                    tzinfo=target.tzinfo,
+                )
+
+        return Clock
+
+    # 1. Fresh issue: 20h after the served issue -> 200
     with (
-        patch("gridcast.serve.datetime", FreshDateTime),
+        patch("gridcast.serve.datetime", make_clock(20)),
         TestClient(app_instance) as c,
     ):
         resp = c.get("/ready")
@@ -1136,17 +1161,9 @@ def test_ready_endpoint_returns_200_and_503_based_on_served_issue_age() -> None:
             age_fam.samples[0].value, data["served_issue_age_seconds"], rel_tol=1e-3
         )
 
-    # 2. Stale issue: simulate served issue older than 27h (e.g. 35h) -> 503
-    class StaleDateTime(datetime):
-        @classmethod
-        def now(cls, tz: Any = None) -> StaleDateTime:
-            # 35 hours after 2026-11-07 00:00:00 is 2026-11-08 11:00:00 (> 27h)
-            if tz is not None:
-                return cls(2026, 11, 8, 11, 0, 0, tzinfo=tz)
-            return cls(2026, 11, 8, 11, 0, 0, tzinfo=timezone.utc)
-
+    # 2. Stale issue: 72h after the served issue, so today's issue cannot be built -> 503
     with (
-        patch("gridcast.serve.datetime", StaleDateTime),
+        patch("gridcast.serve.datetime", make_clock(72)),
         TestClient(app_instance) as c_stale,
     ):
         resp_stale = c_stale.get("/ready")
