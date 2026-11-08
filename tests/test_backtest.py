@@ -12,6 +12,8 @@ Implements all five evaluation-integrity requirements:
 from __future__ import annotations
 
 import json
+import platform
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -446,13 +448,27 @@ def math_isclose(a: float, b: float, tol: float = 1e-9) -> bool:
 def test_golden_backtest_metrics_stability() -> None:
     """Requirement 4: Golden-file test on a frozen 30-day window.
 
-    Asserts byte-stable metrics with fixed seed so any evaluation drift is visible as a diff.
+    Asserts byte-stable metrics within a platform, with fixed seed, so evaluation drift shows as a
+    diff. Each platform records its own golden: the compiled LightGBM wheel for Linux and the one
+    for Windows produce different numbers on this window even with identical library versions.
     """
     fixture_path = Path("tests/fixtures/golden_backtest_metrics.json")
     assert fixture_path.exists(), f"Missing golden fixture: {fixture_path}"
 
     with open(fixture_path, encoding="utf-8") as f:
-        golden = json.load(f)
+        data = json.load(f)
+
+    # The golden is per platform. The Linux and Windows LightGBM wheels disagree by ~6% on this
+    # window with identical library versions and num_threads=1, because the compiled histogram code
+    # differs. One number would pass only where it was recorded.
+    machine = platform.machine().lower()
+    if machine in ("amd64", "x86_64"):
+        machine = "x86_64"
+    key = f"{sys.platform}-{machine}"
+    assert key in data["platforms"], (
+        f"No golden recorded for platform {key!r}. Record one deliberately, do not widen the rest."
+    )
+    golden = data["platforms"][key]
 
     intensity_df, weather_df, mix_df = load_feature_sources()
     schedule = default_issue_schedule("2024-11-08", "2025-07-15")
