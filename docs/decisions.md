@@ -323,29 +323,61 @@
   - Validating contract functions against their own declared return values (rejected: permits false green test suites when declarations lie about their bounds).
 
 ## ADR-018 — Serving risk: train/serve lead distribution mismatch on weather features
-- Status: open (pending weather-removal ablation)
-- Date: 2026-11-02 (opened 2026-11-02, review updated 2026-11-07)
+- Status: accepted (weather features dropped per pre-registered ablation; removal implementation queued for next round)
+- Date: 2026-11-02 (opened 2026-11-02, review updated 2026-11-07, ablation concluded 2026-11-08)
 - Context:
   At inference the targets are in the future, and the previous-runs series has no future values. The weather available for `T+h` at serve time is the current model run with lead `h`, not the day-1/day-2 series the frame trains on with lead `>= 24h`.
   Training and serving therefore use different lead distributions, so "the model has weather features" is true in training and not true as stated for the service.
-- Evidence & Ablation:
-  Measured on the frozen 15-origin split (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins), same frame builder, same origins, same parameters; only the weather timestamps moved by +24h:
-  ```
-  baseline (current weather join)       39.032
-  weather values lagged a further 24h   38.279
-  delta                                 -0.753 gCO2/kWh   (-1.93%)
-  materiality threshold                 5.00%
-  ```
-  Two things that keep this honest:
-  - The baseline reproduces today's `make eval` exactly (39.032 gCO2/kWh), so the ablation is the same evaluation with one input degraded, not a different experiment.
-  - The sign is negative: staler weather scored better. The feature is weakly used at these leads, and the result bounds the train/serve MISALIGNMENT, not the feature's informativeness. Do not write that weather is important. This measurement does not support that claim.
+- Evidence & Ablations:
+  1. Lead Misalignment Ablation (stale vs current):
+     Measured on the frozen 15-origin split (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins), same frame builder, same origins, same parameters; only the weather timestamps moved by +24h:
+     ```
+     baseline (current weather join)       39.032
+     weather values lagged a further 24h   38.279
+     delta                                 -0.753 gCO2/kWh   (-1.93%)
+     materiality threshold                 5.00%
+     ```
+     This bounded lead sensitivity and demonstrated that weather features are weakly utilized at these horizons.
+  2. Weather Removal Ablation (Phase P4-c, does weather earn its place?):
+     Pre-registered decision rule (amended before results were read):
+     Let `W` = GATE_VALUE with weather (Control arm) and `N` = GATE_VALUE without weather (Treatment arm), scored on frozen fixture v1.
+     The decision rule as applied has two conditions, where the second condition was added before the result was read:
+     - Condition 1 (aggregate): `N <= 1.02W` (no-weather GATE_VALUE is within 2.0% of weather)
+     - Condition 2 (tail / long horizons): `N_long <= 1.05W_long` over `h >= 48` (no-weather mean MAE over `h >= 48` is within 5.0% of weather)
+     - Decision criteria: DROP weather only if both conditions hold; otherwise KEEP weather.
+     Rationale: ADR-021 demands closing 30% of a 48.127 gap (14.438 gCO2/kWh). 2.0% of 39.03 is ~0.78 gCO2/kWh, ~5% of what the gate demands. A feature buying less than a twentieth of gate demand does not justify an external serving dependency that cannot reproduce its training distribution. The secondary condition over `h >= 48` bounds long-horizon degradation to 5.0% to guard against tail collapse.
+     Precondition verified: Control arm reproduces frozen fixture v1 bitwise (max candidate delta: 0.00000000, GATE_VALUE: 39.032478 gCO2/kWh).
+     Measured ablation results (15 folds, 100 boost rounds, seed=42, deterministic):
+     ```
+     Control arm (W, with weather)          39.032478 gCO2/kWh
+     Treatment arm (N, without weather)     39.118459 gCO2/kWh
+     Delta (N - W)                          +0.085981 gCO2/kWh   (+0.22%)
+     2.0% aggregate limit (1.02 * W)        39.813127 gCO2/kWh   (Condition 1: PASS, 39.118459 <= 39.813127)
+     h >= 48  W 38.0234  N 38.3512  delta   +0.328 gCO2/kWh      (+0.86%)
+     5.0% tail limit (1.05 * W_long)        39.9246 gCO2/kWh     (Condition 2: PASS, 38.3512 <= 39.9246)
+     Decision Rule Applied                  DROP (both conditions satisfied)
+     ```
+     Key horizons:
+     - `h = 1`:  W = 13.2536, N = 12.9836, delta = -0.2700 gCO2/kWh (-2.04%)
+     - `h = 2`:  W = 13.9344, N = 13.9959, delta = +0.0615 gCO2/kWh (+0.44%)
+     - `h = 48`: W = 53.9933, N = 54.0323, delta = +0.0390 gCO2/kWh (+0.07%)
+     - `h = 96`: W = 39.1453, N = 36.6272, delta = -2.5181 gCO2/kWh (-6.43%)
+  3. Horizon-band tension:
+     The per-horizon data exhibits a clear structural tension across horizon bands:
+     - No-weather is better at `h = 96` (-6.43%, -2.518 gCO2/kWh) and across roughly `h = 49..65` (e.g., h=52 is -4.31%, h=60 is -5.56%, h=62 is -5.87%, h=63 is -6.31%).
+     - Weather is better across roughly `h = 82..93` (+11% to +15% degradation without weather, e.g., h=82 is +12.44%, h=88 is +13.73%, h=89 is +14.56%).
+     The pre-registered rule is an unweighted mean test across horizons and it says DROP. A horizon-weighted rule that placed high premium on day-2 evening peak hours (h=82..93) would have decided differently. However, we do not re-decide after observing the data: the rule was fixed in advance as an unweighted mean test, both aggregate and tail conditions hold, and DROP stands.
 - Decision:
-  Serve the current-run forecast for `T+h`, and record the lead actually used per horizon on every forecast row.
+  DROP weather features from the production feature set, implemented in the next round.
+  ADR-018 stays (weather does buy something in a band), so it is closed by rule, not deleted.
+  In this round (Phase P4-c), the decision is formally recorded without modifying the production model, serve feature list, or frozen fixture. Code changes to remove weather columns, refreeze fixture v2, and update documentation will execute in the subsequent round.
 - Caveat:
-  No artifact or service documentation may claim that weather features ship in production without the explicit caveat that short horizons receive forecast lead $h$ at inference while trained on lead $\ge 24$h.
-- Alternatives rejected / deferred:
+  Until the removal implementation round is completed, models in the repository remain on v1 feature set.
+- Alternatives rejected:
+  - Keeping weather features (rejected: buys only 0.086 gCO2/kWh or 0.22% overall and +0.86% over h >= 48, satisfying both DROP conditions; creates serving complexity and irreconcilable train/serve lead distribution mismatch).
+  - Deleting ADR-018 (rejected: weather does buy something in a band; ADR-018 is retained and closed by rule).
+  - Re-deciding based on horizon-band weighting (rejected: violates pre-registration integrity; rule is a mean test).
   - Restricting the product to horizons $\ge 24$h (rejected: forfeits 48 half-hours essential for system balancing).
-  - Dropping weather features entirely (status: open pending weather-removal ablation queued next; the stale-vs-current experiment bounds lead sensitivity and nothing else).
 
 ## ADR-019 — Evaluation gate: single scalar threshold fixed from validation split
 - Status: accepted

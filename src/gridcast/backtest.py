@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -26,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from gridcast.features import (
+    FEATURE_COLUMNS,
     build_example_frame,
     default_issue_schedule,
     issue_time_for_date,
@@ -54,6 +56,7 @@ __all__: list[str] = [
     "TEST_SPLIT_END_DATE",
     "TEST_SPLIT_START_DATE",
     "TEST_SPLIT_STEP_DAYS",
+    "WeatherAblationResults",
     "assert_fold_training_integrity",
     "assert_refresh_window_eligibility",
     "check_sidecar_library_versions",
@@ -62,6 +65,7 @@ __all__: list[str] = [
     "compute_per_horizon_metrics",
     "compute_skill_score",
     "derive_test_split_origins",
+    "emit_weather_ablation_table",
     "evaluate_from_fixture",
     "evaluate_gap_gate",
     "evaluate_gate",
@@ -69,6 +73,7 @@ __all__: list[str] = [
     "refresh_eval_fixture",
     "reproduce_eval_fixture",
     "run_rolling_origin_backtest",
+    "run_weather_ablation",
     "verify_fixture_integrity",
 ]
 
@@ -1173,5 +1178,382 @@ def reproduce_eval_fixture(
         "elapsed_seconds": elapsed,
         "mismatches": mismatches,
     }
+
+
+def emit_weather_ablation_table(
+    per_h_df: pd.DataFrame,
+    doc_path: Path | str,
+) -> Path:
+    """Write generated per-horizon table directly into markdown document between markers.
+
+    Prose outside the markers remains unchanged.
+    """
+    path = Path(doc_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Document not found at {path}")
+
+    content = path.read_text(encoding="utf-8")
+    begin_marker = "<!-- BEGIN GENERATED TABLE -->"
+    end_marker = "<!-- END GENERATED TABLE -->"
+
+    if begin_marker not in content or end_marker not in content:
+        raise ValueError(
+            f"Document {path} must contain '{begin_marker}' and '{end_marker}' markers."
+        )
+
+    header = (
+        "| Horizon | Control MAE ($W$) | Treatment MAE ($N$) | Delta ($N - W$) | "
+        "Delta (%) | NESO MAE | Persistence MAE | Seasonal-Naive MAE |"
+    )
+    lines: list[str] = [
+        header,
+        "|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
+    ]
+    for _, r in per_h_df.sort_values("horizon").iterrows():
+        h = int(r["horizon"])
+        w = float(r["control_mae"])
+        n = float(r["treatment_mae"])
+        d = float(r["delta"])
+        pct = float(r["delta_pct"])
+        o = float(r["operator_mae"])
+        p = float(r["persistence_mae"])
+        s = float(r["seasonal_naive_mae"])
+        lines.append(
+            f"| {h} | {w:.4f} | {n:.4f} | {d:+.4f} | {pct:+.2f}% | {o:.4f} | {p:.4f} | {s:.4f} |"
+        )
+
+    table_block = f"{begin_marker}\n" + "\n".join(lines) + f"\n{end_marker}"
+
+    pattern = re.compile(
+        re.escape(begin_marker) + r".*?" + re.escape(end_marker),
+        re.DOTALL,
+    )
+    new_content = pattern.sub(table_block, content, count=1)
+    path.write_text(new_content, encoding="utf-8")
+    return path
+
+
+@dataclass(frozen=True)
+class WeatherAblationResults:
+    """Results container for pre-registered weather removal ablation (Phase P4-c)."""
+
+    control_gate_value: float
+    treatment_gate_value: float
+    delta_gate_value: float
+    delta_percent: float
+    decision: str
+    max_control_delta: float
+    decision_threshold_percent: float
+    per_horizon_table: pd.DataFrame
+    operator_gate_value: float
+    persistence_gate_value: float
+    seasonal_naive_gate_value: float
+    key_horizons: dict[int, dict[str, float]]
+    elapsed_seconds: float
+    control_long_gate_value: float = 0.0
+    treatment_long_gate_value: float = 0.0
+    delta_long_gate_value: float = 0.0
+    delta_long_percent: float = 0.0
+
+
+def run_weather_ablation(
+    parquet_path: Path | str = DEFAULT_EVAL_FIXTURE_PARQUET,
+    sidecar_path: Path | str = DEFAULT_EVAL_FIXTURE_SIDECAR,
+    output_doc: Path | str | None = None,
+    max_control_tolerance: float = 0.0,
+    decision_threshold_percent: float = 2.0,
+    verbose: bool = True,
+) -> WeatherAblationResults:
+    """Execute pre-registered weather removal ablation benchmark (Phase P4-c).
+
+    Arms:
+    1. Control arm (W): LightGBM model trained with weather features. Precondition:
+       reproduces frozen fixture bitwise (max candidate delta <= max_control_tolerance).
+    2. Treatment arm (N): LightGBM model trained without weather features.
+       Method: Drops weather columns ('temperature', 'temperature_24h_mean', 'temperature_24h_min')
+       before training and prediction, because build_example_frame requires auxiliary weather
+       inputs and populates NaNs when absent.
+
+    Decision Rule (fixed before run):
+        DROP weather if N <= W * 1.02  (no-weather is equal, better, or worse by < 2.0%)
+        KEEP weather if N >  W * 1.02
+    """
+    import time
+
+    t0 = time.perf_counter()
+
+    meta = verify_fixture_integrity(parquet_path=parquet_path, sidecar_path=sidecar_path)
+    fixture_res = evaluate_from_fixture(
+        parquet_path=parquet_path,
+        sidecar_path=sidecar_path,
+        verbose=False,
+    )
+    fixture_df = pd.read_parquet(parquet_path)
+    fixture_df["issue_time"] = pd.to_datetime(fixture_df["issue_time"], utc=True)
+
+    if verbose:
+        print("Loading feature sources for weather removal ablation...")
+    intensity_df, weather_df, mix_df = load_feature_sources()
+
+    start_date = str(meta.get("window_start", TEST_SPLIT_START_DATE))
+    end_date = str(meta.get("window_end", TEST_SPLIT_END_DATE))
+    origins = derive_test_split_origins(start_date, end_date)
+    schedule = default_issue_schedule("2024-11-08", end_date)
+
+    if verbose:
+        print(f"Building example frame across {len(schedule)} issues...")
+    frame = build_example_frame(
+        intensity_df=intensity_df,
+        weather_df=weather_df,
+        mix_df=mix_df,
+        issue_times=schedule,
+        require_aux=True,
+    )
+
+    control_feature_cols = list(FEATURE_COLUMNS)
+    weather_cols = ["temperature", "temperature_24h_mean", "temperature_24h_min"]
+    treatment_feature_cols = [c for c in FEATURE_COLUMNS if c not in weather_cols]
+
+    num_boost_round = int(meta.get("num_boost_round", 100))
+    lgbm_params = meta.get("lgbm_params")
+    merged_params = dict(DEFAULT_LGBM_PARAMS)
+    if lgbm_params:
+        merged_params.update(lgbm_params)
+
+    # 1. Train and evaluate Control Arm (with weather)
+    if verbose:
+        print(f"\n--- Training Control Arm (with weather, 15 folds, {num_boost_round} rounds) ---")
+    control_preds_list: list[pd.DataFrame] = []
+    for origin_T in origins:
+        train_slice = frame[frame["target_time"] < origin_T]
+        train_slice = train_slice[train_slice["y"].notna()]
+        assert_fold_training_integrity(train_slice, origin_T)
+
+        X_train = train_slice[control_feature_cols]
+        y_train = train_slice["y"].to_numpy(dtype=float)
+        dtrain = lgb.Dataset(X_train, label=y_train, free_raw_data=False)
+        booster = lgb.train(
+            params=merged_params,
+            train_set=dtrain,
+            num_boost_round=num_boost_round,
+        )
+
+        test_fold = frame[frame["issue_time"] == origin_T].copy()
+        X_test = test_fold[control_feature_cols]
+        preds = np.asarray(booster.predict(X_test), dtype=float)
+        test_fold["pred"] = preds
+        control_preds_list.append(test_fold[["issue_time", "horizon", "pred"]])
+
+    control_df = pd.concat(control_preds_list, ignore_index=True)
+    control_df["issue_time"] = pd.to_datetime(control_df["issue_time"], utc=True)
+
+    merged_ctrl = pd.merge(fixture_df, control_df, on=["issue_time", "horizon"])
+    if len(merged_ctrl) != len(fixture_df):
+        raise ValueError(
+            f"Control merge row count mismatch: {len(merged_ctrl)} vs {len(fixture_df)}"
+        )
+
+    ctrl_diff = np.abs(
+        merged_ctrl["candidate_pred"].to_numpy(dtype=float)
+        - merged_ctrl["pred"].to_numpy(dtype=float)
+    )
+    max_ctrl_delta = float(np.max(ctrl_diff))
+
+    if verbose:
+        print(f"Control arm max per-row candidate delta vs fixture: {max_ctrl_delta:.8f}")
+
+    if max_ctrl_delta > max_control_tolerance:
+        raise RuntimeError(
+            f"Control arm failed to reproduce fixture: max per-row candidate_pred delta "
+            f"({max_ctrl_delta:.8f}) exceeds tolerance ({max_control_tolerance}). "
+            "Harness is wrong: stopping ablation; treatment number cannot be presented as usable."
+        )
+
+    # 2. Train and evaluate Treatment Arm (without weather)
+    if verbose:
+        print(f"\n--- Training Treatment Arm (no weather, 15 folds, {num_boost_round} rounds) ---")
+        print(
+            "Method: weather columns dropped before training/prediction "
+            "(frame builder requires aux inputs)."
+        )
+    treatment_preds_list: list[pd.DataFrame] = []
+    for origin_T in origins:
+        train_slice = frame[frame["target_time"] < origin_T]
+        train_slice = train_slice[train_slice["y"].notna()]
+        assert_fold_training_integrity(train_slice, origin_T)
+
+        X_train = train_slice[treatment_feature_cols]
+        y_train = train_slice["y"].to_numpy(dtype=float)
+        dtrain = lgb.Dataset(X_train, label=y_train, free_raw_data=False)
+        booster = lgb.train(
+            params=merged_params,
+            train_set=dtrain,
+            num_boost_round=num_boost_round,
+        )
+
+        test_fold = frame[frame["issue_time"] == origin_T].copy()
+        X_test = test_fold[treatment_feature_cols]
+        preds = np.asarray(booster.predict(X_test), dtype=float)
+        test_fold["pred"] = preds
+        treatment_preds_list.append(test_fold[["issue_time", "horizon", "pred"]])
+
+    treatment_df = pd.concat(treatment_preds_list, ignore_index=True)
+    treatment_df["issue_time"] = pd.to_datetime(treatment_df["issue_time"], utc=True)
+
+    merged_treat = pd.merge(fixture_df, treatment_df, on=["issue_time", "horizon"])
+    if len(merged_treat) != len(fixture_df):
+        raise ValueError(
+            f"Treatment merge row count mismatch: {len(merged_treat)} vs {len(fixture_df)}"
+        )
+
+    # 3. Score both arms against fixture actuals and baselines
+    records: list[dict[str, Any]] = []
+    for h in range(1, 97):
+        c_sub = merged_ctrl[merged_ctrl["horizon"] == h]
+        t_sub = merged_treat[merged_treat["horizon"] == h]
+        act = c_sub["actual"].to_numpy(dtype=float)
+        w_p = c_sub["pred"].to_numpy(dtype=float)
+        n_p = t_sub["pred"].to_numpy(dtype=float)
+        o_p = c_sub["neso_forecast"].to_numpy(dtype=float)
+        p_p = c_sub["persistence_pred"].to_numpy(dtype=float)
+        s_p = c_sub["seasonal_naive_pred"].to_numpy(dtype=float)
+
+        w_mae = float(np.mean(np.abs(w_p - act)))
+        n_mae = float(np.mean(np.abs(n_p - act)))
+        o_mae = float(np.mean(np.abs(o_p - act)))
+        pers_mae = float(np.mean(np.abs(p_p - act)))
+        sn_mae = float(np.mean(np.abs(s_p - act)))
+        d_h = n_mae - w_mae
+        pct_h = (d_h / w_mae) * 100.0
+
+        records.append({
+            "horizon": h,
+            "periods": len(c_sub),
+            "control_mae": w_mae,
+            "treatment_mae": n_mae,
+            "delta": d_h,
+            "delta_pct": pct_h,
+            "operator_mae": o_mae,
+            "persistence_mae": pers_mae,
+            "seasonal_naive_mae": sn_mae,
+        })
+
+    per_h_df = pd.DataFrame(records)
+    w_gv = float(per_h_df["control_mae"].sum()) / 96.0
+    n_gv = float(per_h_df["treatment_mae"].sum()) / 96.0
+    oper_gv = float(per_h_df["operator_mae"].sum()) / 96.0
+    pers_gv = float(per_h_df["persistence_mae"].sum()) / 96.0
+    sn_gv = float(per_h_df["seasonal_naive_mae"].sum()) / 96.0
+
+    if not math.isclose(w_gv, fixture_res.gate_value, abs_tol=1e-6):
+        raise RuntimeError(
+            f"Control arm GATE_VALUE ({w_gv:.6f}) does not match fixture "
+            f"GATE_VALUE ({fixture_res.gate_value:.6f}). Harness is wrong: "
+            "stopping ablation; treatment number cannot be presented as usable."
+        )
+
+    delta_gv = n_gv - w_gv
+    pct_delta = (delta_gv / w_gv) * 100.0
+
+    decision_limit = w_gv * (1.0 + decision_threshold_percent / 100.0)
+    decision = "DROP" if n_gv <= decision_limit else "KEEP"
+
+    h48_df = per_h_df[per_h_df["horizon"] >= 48]
+    w_long = float(h48_df["control_mae"].mean())
+    n_long = float(h48_df["treatment_mae"].mean())
+    delta_long = n_long - w_long
+    pct_long = (delta_long / w_long) * 100.0
+
+    if output_doc is not None:
+        emit_weather_ablation_table(per_h_df, output_doc)
+        if verbose:
+            print(f"Generated per-horizon table written to: {output_doc}")
+
+    elapsed = time.perf_counter() - t0
+
+    key_horizons: dict[int, dict[str, float]] = {}
+    for h in (1, 2, 48, 96):
+        row = per_h_df[per_h_df["horizon"] == h].iloc[0]
+        key_horizons[h] = {
+            "control_mae": float(row["control_mae"]),
+            "treatment_mae": float(row["treatment_mae"]),
+            "delta": float(row["delta"]),
+            "delta_pct": float(row["delta_pct"]),
+            "operator_mae": float(row["operator_mae"]),
+            "persistence_mae": float(row["persistence_mae"]),
+            "seasonal_naive_mae": float(row["seasonal_naive_mae"]),
+        }
+
+    if verbose:
+        print("\n" + "=" * 90)
+        print("PER-HORIZON WEATHER ABLATION PERFORMANCE (h=1..96)")
+        print("=" * 90)
+        header = (
+            f"{'Horizon':<8}{'Periods':<9}{'Control (W)':<14}{'Treatment (N)':<15}"
+            f"{'Delta (N-W)':<14}{'Delta %':>8}   {'NESO MAE':<11}{'Persistence':<13}"
+            f"{'Seasonal-Naive'}"
+        )
+        print(header)
+        print("-" * 90)
+        for _, r in per_h_df.iterrows():
+            print(
+                f"{int(r['horizon']):<8}{int(r['periods']):<9}{r['control_mae']:<14.4f}"
+                f"{r['treatment_mae']:<15.4f}{r['delta']:<+14.4f}{r['delta_pct']:>+7.2f}%   "
+                f"{r['operator_mae']:<11.4f}{r['persistence_mae']:<13.4f}{r['seasonal_naive_mae']:<13.4f}"
+            )
+        print("=" * 90)
+        print("WEATHER REMOVAL ABLATION RESULTS (Phase P4-c)")
+        print("=" * 90)
+        print(f"Runtime:                      {elapsed:.2f}s")
+        print(f"Control (W) GATE_VALUE:       {w_gv:.6f} gCO2/kWh (table mean: {w_gv:.6f})")
+        print(f"Treatment (N) GATE_VALUE:     {n_gv:.6f} gCO2/kWh (table mean: {n_gv:.6f})")
+        print(f"Delta (N - W):                {delta_gv:+.6f} gCO2/kWh ({pct_delta:+.2f}%)")
+        print(
+            f"h >= 48:                      W {w_long:.4f}  N {n_long:.4f}  "
+            f"delta {delta_long:+.3f} ({pct_long:+.2f}%)"
+        )
+        print(
+            f"Threshold rule:               DROP if N <= W * "
+            f"{1.0 + decision_threshold_percent / 100.0:.2f} "
+            f"(+{decision_threshold_percent:.1f}%), else KEEP"
+        )
+        print(f"N <= W * 1.02 limit:          {decision_limit:.6f} gCO2/kWh")
+        print(
+            f"Precondition (control delta): {max_ctrl_delta:.8f} "
+            f"(tolerance: {max_control_tolerance})"
+        )
+        print(f"DECISION:                     {decision}")
+        print("-" * 90)
+        print("KEY HORIZONS DETAIL:")
+        for h in (1, 2, 48, 96):
+            kh = key_horizons[h]
+            print(
+                f"  h={h:02d} | W: {kh['control_mae']:.4f} | N: {kh['treatment_mae']:.4f} | "
+                f"delta: {kh['delta']:+.4f} ({kh['delta_pct']:+.2f}%) | "
+                f"NESO: {kh['operator_mae']:.4f} | Pers: {kh['persistence_mae']:.4f} | "
+                f"SN: {kh['seasonal_naive_mae']:.4f}"
+            )
+        print("=" * 90)
+
+    return WeatherAblationResults(
+        control_gate_value=w_gv,
+        treatment_gate_value=n_gv,
+        delta_gate_value=delta_gv,
+        delta_percent=pct_delta,
+        decision=decision,
+        max_control_delta=max_ctrl_delta,
+        decision_threshold_percent=decision_threshold_percent,
+        per_horizon_table=per_h_df,
+        operator_gate_value=oper_gv,
+        persistence_gate_value=pers_gv,
+        seasonal_naive_gate_value=sn_gv,
+        key_horizons=key_horizons,
+        elapsed_seconds=elapsed,
+        control_long_gate_value=w_long,
+        treatment_long_gate_value=n_long,
+        delta_long_gate_value=delta_long,
+        delta_long_percent=pct_long,
+    )
+
 
 

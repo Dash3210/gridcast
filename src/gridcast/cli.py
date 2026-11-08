@@ -341,6 +341,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="Suppress progress and table output.",
     )
 
+    ablation_weather_parser = subparsers.add_parser(
+        "ablation-weather",
+        help="Run pre-registered weather removal ablation against frozen fixture.",
+    )
+    ablation_weather_parser.add_argument(
+        "--fixture",
+        type=str,
+        default="data/eval/frozen_split_v1.parquet",
+        help="Path to frozen split parquet fixture (default: data/eval/frozen_split_v1.parquet).",
+    )
+    ablation_weather_parser.add_argument(
+        "--sidecar",
+        type=str,
+        default="data/eval/frozen_split_v1.json",
+        help="Path to fixture sidecar metadata JSON (default: data/eval/frozen_split_v1.json).",
+    )
+    ablation_weather_parser.add_argument(
+        "--output-doc",
+        type=str,
+        default="docs/ablations/weather_removal.md",
+        help="Path to markdown document to update generated table.",
+    )
+    ablation_weather_parser.add_argument(
+        "--max-control-tolerance",
+        type=float,
+        default=0.0,
+        help="Maximum allowed absolute difference for control arm reproduction (default: 0.0).",
+    )
+    ablation_weather_parser.add_argument(
+        "--threshold-percent",
+        type=float,
+        default=2.0,
+        help="Decision threshold percentage for KEEP vs DROP (default: 2.0).",
+    )
+    ablation_weather_parser.add_argument(
+        "--no-verbose",
+        dest="verbose",
+        action="store_false",
+        default=True,
+        help="Disable detailed progress and table output.",
+    )
+    ablation_weather_parser.add_argument(
+        "--quiet",
+        dest="verbose",
+        action="store_false",
+        help="Suppress progress and table output.",
+    )
+
     subparsers.add_parser("serve", help="Run forecast API service.")
     subparsers.add_parser("version", help="Print package version.")
 
@@ -554,6 +602,32 @@ def run_eval_refresh_cli(
     return 0
 
 
+def run_ablation_weather_cli(
+    fixture_path: Path | str = "data/eval/frozen_split_v1.parquet",
+    sidecar_path: Path | str = "data/eval/frozen_split_v1.json",
+    output_doc: Path | str | None = "docs/ablations/weather_removal.md",
+    max_control_tolerance: float = 0.0,
+    threshold_percent: float = 2.0,
+    verbose: bool = True,
+) -> int:
+    """Run pre-registered weather removal ablation benchmark against frozen fixture."""
+    from gridcast.backtest import run_weather_ablation
+
+    try:
+        run_weather_ablation(
+            parquet_path=fixture_path,
+            sidecar_path=sidecar_path,
+            output_doc=output_doc,
+            max_control_tolerance=max_control_tolerance,
+            decision_threshold_percent=threshold_percent,
+            verbose=verbose,
+        )
+        return 0
+    except Exception as e:
+        print(f"Weather removal ablation failed: {e}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point for gridcast."""
     parser = build_parser()
@@ -606,6 +680,16 @@ def main(argv: list[str] | None = None) -> int:
             num_boost_round=args.num_boost_round,
             reconcile_window_days=args.reconcile_window_days,
             force=args.force,
+        )
+
+    if args.subcommand == "ablation-weather":
+        return run_ablation_weather_cli(
+            fixture_path=args.fixture,
+            sidecar_path=args.sidecar,
+            output_doc=args.output_doc,
+            max_control_tolerance=args.max_control_tolerance,
+            threshold_percent=args.threshold_percent,
+            verbose=args.verbose,
         )
 
     if args.subcommand == "ingest":

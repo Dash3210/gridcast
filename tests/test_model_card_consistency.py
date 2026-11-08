@@ -306,29 +306,68 @@ def test_fixture_file_is_hashes_only() -> None:
     assert "model_artifact_sha256" in data, "Fixture file must contain 'model_artifact_sha256'"
 
 
+def _find_all_doc_paths() -> list[Path]:
+    """Discover all documentation markdown files across the repository."""
+    root = Path(".")
+    docs: list[Path] = []
+    for p in root.glob("*.md"):
+        if p.is_file():
+            docs.append(p)
+    docs_dir = root / "docs"
+    if docs_dir.exists():
+        for p in docs_dir.rglob("*.md"):
+            if p.is_file():
+                docs.append(p)
+    return sorted(docs)
+
+
+def _is_superseded_with_commit(line: str, score: str) -> bool:
+    """Check if a score is explicitly marked as superseded/restated with its commit hash."""
+    esc_score = re.escape(score)
+    pattern = (
+        r"(?:superseded|restated)\s+(?:from\s+)?"
+        + r"(?:`" + esc_score + r"`|" + esc_score + r")"
+        + r"(?:\s*gCO2/kWh)?\s+(?:at|with|from)\s+(?:commit\s+)?([0-9a-f]{7,40})"
+    )
+    return bool(re.search(pattern, line, re.IGNORECASE))
+
+
 def _assert_line_valid_for_fixture_hash(line: str, location: str) -> None:
-    """Helper asserting line pairing fixture sha256 205222ce contains no score other than 39.032."""
+    """Assert published number paired with fixture hash is fixture value or superseded.
+
+    Rule: Every published number is either the fixture value, or explicitly marked
+    as superseded, with the commit it came from.
+    """
     if "205222ce" not in line:
         return
-    # Must not contain stale 39.043
-    assert "39.043" not in line, (
-        f"{location} pairs fixture hash 205222ce with stale 39.043: {line}"
-    )
-    # Any 39.xxx score on this line must be 39.032
+
+    # Check any 39.xxx score on this line
     for score in re.findall(r"\b39\.\d{3}\b", line):
-        assert score == "39.032", (
-            f"{location} pairs fixture hash 205222ce with score {score} != 39.032: {line}"
+        if score == "39.032":
+            continue
+        assert _is_superseded_with_commit(line, score), (
+            f"{location} pairs fixture hash 205222ce with unsourced score {score} "
+            f"not explicitly marked as superseded with its commit: {line}"
         )
-    # Any GATE_VALUE match on this line must be 39.032
+
+    # Any GATE_VALUE match on this line must be 39.032 or explicitly marked as superseded
     for gv in re.findall(r"GATE_VALUE\s*=\s*`?([0-9]+\.[0-9]+)`?", line):
-        assert gv == "39.032", (
-            f"{location} pairs fixture hash 205222ce with GATE_VALUE {gv} != 39.032: {line}"
+        if gv in ("39.032", "39.032478"):
+            continue
+        assert _is_superseded_with_commit(line, gv), (
+            f"{location} pairs fixture hash 205222ce with unsourced GATE_VALUE {gv} "
+            f"not explicitly marked as superseded with its commit: {line}"
         )
 
 
 def test_no_line_pairs_fixture_hash_with_non_fixture_score() -> None:
-    """Assert no line of docs pairs fixture sha256 205222ce with any value other than 39.032."""
-    for doc_path in [DECISIONS_PATH, MODEL_CARD_PATH]:
+    """Assert every published number across all docs is fixture value or superseded with commit.
+
+    Reads every documentation markdown file across the repository.
+    """
+    all_docs = _find_all_doc_paths()
+    assert len(all_docs) >= 3, f"Expected at least 3 doc files, found {len(all_docs)}"
+    for doc_path in all_docs:
         text = doc_path.read_text(encoding="utf-8")
         for line_no, line in enumerate(text.splitlines(), start=1):
             _assert_line_valid_for_fixture_hash(line, f"{doc_path}:{line_no}")
