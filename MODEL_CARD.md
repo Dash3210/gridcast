@@ -42,22 +42,59 @@ tightened from that distribution once enough nights have accumulated.
 freshest forecast that genuinely existed at the issue instant, and it caps short-horizon weather skill
 by design.
 
-**Serving caveat on weather features (ADR-018 resolution):** At inference the targets are in the future,
-and the previous-runs series has no future values. The weather available for `T+h` at serve time is the
-current model run with lead `h`, not the day-1/day-2 series the frame trains on with lead `>= 24h`.
-Training and serving therefore use different lead distributions. ADR-018 decided Option (b): retain all
-horizons, document this caveat explicitly, and bound the damage empirically. On the validation split ($h \le 48$),
-mean temperature divergence $|Day1 - Day2|$ is $1.008$ °C, and validation MAE differs by only $0.0875$ gCO2/kWh
-($28.6310$ vs $28.5435$ gCO2/kWh, a $0.31\%$ divergence). The candidate uses weather features with this
-caveat: short horizons receive forecast lead $h$ at inference while trained on lead $\ge 24$h. Whether the
-served model keeps them is decided in Phase P4, not here.
+**Serving decision on weather features (ADR-018 open, pending weather-removal ablation):**
+At inference the targets are in the future, and the previous-runs series has no future values. The weather available for `T+h` at serve time is the current model run with lead `h`, not the day-1/day-2 series the frame trains on with lead `>= 24h`. Training and serving therefore use different lead distributions.
+ADR-018 evaluated this empirical ablation on the frozen 15-origin split (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins) using identical frame builder, origins, and hyperparameters, shifting only weather timestamps by +24h:
+
+```
+baseline (current weather join)       39.032
+weather values lagged a further 24h   38.279
+delta                                 -0.753 gCO2/kWh   (-1.93%)
+materiality threshold                 5.00%
+```
+
+Two principles keep this honest:
+- The baseline reproduces today's `make eval` exactly (39.032 gCO2/kWh), so the ablation is the same evaluation with one input degraded, not a different experiment.
+- The sign is negative: staler weather scored better. The feature is weakly used at these leads, and the result bounds the train/serve MISALIGNMENT, not the feature's informativeness. Do not write that weather is important; this measurement does not support that claim.
+
+Decision: serve the current-run forecast for `T+h`, and record the lead actually used per horizon on every forecast row.
+
+## Service Metadata (GET /model contract)
+
+The prediction service exposes `GET /model`, returning the following computed metadata describing the loaded model artifact:
+
+- **Model Version**: `lgbm-v1`
+- **Artifact SHA-256**: `5ddfe624a05dee49fa2ec339f6d22ba4ad6783dfcb1ea30eb7bca4a501e19e15`
+- **Training Window**: `2024-11-08` to `2026-11-01` (724 issue dates, 00:00 Europe/London daily)
+- **Feature Count**: 29 declared features
+
+### Model Artifact Hashing and Verification Commands
+
+Two distinct hash values exist for the model artifact `data/models/lgbm_model.txt`. `git hash-object` is shell-proof but yields the **object ID** (git object database hash), a different function from the content **SHA-256** pinned by this card:
+
+1. **Content SHA-256 (64 hex characters)**:
+   Exact command:
+   ```bash
+   python -c "import hashlib, pathlib; print(hashlib.sha256(pathlib.Path('data/models/lgbm_model.txt').read_text(encoding='utf-8').encode('utf-8')).hexdigest())"
+   ```
+   Output: `5ddfe624a05dee49fa2ec339f6d22ba4ad6783dfcb1ea30eb7bca4a501e19e15`
+   This is the value returned by `GET /model` (`artifact_sha256`). Marked `binary` in `.gitattributes` beside the parquet rule so a CRLF checkout cannot change the bytes.
+
+2. **Git Object ID (40 hex characters, SHA-1)**:
+   Exact command:
+   ```bash
+   git hash-object data/models/lgbm_model.txt
+   ```
+   Output: `8f841a6f048242085a36c33ed8b92b7acdf6d8e7`
+   This is git's internal object ID in the git object database (computed over `blob <size>\0<content>`).
+
 
 ## Evaluation
 
 Leakage and value correctness are checked on a grid covering DST transitions, gap-adjacent dates, and
 the first and last week of the archive.
 
-### Evaluation Metrics on the Frozen Split (frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run)
+### Evaluation Metrics on the Frozen Split (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins)
 
 The scalar evaluation metric is defined as the unweighted mean of per-horizon MAEs:
 
@@ -66,14 +103,14 @@ MAE_h      = mean absolute error over scored periods at horizon h
 GATE_VALUE = (1 / 96) * sum_{h=1..96} MAE_h
 ```
 
-Evaluated on the frozen split (frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run; 2026-09-04 23:00 UTC to 2026-10-31 00:00 UTC, 15 rolling origins), each number carrying this origin range:
+Evaluated on the frozen split (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins; 2026-09-04 23:00 UTC to 2026-10-31 00:00 UTC, 15 rolling origins), each number carrying this origin range:
 
-| candidate | GATE_VALUE (gCO2/kWh) |
-|---|---|
-| LightGBM candidate | 39.043 |
-| persistence (issue-anchored) | 53.741 |
-| seasonal-naive | 51.495 |
-| NESO operator | 11.666 |
+| candidate | GATE_VALUE (gCO2/kWh) | Notes |
+|---|---|---|
+| LightGBM candidate | 39.032 | Archive commit 3617143 (restated from 39.043 at 0bbb497; frozen fixture v1) |
+| persistence (issue-anchored) | 53.741 | Unchanged across commits |
+| seasonal-naive | 51.495 | Unchanged across commits |
+| NESO operator | 11.666 | Published NESO forecast, vintage unverified (ADR-022) |
 
 The candidate beats its own baselines by roughly a quarter and loses to the operator by about three times, on a fixed window, so any future number must be quoted beside its window. Do not describe this as accuracy, as a pass, or as meeting a standard.
 
@@ -121,17 +158,23 @@ The gate is not wired into CI until Phase P5.
 
 The benchmark is a data source, not an oracle, and needs the same alignment discipline as any feature; the vintage of an archived forecast is a property to be recorded, not assumed; the only fair comparison is between two forecasts made at the same instant.
 
-### Key Horizons Detail (frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run)
+### Key Horizons Detail (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins)
 
 | Horizon | Lead Time | Model MAE (gCO2/kWh) | Operator MAE (gCO2/kWh)* | Persistence MAE (gCO2/kWh) | Seasonal-Naive MAE (gCO2/kWh) | Scored Periods |
 |---|---|---|---|---|---|---|
 | h = 2 | 1.0 hr | 13.93 | 7.67 | 34.67 | 30.13 | 15 |
 | h = 48 | 24.0 hr | 53.99 | 14.47 | 63.60 | 47.00 | 15 |
-| h = 96 | 48.0 hr | 40.17 | 8.47 | 53.67 | 54.93 | 15 |
+| h = 96 | 48.0 hr | 39.15 | 8.47 | 53.67 | 54.93 | 15 |
 
 *\* Published NESO forecast for the same periods, vintage unverified (ADR-022).*
 
-All skill metrics are computed inside `compute_skill_score` asserting identical period sets at the point of division. Gate evaluation is executed locally via `make eval` (`python -m gridcast.cli backtest`).
+All skill metrics are computed inside `compute_skill_score` asserting identical period sets at the point of division. Gate evaluation is executed locally via `make eval` (`python -m gridcast.cli eval`).
+
+### Benchmark Target Mutability and Guard Blind Spot (ADR-023)
+
+- **Target mutability & Frozen Fixture Resolution**: The split was previously frozen in origins, not in targets; its target values were a snapshot of the archive at run time. Nightly `--reconcile-recent --window-days 3` re-fetches recent partitions, so the final ~48 hours of every evaluation window were revised after the fact. Between commit `0bbb497` and commit `3617143`, revisions caused `GATE_VALUE` to move from 39.043 to 39.032. ADR-023 resolved this by materialising the immutable evaluation fixture `data/eval/frozen_split_v1.parquet` (and sidecar `data/eval/frozen_split_v1.json`), decoupling evaluation from live archive reconciliations.
+- **Two Data Planes**: The evaluation fixture is immutable, read exclusively by `make eval`; the live scoreboard reads the reconciled store so it captures late actuals.
+- **Guard blind spot**: `test_model_card_consistency.py` previously compared documents to a static JSON fixture. Under ADR-023, it computes published metrics directly from `data/eval/` at test time, making `data/eval/` the single source of truth. Every published number is qualified with: `frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins`.
 
 ## Known failure modes (to be quantified in P3)
 

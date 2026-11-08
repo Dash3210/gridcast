@@ -323,24 +323,29 @@
   - Validating contract functions against their own declared return values (rejected: permits false green test suites when declarations lie about their bounds).
 
 ## ADR-018 — Serving risk: train/serve lead distribution mismatch on weather features
-- Status: accepted
-- Date: 2026-11-02
+- Status: open (pending weather-removal ablation)
+- Date: 2026-11-02 (opened 2026-11-02, review updated 2026-11-07)
 - Context:
   At inference the targets are in the future, and the previous-runs series has no future values. The weather available for `T+h` at serve time is the current model run with lead `h`, not the day-1/day-2 series the frame trains on with lead `>= 24h`.
   Training and serving therefore use different lead distributions, so "the model has weather features" is true in training and not true as stated for the service.
+- Evidence & Ablation:
+  Measured on the frozen 15-origin split (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins), same frame builder, same origins, same parameters; only the weather timestamps moved by +24h:
+  ```
+  baseline (current weather join)       39.032
+  weather values lagged a further 24h   38.279
+  delta                                 -0.753 gCO2/kWh   (-1.93%)
+  materiality threshold                 5.00%
+  ```
+  Two things that keep this honest:
+  - The baseline reproduces today's `make eval` exactly (39.032 gCO2/kWh), so the ablation is the same evaluation with one input degraded, not a different experiment.
+  - The sign is negative: staler weather scored better. The feature is weakly used at these leads, and the result bounds the train/serve MISALIGNMENT, not the feature's informativeness. Do not write that weather is important. This measurement does not support that claim.
 - Decision:
-  Adopt Option (b): Keep all 96 horizons, document the lead mismatch caveat across all model documentation, and bound the damage by empirically scoring day-1 features against day-2 features on the canonical validation frame.
-  Empirical quantification on the validation split for short horizons ($h \le 48$):
-  - Mean absolute temperature difference between day-1 and day-2 forecasts: $1.008$ °C (max $8.200$ °C, 95th percentile $2.700$ °C).
-  - Validation MAE with Day-1 weather features: $28.6310$ gCO2/kWh.
-  - Validation MAE with Day-2 weather features: $28.5435$ gCO2/kWh.
-  - Divergence: $0.0875$ gCO2/kWh ($0.31\%$).
-  Because the empirical accuracy divergence from lead mismatch is under $0.1$ gCO2/kWh, truncating short horizons (Option a) would sacrifice critical intraday balancing periods for negligible benefit, while dropping weather entirely (Option c) removes useful meteorological signals during grid strain.
+  Serve the current-run forecast for `T+h`, and record the lead actually used per horizon on every forecast row.
 - Caveat:
   No artifact or service documentation may claim that weather features ship in production without the explicit caveat that short horizons receive forecast lead $h$ at inference while trained on lead $\ge 24$h.
-- Alternatives rejected:
-  - Restricting the product to horizons $\ge 24$h (rejected: forfeits 48 half-hours essential for system balancing when empirical divergence is $< 0.1$ gCO2/kWh).
-  - Dropping weather features entirely (rejected: removes temperature-demand relationship across the 48-hour window).
+- Alternatives rejected / deferred:
+  - Restricting the product to horizons $\ge 24$h (rejected: forfeits 48 half-hours essential for system balancing).
+  - Dropping weather features entirely (status: open pending weather-removal ablation queued next; the stale-vs-current experiment bounds lead sensitivity and nothing else).
 
 ## ADR-019 — Evaluation gate: single scalar threshold fixed from validation split
 - Status: accepted
@@ -353,9 +358,9 @@
      `GATE_VALUE = (1 / 96) * sum_{h=1}^{96} MAE_h`
      Every horizon is weighted equally.
   2. Fix the accuracy gate threshold to `GATE_VALUE <= 35.0 gCO2/kWh` on 2026-11-02 from the validation split (`2026-06-05` to `2026-08-30`, 15 rolling origins). On this split, the LightGBM candidate achieved `GATE_VALUE = 33.815 gCO2/kWh`, beating the persistence baseline (`57.776 gCO2/kWh`, 41.5% improvement) and seasonal-naive baseline (`46.732 gCO2/kWh`, 27.6% improvement).
-  3. Score the test split (frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run) against this threshold. The candidate achieved `GATE_VALUE = 39.043 gCO2/kWh` (superseding the initial sliding evaluation; declared void and superseded by ADR-020).
+  3. Score the test split (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins) against this threshold (initial evaluation declared void and superseded by ADR-020).
   4. The gate must evaluate all candidates and baselines strictly on the intersection of non-null periods.
-  5. The evaluation gate is executed locally via `make eval` (`python -m gridcast.cli backtest`). Wiring into CI is deferred to Phase P5, where CI will execute `make eval` alongside `make check`.
+  5. The evaluation gate is executed locally via `make eval` (`python -m gridcast.cli eval`). Wiring into CI is deferred to Phase P5, where CI will execute `make eval` alongside `make check`.
 - Consequences:
   Deterministic evaluation machinery. Superseded by ADR-020 (threshold invalid; void verdict) and ADR-021 (gap-closure gate).
 - Alternatives rejected:
@@ -367,7 +372,9 @@
 - Date: 2026-11-02
 - Context:
   An evaluation review identified three integrity defects in the evaluation pipeline:
-  1. Moving origin window: `run_rolling_origin_backtest` defaulted to `test_issues[-60:][::4]`, walking one day forward every night and intruding into the 4-day embargo (`2026-09-04`). On the sliding default origins, the model scored `33.045`, whereas on the committed documented split (frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run) it scored `39.043`.
+  1. Moving origin window: `run_rolling_origin_backtest` defaulted to `test_issues[-60:][::4]`, walking one day forward every night and intruding into the 4-day embargo (`2026-09-04`). On the sliding default origins, the model scored `33.045`.
+     On the committed documented split (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins) it scored `39.032`.
+     (The pre-freeze archive value at commit `0bbb497` was `39.043`, which no longer reproduces).
   2. Tautological provenance guard: the assertion compared the assigned timestamp against the formula used to assign it without verifying prediction values against the raw curated store.
   3. Dead-code period-set guard: `compute_skill_score` enforced period-set equality at division time, but `run_rolling_origin_backtest` computed skill inline.
   4. Silent denominator: `Series.mean(skipna=True)` silently dropped missing horizons, dividing by 95 instead of 96.
@@ -380,7 +387,7 @@
   2. The provenance guard (`assert_baseline_provenance`) reads the raw curated store directly via plain lookup at `issue_time - ACTUAL_AVAILABILITY_LAG`, asserting that the store row exists, is non-null, and exactly equals the prediction value.
   3. All skill figures (per-horizon and overall) must execute through `compute_skill_score` on the live path.
   4. The gate scalar is strictly defined as `(1 / 96) * sum(MAE_h)`; all 96 horizons are required to contribute non-null MAEs, raising `ValueError` otherwise.
-  5. The 35.0 threshold is recognized as invalid under ADR-020 (derived from candidate's own validation score). On the frozen test split (frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run), the candidate scores `GATE_VALUE = 39.043 gCO2/kWh`. The first scoring is void, P3 closes with no gate verdict (neither pass nor fail), and `make eval` prints `GATE VERDICT: NONE - threshold invalid (ADR-020); no pass or fail is claimed` and exits 0.
+  5. The 35.0 threshold is recognized as invalid under ADR-020 (derived from candidate's own validation score). On the frozen test split (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins), the candidate scores `GATE_VALUE = 39.032 gCO2/kWh`. The first scoring is void, P3 closes with no gate verdict (neither pass nor fail), and `make eval` prints `GATE VERDICT: NONE - threshold invalid (ADR-020); no pass or fail is claimed` and exits 0.
 - Consequences:
   Evaluation verdicts are completely deterministic and independent of execution date.
 
@@ -451,3 +458,39 @@
 
 
 
+
+
+## ADR-023 — Frozen evaluation fixture, dual data planes, and archive commit tracking
+- Status: accepted
+- Date: 2026-11-07
+- Context:
+  The evaluation split was previously frozen in origins, not in targets. Target values were a snapshot of the archive at run time.
+  Nightly ingest (`--reconcile-recent --window-days 3`) re-fetches recent partitions, so the final ~48 hours of every evaluation window were revised after the fact.
+  Measured on `data/curated/date=2026-11-02.parquet`, the partition the last origin depends on, between P3 commit `0bbb497` and commit `3617143`:
+  ```
+  actual     11 of 48 rows changed, 14 filled in from null, max delta 3.0
+  forecast   13 of 48 rows changed, max delta 28.0
+  ```
+  Consequence: `GATE_VALUE` previously moved with the archive. The same code and same origins produced `39.032 gCO2/kWh` on archive commit `3617143`, where commit `0bbb497` published `39.043 gCO2/kWh`; persistence (`53.741`), seasonal-naive (`51.495`), and operator (`11.666`) remained unchanged. The origins were frozen, but ground truth was not.
+- Decision:
+  1. The split is frozen in origins AND targets: materialised in `data/eval/frozen_split_v1.parquet` (1,440 rows: 15 origins x 96 horizons) and accompanied by metadata sidecar `data/eval/frozen_split_v1.json`.
+  2. Two data planes:
+     - The evaluation fixture (`data/eval/`) is immutable and strictly decoupled from live ingest. `make eval` reads only the fixture and never touches `data/curated`, hard-failing on SHA-256 mismatch or missing sidecar.
+     - The live scoreboard continues reading the reconciled store (`data/curated/` and `data/scoreboard/`) so late-arriving actuals are captured for production evaluation.
+  3. Window-selection rule: an evaluation window is eligible to be frozen only if the window's last target is at least 3 days behind the newest archive period (`newest_archive_period - window_last_target >= 3 days`). Because the nightly reconcile window is 3 days (`--window-days 3`), partitions older than 3 days are settled and final. At freeze time (2026-11-07 23:30 UTC), the split's last target (2026-11-02 00:00 UTC) was 5.98 days behind and had been final since 2026-11-03, satisfying the eligibility requirement.
+  4. What the fixture pins and what it cannot:
+     The candidate and baseline predictions are frozen alongside the realised actuals (`candidate_pred`, `neso_forecast`, `persistence_pred`, `seasonal_naive_pred`). The fixture pins the metric and the ground truth, not the training run; only `make eval-refresh` can regenerate predictions, and the sidecar's environment versions (python, lightgbm, pandas, numpy) and hyperparameters make that reproducible. If the model or feature set changes, a new version file (`v2`) must be written; `v1` is never edited.
+  5. Published number authority and guard blind spot: `data/eval/` is the single authority for all published figures. `tests/test_model_card_consistency.py` computes numbers from `data/eval/` at test time. The fixture file `tests/fixtures/frozen_split_metrics.json` is reduced to recorded hashes only. Previously, the consistency guard had a blind spot: comparing against a static metrics JSON could not detect when live backtests drifted against an updated archive; pinning the frozen fixture directly eliminates the blind spot against silent live run drift.
+  6. All published numbers are restated with full provenance:
+     `frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins`.
+  7. Model reproduction check (`make eval-reproduce`):
+     Retraining the 15 folds on the frozen origins from the canonical feature frame reproduces the fixture bitwise identically:
+     - Per-row `candidate_pred` max absolute difference: 0.0 (tolerance pinned to 0.0)
+     - `GATE_VALUE` delta: 0.0 (tolerance pinned to 0.0)
+     - Library versions match sidecar: python 3.10.11, lightgbm 4.7.0, pandas 2.3.3, numpy 2.2.6
+     - Measured runtime: 19.3s (Run 1: 19.88s, Run 2: 18.79s). This number provides the empirical basis for deciding whether to wire reproduction into nightly CI in Phase P5.
+- Consequences:
+  Evaluation is fast, hermetic, and completely decoupled from archive mutability.
+- Alternatives rejected:
+  - Re-reading `data/curated` during `make eval` (rejected: subject to upstream backfill revisions; breaks metric stability).
+  - Silently mutating numbers without commit and hash references (rejected: breaks reproducibility).

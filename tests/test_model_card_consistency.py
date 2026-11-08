@@ -1,27 +1,103 @@
-"""Consistency test asserting published model card metrics match the frozen split fixture."""
+"""Consistency test asserting published model card metrics match the frozen split fixture.
+
+data/eval/ is the single authority for all published numbers.
+Figures are computed from data/eval/frozen_split_v1.parquet and sidecar at test time.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
 from typing import Any
 
-FIXTURE_PATH = Path("tests/fixtures/frozen_split_metrics.json")
+import numpy as np
+import pandas as pd
+import pytest
+
+from gridcast.models import get_model_artifact_hash
+
+EVAL_PARQUET_PATH = Path("data/eval/frozen_split_v1.parquet")
+EVAL_SIDECAR_PATH = Path("data/eval/frozen_split_v1.json")
+HASHES_FIXTURE_PATH = Path("tests/fixtures/frozen_split_metrics.json")
 MODEL_CARD_PATH = Path("MODEL_CARD.md")
 README_PATH = Path("README.md")
 DECISIONS_PATH = Path("docs/decisions.md")
 
-REQUIRED_WINDOW_TEXT = "frozen split, 2026-09-05 to 2026-11-01, 15 origins, 2026-11-02 run"
+REQUIRED_WINDOW_TEXT = (
+    "frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, "
+    "archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins"
+)
 
 
-def load_fixture() -> dict[str, Any]:
-    """Load the committed frozen split metrics fixture."""
-    if not FIXTURE_PATH.exists():
-        raise FileNotFoundError(f"Fixture not found at {FIXTURE_PATH}")
-    with open(FIXTURE_PATH, encoding="utf-8") as f:
-        data: dict[str, Any] = json.load(f)
-    return data
+def compute_published_metrics() -> dict[str, Any]:
+    """Compute published benchmark metrics directly from data/eval fixture at test time.
+
+    data/eval/ is the single authority for all published figures.
+    """
+    if not EVAL_PARQUET_PATH.exists():
+        raise FileNotFoundError(f"Evaluation fixture not found at {EVAL_PARQUET_PATH}")
+    if not EVAL_SIDECAR_PATH.exists():
+        raise FileNotFoundError(f"Evaluation sidecar not found at {EVAL_SIDECAR_PATH}")
+
+    with open(EVAL_SIDECAR_PATH, encoding="utf-8") as f:
+        meta = json.load(f)
+
+    # Verify parquet sha256 matches sidecar
+    with open(EVAL_PARQUET_PATH, "rb") as f:
+        actual_sha = hashlib.sha256(f.read()).hexdigest()
+    assert actual_sha == meta.get("sha256"), "Parquet SHA-256 does not match sidecar"
+
+    df = pd.read_parquet(EVAL_PARQUET_PATH)
+    assert len(df) == 1440, f"Expected 1440 rows in fixture, got {len(df)}"
+
+    cand_maes = []
+    oper_maes = []
+    pers_maes = []
+    sn_maes = []
+    key_horizons: dict[str, dict[str, Any]] = {}
+
+    for h in range(1, 97):
+        h_df = df[df["horizon"] == h]
+        act = h_df["actual"].to_numpy(dtype=float)
+        c_mae = float(np.mean(np.abs(h_df["candidate_pred"].to_numpy(dtype=float) - act)))
+        o_mae = float(np.mean(np.abs(h_df["neso_forecast"].to_numpy(dtype=float) - act)))
+        p_mae = float(np.mean(np.abs(h_df["persistence_pred"].to_numpy(dtype=float) - act)))
+        s_mae = float(np.mean(np.abs(h_df["seasonal_naive_pred"].to_numpy(dtype=float) - act)))
+
+        cand_maes.append(c_mae)
+        oper_maes.append(o_mae)
+        pers_maes.append(p_mae)
+        sn_maes.append(s_mae)
+
+        if h in (2, 48, 96):
+            key_horizons[str(h)] = {
+                "model": round(c_mae, 2),
+                "operator": round(o_mae, 2),
+                "persistence": round(p_mae, 2),
+                "seasonal_naive": round(s_mae, 2),
+                "periods": len(h_df),
+            }
+
+    gate_val = sum(cand_maes) / 96.0
+    oper_gate_val = sum(oper_maes) / 96.0
+    pers_gate_val = sum(pers_maes) / 96.0
+    sn_gate_val = sum(sn_maes) / 96.0
+
+    return {
+        "archive_commit": meta.get("archive_commit", "3617143"),
+        "origin_window": meta.get("origin_window", REQUIRED_WINDOW_TEXT),
+        "parquet_sha256": actual_sha,
+        "model_artifact_sha256": meta.get("model_artifact_sha256"),
+        "scalars": {
+            "model": round(gate_val, 3),
+            "operator": round(oper_gate_val, 3),
+            "persistence": round(pers_gate_val, 3),
+            "seasonal_naive": round(sn_gate_val, 3),
+        },
+        "key_horizons": key_horizons,
+    }
 
 
 def parse_model_card_gate_scalars(card_text: str) -> dict[str, float]:
@@ -79,8 +155,6 @@ def parse_model_card_key_horizons(card_text: str) -> dict[int, dict[str, float]]
 
 def parse_readme_scalars(readme_text: str) -> list[dict[str, float]]:
     """Extract quoted GATE_VALUE blocks from README.md."""
-    # Pattern matching: GATE_VALUE = <m> ... persistence (<p>) ...
-    # seasonal-naive (<sn>) ... NESO operator (<o>)
     pattern = re.compile(
         r"GATE_VALUE\s*=\s*`?([0-9]+\.[0-9]+)`?\s*gCO2/kWh.*?"
         r"persistence\s*\(?`?([0-9]+\.[0-9]+)`?\s*(?:gCO2/kWh)?\)?.*?"
@@ -101,11 +175,11 @@ def parse_readme_scalars(readme_text: str) -> list[dict[str, float]]:
 
 def test_model_card_gate_scalars_match_fixture() -> None:
     """Verify that MODEL_CARD scalar GATE_VALUE numbers match fixture at 3 decimals."""
-    fixture = load_fixture()
+    computed = compute_published_metrics()
     card_text = MODEL_CARD_PATH.read_text(encoding="utf-8")
     parsed = parse_model_card_gate_scalars(card_text)
 
-    expected = fixture["scalars"]
+    expected = computed["scalars"]
     assert "model" in parsed, "Model GATE_VALUE missing from MODEL_CARD table"
     assert "operator" in parsed, "Operator GATE_VALUE missing from MODEL_CARD table"
     assert "persistence" in parsed, "Persistence GATE_VALUE missing from MODEL_CARD table"
@@ -119,11 +193,11 @@ def test_model_card_gate_scalars_match_fixture() -> None:
 
 def test_model_card_key_horizons_match_fixture() -> None:
     """Verify that MODEL_CARD key horizon rows match fixture at 2 decimals."""
-    fixture = load_fixture()
+    computed = compute_published_metrics()
     card_text = MODEL_CARD_PATH.read_text(encoding="utf-8")
     parsed_horizons = parse_model_card_key_horizons(card_text)
 
-    expected_horizons = fixture["key_horizons"]
+    expected_horizons = computed["key_horizons"]
     for h_str, exp in expected_horizons.items():
         h = int(h_str)
         assert h in parsed_horizons, f"Horizon h={h} row missing from MODEL_CARD"
@@ -139,12 +213,12 @@ def test_model_card_key_horizons_match_fixture() -> None:
 
 def test_readme_scalars_match_fixture() -> None:
     """Verify that any scalar figures quoted in README match fixture at 3 decimals."""
-    fixture = load_fixture()
+    computed = compute_published_metrics()
     readme_text = README_PATH.read_text(encoding="utf-8")
     parsed_entries = parse_readme_scalars(readme_text)
 
     assert len(parsed_entries) >= 2, "Expected at least 2 GATE_VALUE references in README.md"
-    expected = fixture["scalars"]
+    expected = computed["scalars"]
 
     for entry in parsed_entries:
         assert f"{entry['model']:.3f}" == f"{expected['model']:.3f}"
@@ -155,8 +229,8 @@ def test_readme_scalars_match_fixture() -> None:
 
 def test_published_figures_carry_window() -> None:
     """Assert that every published number carries its origin window description."""
-    fixture = load_fixture()
-    expected_window = fixture.get("origin_window", REQUIRED_WINDOW_TEXT)
+    computed = compute_published_metrics()
+    expected_window = computed.get("origin_window", REQUIRED_WINDOW_TEXT)
 
     for doc_path in [MODEL_CARD_PATH, README_PATH, DECISIONS_PATH]:
         text = doc_path.read_text(encoding="utf-8")
@@ -167,7 +241,7 @@ def test_published_figures_carry_window() -> None:
 
 def test_no_stale_metrics() -> None:
     """Assert that deprecated/stale numbers do not appear in any documentation."""
-    stale_values = ["39.032", "31.992", "39.605", "10.611"]
+    stale_values = ["31.992", "39.605", "10.611"]
     for doc_path in [MODEL_CARD_PATH, README_PATH, DECISIONS_PATH]:
         text = doc_path.read_text(encoding="utf-8")
         for stale in stale_values:
@@ -187,73 +261,158 @@ def test_schema_label_not_day_ahead() -> None:
             )
 
 
-def write_metrics_fixture(fixture_path: Path | str = FIXTURE_PATH) -> dict[str, Any]:
-    """Regenerate the frozen split metrics fixture from a real eval run."""
-    import pandas as pd
-
-    from gridcast.backtest import (
-        TEST_SPLIT_END_DATE,
-        TEST_SPLIT_START_DATE,
-        derive_test_split_origins,
-        run_rolling_origin_backtest,
-    )
-    from gridcast.cli import build_example_frame, default_issue_schedule, load_feature_sources
-
-    intensity_df, weather_df, mix_df = load_feature_sources()
-    schedule = default_issue_schedule("2024-11-08", TEST_SPLIT_END_DATE)
-    frame = build_example_frame(
-        intensity_df=intensity_df,
-        weather_df=weather_df,
-        mix_df=mix_df,
-        issue_times=schedule,
-        require_aux=True,
-    )
-    operator_forecasts = pd.Series(
-        intensity_df["forecast"].values,
-        index=pd.to_datetime(intensity_df["period_start_utc"], utc=True),
-    )
-    origins = derive_test_split_origins(TEST_SPLIT_START_DATE, TEST_SPLIT_END_DATE)
-    results = run_rolling_origin_backtest(
-        frame=frame,
-        origins=origins,
-        operator_forecasts=operator_forecasts,
-        verbose=False,
+def test_model_card_artifact_sha256_matches() -> None:
+    """Assert that the sha256 computed from data/models/lgbm_model.txt equals the card."""
+    card_text = MODEL_CARD_PATH.read_text(encoding="utf-8")
+    expected_hash = get_model_artifact_hash("data/models/lgbm_model.txt")
+    assert expected_hash in card_text, (
+        f"Artifact SHA-256 {expected_hash} not found in {MODEL_CARD_PATH}"
     )
 
-    pht = results.per_horizon_table
-    key_horizons = {}
-    for h in [2, 48, 96]:
-        row = pht[pht["horizon"] == h].iloc[0]
-        key_horizons[str(h)] = {
-            "model": round(float(row["model_mae"]), 2),
-            "operator": round(float(row["operator_mae"]), 2),
-            "persistence": round(float(row["persistence_mae"]), 2),
-            "seasonal_naive": round(float(row["seasonal_naive_mae"]), 2),
-            "periods": int(row["count"]),
-        }
 
-    origin_window = (
-        f"frozen split, {TEST_SPLIT_START_DATE} to {TEST_SPLIT_END_DATE}, "
-        f"{len(origins)} origins, 2026-11-02 run"
+def test_archive_commit_consistency() -> None:
+    """Assert that the fixture carries the archive commit and docs name it."""
+    computed = compute_published_metrics()
+    assert "archive_commit" in computed, "Computed metrics must carry 'archive_commit'"
+    commit = computed["archive_commit"]
+    for doc_path in [MODEL_CARD_PATH, README_PATH, DECISIONS_PATH]:
+        text = doc_path.read_text(encoding="utf-8")
+        assert commit in text, f"{doc_path} must name the archive commit '{commit}'"
+
+
+def test_guard_blind_spot_documented() -> None:
+    """Assert that the guard's blind spot against live runs is named in docs and tests."""
+    computed = compute_published_metrics()
+    assert computed is not None
+    for doc_path in [MODEL_CARD_PATH, DECISIONS_PATH]:
+        text = doc_path.read_text(encoding="utf-8")
+        assert "blind spot" in text.lower(), f"{doc_path} must name the guard's blind spot"
+
+
+def test_fixture_file_is_hashes_only() -> None:
+    """Requirement 4: tests/fixtures/frozen_split_metrics.json has only recorded hashes.
+
+    Asserts it no longer contains scalars or key_horizons, preventing it from being
+    a second authority for published numbers.
+    """
+    assert HASHES_FIXTURE_PATH.exists(), f"Fixture not found at {HASHES_FIXTURE_PATH}"
+    with open(HASHES_FIXTURE_PATH, encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert "scalars" not in data, "Fixture file must not contain 'scalars'"
+    assert "key_horizons" not in data, "Fixture file must not contain 'key_horizons'"
+    assert "archive_commit" in data, "Fixture file must contain 'archive_commit'"
+    assert "parquet_sha256" in data, "Fixture file must contain 'parquet_sha256'"
+    assert "model_artifact_sha256" in data, "Fixture file must contain 'model_artifact_sha256'"
+
+
+def _assert_line_valid_for_fixture_hash(line: str, location: str) -> None:
+    """Helper asserting line pairing fixture sha256 205222ce contains no score other than 39.032."""
+    if "205222ce" not in line:
+        return
+    # Must not contain stale 39.043
+    assert "39.043" not in line, (
+        f"{location} pairs fixture hash 205222ce with stale 39.043: {line}"
+    )
+    # Any 39.xxx score on this line must be 39.032
+    for score in re.findall(r"\b39\.\d{3}\b", line):
+        assert score == "39.032", (
+            f"{location} pairs fixture hash 205222ce with score {score} != 39.032: {line}"
+        )
+    # Any GATE_VALUE match on this line must be 39.032
+    for gv in re.findall(r"GATE_VALUE\s*=\s*`?([0-9]+\.[0-9]+)`?", line):
+        assert gv == "39.032", (
+            f"{location} pairs fixture hash 205222ce with GATE_VALUE {gv} != 39.032: {line}"
+        )
+
+
+def test_no_line_pairs_fixture_hash_with_non_fixture_score() -> None:
+    """Assert no line of docs pairs fixture sha256 205222ce with any value other than 39.032."""
+    for doc_path in [DECISIONS_PATH, MODEL_CARD_PATH]:
+        text = doc_path.read_text(encoding="utf-8")
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            _assert_line_valid_for_fixture_hash(line, f"{doc_path}:{line_no}")
+
+
+@pytest.mark.parametrize(
+    "restored_line",
+    [
+        (
+            "Score the test split (frozen fixture v1, sha256 "
+            "205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, "
+            "archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins) "
+            "against this threshold. The candidate achieved `GATE_VALUE = 39.043 gCO2/kWh`"
+        ),
+        (
+            "whereas on the committed documented split (frozen fixture v1, sha256 "
+            "205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, "
+            "archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins) "
+            "it scored 39.043"
+        ),
+        (
+            "On the frozen test split (frozen fixture v1, sha256 "
+            "205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, "
+            "archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins), "
+            "the candidate scores `GATE_VALUE = 39.043 gCO2/kWh`"
+        ),
+    ],
+)
+def test_guard_fails_if_stale_line_restored(restored_line: str) -> None:
+    """Prove guard fails if any of the three pre-freeze lines pairing v1 with 39.043 is restored."""
+    # Precondition assertion (brief template section 5): prove injected line has 205222ce and 39.043
+    assert "205222ce" in restored_line, "Precondition failed: restored line must have 205222ce"
+    assert "39.043" in restored_line, "Precondition failed: restored line must have 39.043"
+
+    with pytest.raises(AssertionError) as exc_info:
+        _assert_line_valid_for_fixture_hash(restored_line, "restored_test_line")
+    assert "39.043" in str(exc_info.value)
+
+
+def test_pinned_eval_fixture_sha256_matches_docs() -> None:
+    """Assert PINNED_EVAL_FIXTURE_SHA256 equals the sha256 quoted in ADR and MODEL_CARD.md."""
+    from gridcast.backtest import PINNED_EVAL_FIXTURE_SHA256
+
+    assert len(PINNED_EVAL_FIXTURE_SHA256) == 64
+    assert PINNED_EVAL_FIXTURE_SHA256 == (
+        "205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4"
     )
 
+    model_card_text = MODEL_CARD_PATH.read_text(encoding="utf-8")
+    decisions_text = DECISIONS_PATH.read_text(encoding="utf-8")
+
+    assert PINNED_EVAL_FIXTURE_SHA256 in model_card_text, (
+        f"PINNED_EVAL_FIXTURE_SHA256 not found in {MODEL_CARD_PATH}"
+    )
+    assert PINNED_EVAL_FIXTURE_SHA256 in decisions_text, (
+        f"PINNED_EVAL_FIXTURE_SHA256 not found in {DECISIONS_PATH}"
+    )
+
+
+def test_model_artifact_hash_commands_and_object_id_documented() -> None:
+    """Assert both hash commands (content sha256, git hash-object) are in MODEL_CARD.md."""
+    card_text = MODEL_CARD_PATH.read_text(encoding="utf-8")
+
+    # Both exact commands
+    assert "git hash-object data/models/lgbm_model.txt" in card_text
+    assert "python -c" in card_text and "read_text" in card_text and "sha256" in card_text
+
+    # Both hash values
+    assert "8f841a6f048242085a36c33ed8b92b7acdf6d8e7" in card_text
+    assert "5ddfe624a05dee49fa2ec339f6d22ba4ad6783dfcb1ea30eb7bca4a501e19e15" in card_text
+
+    # Statement of which one GET /model returns
+    assert "GET /model" in card_text
+    assert "object id" in card_text.lower() or "object database" in card_text.lower()
+
+
+def write_metrics_fixture(fixture_path: Path | str = HASHES_FIXTURE_PATH) -> dict[str, Any]:
+    """Regenerate the recorded hashes fixture from data/eval/."""
+    meta = compute_published_metrics()
     data: dict[str, Any] = {
-        "run_date": "2026-11-02",
-        "origin_window": origin_window,
-        "start_date": TEST_SPLIT_START_DATE,
-        "end_date": TEST_SPLIT_END_DATE,
-        "origins_count": len(origins),
-        "first_origin": str(origins[0].strftime("%Y-%m-%d %H:%M UTC")),
-        "last_origin": str(origins[-1].strftime("%Y-%m-%d %H:%M UTC")),
-        "scalars": {
-            "model": round(float(results.gate_value), 3),
-            "operator": round(float(results.operator_gate_value), 3),
-            "persistence": round(float(results.persistence_gate_value), 3),
-            "seasonal_naive": round(float(results.seasonal_naive_gate_value), 3),
-        },
-        "key_horizons": key_horizons,
+        "archive_commit": meta["archive_commit"],
+        "parquet_sha256": meta["parquet_sha256"],
+        "model_artifact_sha256": meta["model_artifact_sha256"],
     }
-
     out_path = Path(fixture_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(data, indent=2) + "\n"

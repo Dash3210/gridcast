@@ -23,7 +23,11 @@ from gridcast.features import (
 
 __all__: list[str] = [
     "DEFAULT_LGBM_PARAMS",
+    "MODEL_VERSION",
     "assert_baseline_provenance",
+    "get_model_artifact_hash",
+    "get_model_version",
+    "load_model_booster",
     "model_artifact_hash",
     "predict_lgbm",
     "predict_persistence",
@@ -274,3 +278,33 @@ def model_artifact_hash(booster: lgb.Booster) -> str:
     """
     model_str = booster.model_to_string()
     return hashlib.sha256(model_str.encode("utf-8")).hexdigest()
+
+
+MODEL_VERSION: Final[str] = "lgbm-v1"
+
+
+def get_model_version() -> str:
+    """Return model version identifier."""
+    return MODEL_VERSION
+
+
+def get_model_artifact_hash(artifact_path: Path | str = "data/models/lgbm_model.txt") -> str:
+    """Compute SHA-256 hash of the committed LightGBM model artifact text representation.
+
+    Reads model text using universal newlines to guarantee identical SHA-256 hashes
+    across Windows and POSIX platforms regardless of checkout line endings.
+    """
+    p = Path(artifact_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Model artifact not found at {p}")
+    text = p.read_text(encoding="utf-8")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def load_model_booster(artifact_path: Path | str = "data/models/lgbm_model.txt") -> lgb.Booster:
+    """Load LightGBM Booster from artifact file, CRLF-safe across platforms."""
+    p = Path(artifact_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Model artifact not found at {p}")
+    text = p.read_text(encoding="utf-8")
+    return lgb.Booster(model_str=text)

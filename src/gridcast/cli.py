@@ -227,6 +227,120 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Do not return non-zero exit code if gate fails.",
     )
+
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="Run model evaluation benchmark from frozen fixture.",
+    )
+    eval_parser.add_argument(
+        "--fixture",
+        type=str,
+        default="data/eval/frozen_split_v1.parquet",
+        help="Path to frozen split parquet fixture (default: data/eval/frozen_split_v1.parquet).",
+    )
+    eval_parser.add_argument(
+        "--sidecar",
+        type=str,
+        default="data/eval/frozen_split_v1.json",
+        help="Path to fixture sidecar metadata JSON (default: data/eval/frozen_split_v1.json).",
+    )
+    eval_parser.add_argument(
+        "--no-verbose",
+        dest="verbose",
+        action="store_false",
+        default=True,
+        help="Disable detailed table output.",
+    )
+
+    eval_refresh_parser = subparsers.add_parser(
+        "eval-refresh",
+        help="Rebuild frame and refresh evaluation fixture (slow, manual).",
+    )
+    eval_refresh_parser.add_argument(
+        "--version",
+        type=str,
+        default="v1",
+        help="Fixture version identifier (default: v1; write v2 if model changes).",
+    )
+    eval_refresh_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="data/eval",
+        help="Output directory for fixture files (default: data/eval).",
+    )
+    eval_refresh_parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Start date for test split (default: 2026-09-05).",
+    )
+    eval_refresh_parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="End date for test split (default: 2026-11-01).",
+    )
+    eval_refresh_parser.add_argument(
+        "--num-boost-round",
+        type=int,
+        default=100,
+        help="Number of boosting iterations per fold (default: 100).",
+    )
+    eval_refresh_parser.add_argument(
+        "--reconcile-window-days",
+        type=int,
+        default=3,
+        help="Required age buffer in days behind newest archive period (default: 3).",
+    )
+    eval_refresh_parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Force overwrite of existing fixture.",
+    )
+
+    eval_reproduce_parser = subparsers.add_parser(
+        "eval-reproduce",
+        help="Retrain 15 folds and verify candidate predictions against fixture (slow, manual).",
+    )
+    eval_reproduce_parser.add_argument(
+        "--fixture",
+        type=str,
+        default="data/eval/frozen_split_v1.parquet",
+        help="Path to frozen split parquet fixture (default: data/eval/frozen_split_v1.parquet).",
+    )
+    eval_reproduce_parser.add_argument(
+        "--sidecar",
+        type=str,
+        default="data/eval/frozen_split_v1.json",
+        help="Path to fixture sidecar metadata JSON (default: data/eval/frozen_split_v1.json).",
+    )
+    eval_reproduce_parser.add_argument(
+        "--max-pred-tolerance",
+        type=float,
+        default=0.0,
+        help="Maximum allowed per-row absolute difference for predictions (default: 0.0).",
+    )
+    eval_reproduce_parser.add_argument(
+        "--gate-value-tolerance",
+        type=float,
+        default=0.0,
+        help="Maximum allowed absolute difference for GATE_VALUE (default: 0.0).",
+    )
+    eval_reproduce_parser.add_argument(
+        "--no-verbose",
+        dest="verbose",
+        action="store_false",
+        default=True,
+        help="Disable detailed progress and table output.",
+    )
+    eval_reproduce_parser.add_argument(
+        "--quiet",
+        dest="verbose",
+        action="store_false",
+        help="Suppress progress and table output.",
+    )
+
     subparsers.add_parser("serve", help="Run forecast API service.")
     subparsers.add_parser("version", help="Print package version.")
 
@@ -358,6 +472,88 @@ def run_backtest_cli(
     return 0
 
 
+def run_eval_cli(
+    fixture_path: Path | str = "data/eval/frozen_split_v1.parquet",
+    sidecar_path: Path | str = "data/eval/frozen_split_v1.json",
+    verbose: bool = True,
+    pinned_sha256: str | None = None,
+) -> int:
+    """Run model evaluation benchmark reading only the frozen fixture."""
+    from gridcast.backtest import PINNED_EVAL_FIXTURE_SHA256, evaluate_from_fixture
+
+    resolved_pin = PINNED_EVAL_FIXTURE_SHA256 if pinned_sha256 is None else pinned_sha256
+
+    try:
+        evaluate_from_fixture(
+            parquet_path=fixture_path,
+            sidecar_path=sidecar_path,
+            verbose=verbose,
+            pinned_sha256=resolved_pin,
+        )
+        return 0
+    except ValueError as e:
+        print(f"Evaluation refused: {e}", file=sys.stderr)
+        return 1
+
+
+def run_eval_reproduce_cli(
+    fixture_path: Path | str = "data/eval/frozen_split_v1.parquet",
+    sidecar_path: Path | str = "data/eval/frozen_split_v1.json",
+    max_pred_tolerance: float = 0.0,
+    gate_value_tolerance: float = 0.0,
+    verbose: bool = True,
+) -> int:
+    """Retrain 15 folds on frozen origins and verify candidate predictions against fixture."""
+    from gridcast.backtest import reproduce_eval_fixture
+
+    try:
+        reproduce_eval_fixture(
+            parquet_path=fixture_path,
+            sidecar_path=sidecar_path,
+            max_pred_tolerance=max_pred_tolerance,
+            gate_value_tolerance=gate_value_tolerance,
+            verbose=verbose,
+        )
+        return 0
+    except Exception as e:
+        print(f"Reproduction check failed: {e}", file=sys.stderr)
+        return 1
+
+
+
+def run_eval_refresh_cli(
+    version: str = "v1",
+    output_dir: Path | str = "data/eval",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    num_boost_round: int = 100,
+    reconcile_window_days: int = 3,
+    verbose: bool = True,
+    force: bool = False,
+) -> int:
+    """Rebuild evaluation frame and refresh frozen fixture."""
+    from gridcast.backtest import (
+        TEST_SPLIT_END_DATE,
+        TEST_SPLIT_START_DATE,
+        refresh_eval_fixture,
+    )
+
+    resolved_start = start_date or TEST_SPLIT_START_DATE
+    resolved_end = end_date or TEST_SPLIT_END_DATE
+
+    refresh_eval_fixture(
+        version=version,
+        output_dir=output_dir,
+        start_date=resolved_start,
+        end_date=resolved_end,
+        num_boost_round=num_boost_round,
+        reconcile_window_days=reconcile_window_days,
+        verbose=verbose,
+        force=force,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point for gridcast."""
     parser = build_parser()
@@ -383,6 +579,33 @@ def main(argv: list[str] | None = None) -> int:
             end_date=getattr(args, "end_date", None),
             num_boost_round=args.num_boost_round,
             fail_on_gate=args.fail_on_gate,
+        )
+
+    if args.subcommand == "eval":
+        return run_eval_cli(
+            fixture_path=args.fixture,
+            sidecar_path=args.sidecar,
+            verbose=args.verbose,
+        )
+
+    if args.subcommand == "eval-reproduce":
+        return run_eval_reproduce_cli(
+            fixture_path=args.fixture,
+            sidecar_path=args.sidecar,
+            max_pred_tolerance=args.max_pred_tolerance,
+            gate_value_tolerance=args.gate_value_tolerance,
+            verbose=args.verbose,
+        )
+
+    if args.subcommand == "eval-refresh":
+        return run_eval_refresh_cli(
+            version=args.version,
+            output_dir=args.output_dir,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            num_boost_round=args.num_boost_round,
+            reconcile_window_days=args.reconcile_window_days,
+            force=args.force,
         )
 
     if args.subcommand == "ingest":

@@ -1371,14 +1371,35 @@ class TestDenseValueGridOracle:
         self,
         curated_sample_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
     ) -> None:
-        """For issue 2026-10-31 at h=96, target_time is 2026-11-02T00:00Z (past store end).
+        """For an issue whose h=96 target is past the weather store end, assert the builder and
+        oracle both yield null and agree for temperature and both rolling statistics.
 
-        Assert builder and oracle both yield null and agree for temperature and both
-        rolling statistics (temperature_24h_mean, temperature_24h_min).
+        The boundary is derived from the store, not hardcoded: the newest weather period moves
+        with every ingest, so a fixed issue date stops being past the store end (it did on
+        2026-11-07, when 2026-10-31 h=96 started returning 9.7 instead of null).
         """
         intensity_df, weather_df, mix_df = curated_sample_data
-        issue_time = issue_time_for_date("2026-10-31")
         h = 96
+        weather_max = pd.to_datetime(weather_df["period_start_utc"], utc=True).max()
+        issue_time = None
+        target_time = None
+        for candidate in sorted(
+            pd.to_datetime(intensity_df["period_start_utc"], utc=True).dt.date.unique()
+        ):
+            ts = issue_time_for_date(str(candidate))
+            candidate_target = ts + pd.Timedelta(minutes=30) * h
+            if candidate_target > weather_max:
+                issue_time = ts
+                target_time = candidate_target
+                break
+        assert issue_time is not None and target_time is not None, (
+            "Precondition failed: no issue date in the store has an h=96 target past the "
+            f"weather store end ({weather_max}); the boundary test cannot be constructed"
+        )
+        assert target_time > weather_max, (
+            f"Precondition failed: derived target {target_time} is not past the weather store "
+            f"end {weather_max}"
+        )
 
         frame = build_example_frame(
             intensity_df=intensity_df,
@@ -1401,10 +1422,10 @@ class TestDenseValueGridOracle:
                 col,
             )
             assert pd.isna(builder_val), (
-                f"Builder must yield null for '{col}' at 2026-10-31 h=96, got {builder_val}"
+                f"Builder must yield null for '{col}' at {issue_time} h={h}, got {builder_val}"
             )
             assert pd.isna(oracle_val), (
-                f"Oracle must yield null for '{col}' at 2026-10-31 h=96, got {oracle_val}"
+                f"Oracle must yield null for '{col}' at {issue_time} h={h}, got {oracle_val}"
             )
             assert math.isnan(float(builder_val)) and math.isnan(float(oracle_val))
 

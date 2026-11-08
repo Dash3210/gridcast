@@ -8,7 +8,7 @@ PYTHON ?= python3
 PY ?= .venv/bin/python
 endif
 
-.PHONY: help install test data-check clean ingest features train eval serve docker lint typecheck check metrics-fixture
+.PHONY: help install test data-check clean ingest features train eval eval-refresh eval-reproduce serve docker lint typecheck check metrics-fixture
 .DEFAULT_GOAL := help
 
 help:
@@ -20,7 +20,9 @@ help:
 	@echo   ingest          - Run ingest CLI
 	@echo   features        - Build and inspect the example feature frame
 	@echo   train           - Run model training CLI
-	@echo   eval            - Run model evaluation backtest and accuracy gate
+	@echo   eval            - Run model evaluation benchmark from frozen fixture
+	@echo   eval-refresh    - Rebuild and refresh frozen evaluation fixture (slow, manual)
+	@echo   eval-reproduce  - Retrain 15 folds and verify candidate predictions against fixture (slow, manual)
 	@echo   metrics-fixture - Regenerate frozen split metrics fixture from eval run
 	@echo   serve           - Run service API (arrives in P4)
 	@echo   docker          - Build Docker image (arrives in P5)
@@ -54,7 +56,13 @@ train:
 	"$(PY)" -m gridcast.cli train
 
 eval:
-	"$(PY)" -m gridcast.cli backtest
+	"$(PY)" -m gridcast.cli eval
+
+eval-refresh:
+	"$(PY)" -m gridcast.cli eval-refresh
+
+eval-reproduce:
+	"$(PY)" -m gridcast.cli eval-reproduce
 
 metrics-fixture:
 	"$(PY)" -c "from tests.test_model_card_consistency import write_metrics_fixture; write_metrics_fixture()"
