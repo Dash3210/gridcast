@@ -571,3 +571,59 @@
   - Silently serving yesterday's issue as if it were today's (rejected: deceptive and masks ingest timing dependencies).
   - Imputing missing recent actuals with forward-fill or persistence (rejected: violates no-fabrication contract).
   - Deriving or floating the anchor from run time `now()` to fix staleness (rejected: presents out-of-distribution anchor hours and features the model never saw; arbitrary anchors require a v3 model trained across a spread of anchor hours with its own fixture, not an ad-hoc serving-time change).
+
+## ADR-026 — Serving boundary security: fixed anchor enforcement, error sanitization, bounded metric cardinality, and atomic reload snapshots
+- Status: accepted
+- Date: 2026-11-08
+- Context:
+  Security audit and boundary contract hardening identified vulnerabilities in the serving layer:
+  1. Accepting arbitrary intraday issue anchors (e.g. `12:00:00Z`) evaluated predictions against phase-shifted diurnal cycles.
+  2. Non-ISO or invalid dates caused unhandled exceptions escaping as 500 errors.
+  3. Administrative reload token accepted in query parameters risked token leakage into access logs and proxies.
+  4. Error responses leaked local filesystem paths and internal LightGBM artifact filenames.
+  5. `endpoint = request.url.path` in Prometheus middleware exposed an unbounded metric cardinality explosion vector under path fuzzing.
+  6. Non-atomic artifact reloading allowed threadpool race conditions between forecast reads and reload updates.
+- Decision:
+  1. Enforce 00:00 Europe/London anchor at the boundary: `date` and `issue_time` are validated strictly. If the resolved instant is not exactly 00:00 Europe/London, return HTTP 422 with a structured error stating anchors must be 00:00 Europe/London.
+  2. Safe parameter parsing: All parses of `date` and `issue_time` are safely wrapped. Invalid dates, path traversal strings, null bytes, or oversized payloads return HTTP 422 with generic error detail without reflecting user input or host paths.
+  3. Header-only reload authentication: Remove the `token` query parameter entirely. Reload token is accepted exclusively via `Authorization: Bearer <token>` (or `X-Reload-Token`), verified with constant-time `secrets.compare_digest`.
+  4. Error body sanitization: 5xx errors return generic messages without host paths or artifact filenames; full exceptions are logged server-side. `FeatureSourceGapError` (503) names the missing feature and timestamp, omitting store directory paths.
+  5. Bound metric cardinality: Prometheus middleware extracts route templates (`request.scope.get('route').path`) and maps unmatched paths to `"unmatched"`, bounding metric label cardinality to static declared endpoints.
+  6. Atomic state swapping: State is represented as an immutable `ModelSnapshot` dataclass swapped with a single pointer assignment under lock. Forecast requests capture a single snapshot at entry and use it across feature resolution, prediction, and interval bracketing.
+- Consequences:
+  Hardened, production-ready serving layer compliant with secure API standards and immune to path fuzzing cardinality attacks.
+- Alternatives rejected:
+  - Allowing arbitrary issue timestamps (rejected: corrupts diurnal diurnal features and invalidates calibrated intervals).
+  - Leaving query parameter token support (rejected: security vulnerability logging secrets in proxy access logs).
+  - In-place mutation of service state during reload (rejected: introduces race conditions and inconsistent response data).
+
+## ADR-027 — Serving guard testability: macro mean metric exposition, BST midnight normalization, honest snapshot swap semantics, and liveness vs readiness separation
+- Status: accepted
+- Date: 2026-11-08
+- Context:
+  Review of Phase P4 serving guards identified areas where guards over-rejected legitimate requests, reported aggregated statistics inconsistent with scalar evaluation definitions, or coupled probe mechanics:
+  1. `/metrics` previously calculated the simple row mean of `abs_error` (28.625 gCO2/kWh) rather than the project's canonical scalar evaluation metric (`GATE_VALUE`), which is the macro mean (unweighted mean of per-horizon MAEs: 29.308 gCO2/kWh). Furthermore, test expectations mirrored implementation functions rather than defining differential expectations.
+  2. Anchor validation previously rejected offsets strictly, causing legitimate midnight instants during British Summer Time (BST, e.g. `2026-07-01T00:00:00+01:00` and `2026-10-25T00:00:00+01:00`) to be rejected as 422 because query parameter `+` was decoded into spaces and offset normalization did not convert all instant representations to `00:00 Europe/London`.
+  3. Reload atomicity previously claimed mutex-guarded consistency, but readers read an immutable snapshot reference without a mutex lock. The true mechanism is one immutable snapshot reference (`ModelSnapshot`) read once per request; the writer lock serializes reload updates only.
+  4. `/health` previously coupled liveness and data age, returning 503 when data was older than 48 hours. Because today's issue is buildable only after ~09:00Z, `is_current_issue` is naturally false for 9 hours daily. Coupling liveness to freshness would trigger spurious container restarts.
+  5. The scoreboard metric gauge did not expose sample sizes, masking that operator series represented only 33 rows across horizons 1-33 rather than 96 settled horizons.
+  6. Parameter `hours` was insufficiently specified as anchor-relative vs wall-clock relative.
+- Decision:
+  1. Scalar metric exposition: `/metrics` computes `gridcast_last_measured_mae` as the unweighted mean of per-horizon MAEs (macro mean), matching `GATE_VALUE`. Accompanied by a companion sample count gauge `gridcast_last_measured_mae_samples{series,plane}`. The operator series is labeled `status="partial"`, `horizons="1-33"`, never "settled".
+  2. BST midnight normalization: Anchor parsing converts query-decoded space before offset back to `+` and validates that the converted instant is `00:00:00 Europe/London` regardless of input offset representation. 00:00 local is verified never in ambiguous or nonexistent daylight savings windows.
+  3. Honest snapshot reload mechanism: Service holds a single immutable `ModelSnapshot` reference. Prediction requests capture this reference once upon entry. `swap_snapshot` executes under a writer lock to serialize concurrent reload requests, updating the reference via a single atomic pointer assignment.
+  4. Liveness and readiness separation:
+     - `/health` is strictly a liveness probe: returns HTTP 200 as long as the process is up and model booster is loaded.
+     - `/ready` is the readiness probe: returns HTTP 200 when the served issue is fresh (<= 27 hours old, providing a 24h expected publish cadence + 3h measured margin); returns HTTP 503 Service Unavailable when the served issue is older than 27 hours.
+     - `/metrics` exposes `gridcast_served_issue_age_seconds` gauge.
+  5. Anchor-relative `hours` contract: `hours` is documented and validated as counted strictly from the issue anchor (`target_time = issue_time + horizon * 30min`), never from `now()`. The response envelope includes `contains_future_points: bool` (true if any target period is in the future relative to request time) and monotonic `generation`. Point count invariant `len(points) == hours * 2` is asserted across hours.
+  6. Exact endpoint label set: Prometheus endpoint label set is strictly asserted to equal `{"/forecast", "/health", "/metrics", "unmatched"}`, and fuzzed with 200 random unknown paths to prove zero label cardinality growth.
+  7. Containerisation claim: Containerisation is explicitly deferred to Phase P5.
+  8. Prediction interval caveat: 87 summer validation samples per horizon understate winter volatility; calibration is descriptive, not a guarantee.
+- Consequences:
+  All serving guards are verifiable, robust, honest, and decouple liveness from freshness.
+- Alternatives rejected:
+  - Recomputing simple row averages for `/metrics` (rejected: disagrees with the project's macro mean scalar).
+  - Rejecting non-UTC offsets for midnight anchors (rejected: over-rejects legitimate BST midnight instants).
+  - Reader-side mutex locking (rejected: unnecessary contention overhead when snapshot is immutable and referenced via atomic pointer assignment).
+  - Alarming liveness probes on unbuildable morning hours (rejected: causes alarm fatigue and container reboot loops).

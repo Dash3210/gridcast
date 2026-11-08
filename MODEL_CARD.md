@@ -58,31 +58,33 @@ The model has no native interval. Prediction intervals are generated using per-h
 - **Interval construction**: `lower = pred + q10(h)`, `upper = pred + q90(h)`.
 - **Bracketing invariant**: By construction, $q_{10}(h) \le 0 \le q_{90}(h)$ guarantees that `lower <= value <= upper` for every horizon. All 96 horizons satisfy this natively without widening.
 - **Empirical validation coverage**: The empirical coverage of these bands on the validation split is **79.31%** (6,624 of 8,352 points covered).
-- **Caveat & Calibration Notice**: This is a calibration sample, not a guarantee.
+- **Caveat & Calibration Notice**: 87 summer samples per horizon understate winter volatility; calibration is descriptive, not a guarantee.
 - **Fixture Isolation**: Quantiles are calibrated strictly on the validation split (`2026-06-05` to `2026-08-30`) and never on `data/eval`, preventing evaluation test data leakage into served predictions.
 
 ### Serving Endpoints (Phase P4 Contracts)
 
 | Endpoint | Method | Contract & Invariants |
 |---|---|---|
-| `/health` | `GET` | Returns HTTP 200 when healthy; reports `model_version`, `training_date`, `training_window`, `content_sha256`, `feature_count`, `interval_sha256`, `data_freshness_at`, `served_issue_time`, and `is_current_issue`. Returns HTTP 503 (unhealthy) when `data_freshness_at` is older than 48 hours relative to current time while still exposing `served_issue_time` and `is_current_issue`. |
-| `/forecast` | `GET` | Query parameter `hours` validated to `1..48` integer (invalid values return HTTP 422 with accepted range `[1, 48]`). Returns response wrapper with `issue_time`, `generated_at`, `is_current_issue`, `retrospective_horizons`, `hours`, and `points`. When `is_current_issue` is false, includes `fallback_reason` naming the null feature and date. When `hours=48`, `points` contains exactly **96** points with timestamps strictly increasing by 30 minutes; each point contains `horizon`, `timestamp`, `target_time`, `value`, `lower`, and `upper` where `lower <= value <= upper`. |
-| `/metrics` | `GET` | Exposes Prometheus text exposition including request counter (`gridcast_requests_total`), latency histogram (`gridcast_request_duration_seconds`), and last measured MAE (`gridcast_last_measured_mae` with `plane="live_scoreboard"` and `horizons` labels) from `data/scoreboard/scores.csv` for candidate, operator, and persistence. Unsettled series (candidate) are exposed as absent with status label and NaN without printing plausible constants. |
-| `/model` | `GET` | Returns JSON matching model card metadata: `version`, `content_sha256`, `training_window`, `feature_count`, and `interval_sha256`. |
-| `/reload` | `POST` | Reloads model and interval artifacts. Authenticated via `GRIDCAST_RELOAD_TOKEN` (constant-time `secrets.compare_digest`). Status codes: 401 for a missing or wrong token when a token is configured, 503 when `GRIDCAST_RELOAD_TOKEN` is unset (no auth configured, so the endpoint is closed), 200 on success, 500 when the artifact cannot be loaded and the old booster is kept. |
+| `/health` | `GET` | Liveness probe: returns HTTP 200 while process is up and model booster is loaded. Reports `status="ok"`, `model_version`, `training_date`, `training_window`, `content_sha256`, `feature_count`, `interval_sha256`, `data_freshness_at`, `served_issue_time`, and `is_current_issue`. |
+| `/ready` | `GET` | Readiness probe: returns HTTP 200 when served issue is fresh (<= 27 hours old; 24h expected publish + 3h measured margin), returns HTTP 503 Service Unavailable when served issue is older than 27 hours. Accompanied by `gridcast_served_issue_age_seconds` gauge in `/metrics`. |
+| `/forecast` | `GET` | Parameter `hours` is anchor-relative, counted strictly from the anchor (`target_time = issue_time + horizon * 30min`), validated to `1..48` integer (invalid values return HTTP 422 with accepted range `[1, 48]`). Anchors (`date` or `issue_time`) are strictly enforced at the boundary to 00:00 Europe/London across timezones/offsets; non-midnight anchors or invalid dates return HTTP 422 with structured errors without reflecting inputs or host paths. Returns response wrapper with `issue_time`, `generated_at`, `is_current_issue`, `contains_future_points`, `retrospective_horizons`, `hours`, `model_version`, `content_sha256`, `interval_sha256`, `model_hash`, `interval_hash`, `generation`, `state_version`, and `points`. When `is_current_issue` is false, includes `fallback_reason` naming the null feature and date. For `hours` in 1..48, `len(points) == hours * 2` with timestamps strictly increasing by 30 minutes; each point contains `horizon`, `timestamp`, `target_time`, `value`, `lower`, and `upper` where `lower <= value <= upper`. |
+| `/metrics` | `GET` | Exposes Prometheus text exposition including request counter (`gridcast_requests_total`), latency histogram (`gridcast_request_duration_seconds`), served issue age (`gridcast_served_issue_age_seconds`), last measured MAE macro mean (`gridcast_last_measured_mae` with `plane="live_scoreboard"` and `horizons` labels) computed as the unweighted mean of per-horizon MAEs matching project scalar evaluation, and companion sample size gauge (`gridcast_last_measured_mae_samples{series,plane}`). The operator series is labeled `status="partial"`, `horizons="1-33"` (n=33), never "settled". Unsettled series (candidate) are exposed as absent with status label and NaN. Exact endpoint label set is strictly bounded to `{"/forecast", "/health", "/metrics", "unmatched"}`. |
+| `/model` | `GET` | Returns JSON matching model card metadata: `version`, `content_sha256`, `training_window`, `feature_count`, `interval_sha256`, and monotonic `generation`. |
+| `/reload` | `POST` | Reloads model and interval artifacts. Authenticated exclusively via `Authorization: Bearer <token>` header (or `X-Reload-Token`) using constant-time `secrets.compare_digest`. Status codes: 401 for a missing or wrong token when configured, 503 when `GRIDCAST_RELOAD_TOKEN` is unset, 200 on success, 500 when artifact cannot be loaded (returning generic error detail without host paths or filenames while keeping active in-memory snapshot intact). |
 
 ### Feature Path & Source Gap Handling
 
 - **Single feature path**: In-service feature resolution calls `resolve_features_for_issue()`, which drives `build_example_frame()`, asserting row-for-row equality with the backtest frame.
-- **No nulls reach the model**: When an upstream source gap causes null values in any required model feature, the service refuses the request with named structured error `FeatureSourceGapError` (HTTP 503), reporting the corrupted features and timestamp. Silent NaNs are strictly forbidden.
+- **No nulls reach the model**: When an upstream source gap causes null values in any required model feature, the service refuses the request with named structured error `FeatureSourceGapError` (HTTP 503), reporting the corrupted features and timestamp without exposing internal directory paths. Silent NaNs are strictly forbidden.
 
-### Operational Characteristics and Serving Contract (ADR-025)
+### Operational Characteristics and Serving Contract (ADR-025, ADR-026)
 
 - **Issue availability timing**: The current-day issue becomes buildable only after the nightly ingest, because `actual_recent_3h` needs the previous day's 21:00 actual and the ingest runs around 09:00Z.
 - **Explicit fallback labeling**: Before the nightly ingest lands, the service serves the newest buildable issue and says so via `issue_time` and `is_current_issue` (with `fallback_reason` naming the null feature and date when `is_current_issue` is false). Refusing to build with a null feature is deliberate: imputing the missing actual would be fabrication.
 - **Retrospective horizons**: Horizons earlier than the publication time are retrospective (`retrospective_horizons`), because the 00:00 issue is published when the nightly ingest makes it buildable.
-- **Fixed 00:00 Europe/London anchor**: Anchors are fixed at 00:00 Europe/London. Arbitrary anchors would require a v3 model trained across a spread of anchor hours, with its own fixture - not a serving-time change.
-- **Reload status codes**: 401 for a missing or wrong token when a token is configured, 503 when `GRIDCAST_RELOAD_TOKEN` is unset (no auth configured, so the endpoint is closed), 200 on success, 500 when the artifact cannot be loaded and the old booster is kept.
+- **Fixed 00:00 Europe/London anchor**: Anchors are fixed at 00:00 Europe/London. Non-00:00 Europe/London timestamps return HTTP 422 at the serving boundary. Arbitrary anchors would require a v3 model trained across a spread of anchor hours, with its own fixture - not a serving-time change.
+- **Reload status codes**: 401 for a missing or wrong token when a token is configured (header only), 503 when `GRIDCAST_RELOAD_TOKEN` is unset (no auth configured, so the endpoint is closed), 200 on success, 500 when the artifact cannot be loaded and the old booster is kept.
+- **Snapshot Reload Mechanism**: One immutable snapshot reference (`ModelSnapshot`), read once per request; a mutex serialises reload writers during snapshot swap so concurrent forecast requests observe an internally consistent snapshot without reader locks.
 
 ### Lineage and Historical Artifacts
 Model version `lgbm-v1` existed previously with 29 features:
@@ -208,16 +210,17 @@ All skill metrics are computed inside `compute_skill_score` asserting identical 
 
 ```
 frozen fixture v2 (Sep 5 - Nov 1, 15 origins)   persistence 53.741   operator 11.666
-live scoreboard   (Nov 2 - Nov 7, settled)      persistence 28.625   operator  9.152
+live scoreboard   (Nov 2 - Nov 7, settled)      persistence 29.308   operator  9.152
 ```
 
 Card lines for both planes:
-- `persistence (frozen backtest, 15 origins)`: **53.741** gCO2/kWh
-- `operator (frozen backtest, 15 origins)`: **11.666** gCO2/kWh
-- `persistence (live scoreboard, settled horizons)`: **28.625** gCO2/kWh
-- `operator (live scoreboard, settled horizons)`: **9.152** gCO2/kWh
+- `persistence (frozen backtest, 15 origins)`: **53.741** gCO2/kWh (n=1440)
+- `operator (frozen backtest, 15 origins)`: **11.666** gCO2/kWh (n=1440)
+- `persistence (live scoreboard, settled horizons)`: **29.308** gCO2/kWh (n=464)
+- `operator (live scoreboard, partial horizons 1-33)`: **9.152** gCO2/kWh (n=33)
 
-Persistence is the same definition in both planes: reconstructing a flat curve from `actual(issue - 3h)` over the live window gives 28.683 (bands 22.93 / 22.36 / 36.26), against the scoreboard's 28.625 (22.86 / 22.33 / 36.19). The live record is also not short-horizon weighted: 464 rows, 208 of them in h49-96, median horizon 44. The difference is the sample - six days were far more persistence-friendly (24h band 22.4 live vs 55.6 frozen) and calmer (mean 30-min change 4.00 vs 5.50, std 42.56 vs 51.51). The operator difference is coverage, not definition: the live operator series has no settled h49-96 rows, so 9.152 is over h1-48 only, while 11.666 covers all 96 horizons equally.
+Persistence is the same definition in both planes: the project scalar macro mean (unweighted mean of per-horizon MAEs). On the live window, persistence macro mean is 29.308 gCO2/kWh (row mean is 28.625 gCO2/kWh, n=464). The live record is also not short-horizon weighted: 464 rows across horizons 1-96, median horizon 44. The difference is the sample - six days were far more persistence-friendly (24h band 22.4 live vs 55.6 frozen) and calmer (mean 30-min change 4.00 vs 5.50, std 42.56 vs 51.51).
+The operator series on the live scoreboard is partial: 33 rows from one issue across horizons 1-33 (n=33, MAE 9.152), compared to 15 origins x 96 (n=1440, MAE 11.666) in the frozen backtest. It is never labeled "settled". When it settles across all horizons, the sample size will expand and the score will reflect longer horizons.
 
 ## Known failure modes (to be quantified in P3)
 

@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import re
 import secrets
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -51,6 +54,8 @@ from gridcast.models import get_model_artifact_hash, load_model_booster, predict
 
 __all__: list[str] = []
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_MODEL_PATH: Path = Path("data/models/lgbm_model.txt")
 DEFAULT_INTERVAL_PATH: Path = Path("data/models/interval_v2.json")
 DEFAULT_SCORES_PATH: Path = Path("data/scoreboard/scores.csv")
@@ -81,10 +86,10 @@ def _check_source_availability(
                 if feat.startswith("actual_"):
                     raise FeatureSourceGapError(
                         f"Startup check failed: model feature '{feat}' is unobtainable "
-                        f"because curated intensity source '{c_p}' is missing or empty."
+                        f"because curated intensity source is missing or empty."
                     )
             raise FeatureSourceGapError(
-                f"Startup check failed: curated intensity source '{c_p}' is missing or empty."
+                "Startup check failed: curated intensity source is missing or empty."
             )
         intensity_df = pd.read_parquet(c_p)
     if intensity_df.empty:
@@ -105,7 +110,7 @@ def _check_source_availability(
                     if feat.startswith("temperature"):
                         raise FeatureSourceGapError(
                             f"Startup check failed: model feature '{feat}' is unobtainable "
-                            f"because weather source '{w_p}' is missing or empty."
+                            f"because weather source is missing or empty."
                         )
             weather_df = None
         else:
@@ -128,7 +133,7 @@ def _check_source_availability(
                     if feat.startswith("mix_share_"):
                         raise FeatureSourceGapError(
                             f"Startup check failed: model feature '{feat}' is unobtainable "
-                            f"because generation mix source '{m_p}' is missing or empty."
+                            f"because generation mix source is missing or empty."
                         )
             mix_df = None
         else:
@@ -187,7 +192,12 @@ def resolve_features_for_issue(
         try:
             issue_ts = issue_time_for_date(issue_time)
         except Exception:
-            issue_ts = pd.Timestamp(issue_time)
+            try:
+                issue_ts = pd.Timestamp(issue_time)
+                if issue_ts is pd.NaT:
+                    raise ValueError("NaT timestamp")
+            except Exception as e:
+                raise ValueError("Invalid issue_time") from e
             if issue_ts.tzinfo is None:
                 issue_ts = issue_ts.tz_localize("UTC")
             else:
@@ -339,32 +349,102 @@ def _file_sha256(path: Path | str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-@dataclass
-class ServiceState:
-    """Holds active in-memory model booster, interval quantiles, and telemetry state."""
+@dataclass(frozen=True)
+class ModelSnapshot:
+    """Immutable snapshot of model booster, interval quantiles, and telemetry state."""
 
     booster: lgb.Booster
     interval_data: dict[str, Any]
-    model_path: Path
-    interval_path: Path
-    curated_dir: Path
-    scores_path: Path
     content_sha256: str
     interval_sha256: str
     version: str = MODEL_VERSION
     training_window: str = TRAINING_WINDOW
     training_date: str = TRAINING_DATE
-    _cached_status: (
-        tuple[date, datetime | None, pd.Timestamp, bool, str | None, pd.DataFrame | None] | None
-    ) = None
+    generation: int = 1
+    state_version: int = 1
 
     @property
     def feature_count(self) -> int:
         return len(self.booster.feature_name())
 
 
+class ServiceState:
+    """Holds active service configuration and thread-safe reference to ModelSnapshot."""
+
+    def __init__(
+        self,
+        snapshot: ModelSnapshot,
+        model_path: Path,
+        interval_path: Path,
+        curated_dir: Path,
+        scores_path: Path,
+    ) -> None:
+        self._snapshot = snapshot
+        self.model_path = model_path
+        self.interval_path = interval_path
+        self.curated_dir = curated_dir
+        self.scores_path = scores_path
+        self._lock = threading.Lock()
+        self._cached_status: (
+            tuple[
+                str,
+                date,
+                datetime | None,
+                pd.Timestamp,
+                bool,
+                str | None,
+                pd.DataFrame | None,
+            ]
+            | None
+        ) = None
+
+    @property
+    def snapshot(self) -> ModelSnapshot:
+        with self._lock:
+            return self._snapshot
+
+    @property
+    def booster(self) -> lgb.Booster:
+        return self.snapshot.booster
+
+    @property
+    def interval_data(self) -> dict[str, Any]:
+        return self.snapshot.interval_data
+
+    @property
+    def content_sha256(self) -> str:
+        return self.snapshot.content_sha256
+
+    @property
+    def interval_sha256(self) -> str:
+        return self.snapshot.interval_sha256
+
+    @property
+    def version(self) -> str:
+        return self.snapshot.version
+
+    @property
+    def training_window(self) -> str:
+        return self.snapshot.training_window
+
+    @property
+    def training_date(self) -> str:
+        return self.snapshot.training_date
+
+    @property
+    def feature_count(self) -> int:
+        return self.snapshot.feature_count
+
+    def swap_snapshot(self, new_snapshot: ModelSnapshot) -> None:
+        """Publish a new immutable snapshot with a single assignment under lock."""
+        with self._lock:
+            self._snapshot = new_snapshot
+            self._cached_status = None
+
+
 def get_served_issue_status(
     st: ServiceState,
+    snap: ModelSnapshot | None = None,
 ) -> tuple[pd.Timestamp, bool, str | None, pd.DataFrame | None]:
     """Determine the served issue timestamp, whether it is the current issue, and fallback info.
 
@@ -376,6 +456,9 @@ def get_served_issue_status(
           is_current_issue is False)
         - feature_df (DataFrame | None, pre-resolved features for the served issue if available)
     """
+    if snap is None:
+        snap = st.snapshot
+
     today_date = datetime.now(LONDON_TZ).date()
     today_anchor_ts = issue_time_for_date(today_date)
     today_str = today_date.isoformat()
@@ -385,19 +468,33 @@ def get_served_issue_status(
     except Exception:
         freshness_dt = None
 
-    if st._cached_status is not None:
-        c_date, c_freshness, c_ts, c_is_curr, c_reason, c_df = st._cached_status
-        if c_date == today_date and c_freshness == freshness_dt:
-            return c_ts, c_is_curr, c_reason, c_df
+    with st._lock:
+        if st._cached_status is not None:
+            c_sha, c_date, c_freshness, c_ts, c_is_curr, c_reason, c_df = st._cached_status
+            if (
+                c_sha == snap.content_sha256
+                and c_date == today_date
+                and c_freshness == freshness_dt
+            ):
+                return c_ts, c_is_curr, c_reason, c_df
 
     try:
         df = resolve_features_for_issue(
             issue_time=today_anchor_ts,
-            booster=st.booster,
+            booster=snap.booster,
             curated_dir=st.curated_dir,
             mix_dir=MIX_DIR_DEFAULT,
         )
-        st._cached_status = (today_date, freshness_dt, today_anchor_ts, True, None, df)
+        with st._lock:
+            st._cached_status = (
+                snap.content_sha256,
+                today_date,
+                freshness_dt,
+                today_anchor_ts,
+                True,
+                None,
+                df,
+            )
         return today_anchor_ts, True, None, df
     except FeatureSourceGapError as exc:
         fallback_reason = f"Today's issue ({today_str}) is not buildable: {exc}"
@@ -424,7 +521,7 @@ def get_served_issue_status(
         try:
             cand_df = resolve_features_for_issue(
                 issue_time=cand_ts,
-                booster=st.booster,
+                booster=snap.booster,
                 curated_dir=st.curated_dir,
                 mix_dir=MIX_DIR_DEFAULT,
             )
@@ -444,15 +541,146 @@ def get_served_issue_status(
         else:
             newest_ts = today_anchor_ts
 
-    st._cached_status = (
-        today_date,
-        freshness_dt,
-        newest_ts,
-        False,
-        fallback_reason,
-        newest_df,
-    )
+    with st._lock:
+        st._cached_status = (
+            snap.content_sha256,
+            today_date,
+            freshness_dt,
+            newest_ts,
+            False,
+            fallback_reason,
+            newest_df,
+        )
     return newest_ts, False, fallback_reason, newest_df
+
+
+def _parse_and_validate_anchor(
+    date_str: str | None,
+    issue_time_str: str | None,
+) -> pd.Timestamp | None:
+    """Parse and validate date and issue_time parameters at the serving boundary.
+
+    Enforces that the resolved anchor instant is strictly 00:00 Europe/London.
+    Invalid formats, path traversals, or impossible dates raise 422 with a structured error
+    that does not echo the input verbatim or any path.
+    """
+    if date_str is None and issue_time_str is None:
+        return None
+
+    # Guard against null bytes and control characters
+    if date_str is not None and ("\x00" in date_str or "%00" in date_str):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "ValidationError",
+                "detail": "Invalid date parameter.",
+                "message": "Invalid date parameter.",
+            },
+        )
+    if issue_time_str is not None and ("\x00" in issue_time_str or "%00" in issue_time_str):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "ValidationError",
+                "detail": "Invalid issue_time parameter.",
+                "message": "Invalid issue_time parameter.",
+            },
+        )
+
+    # Length guard to prevent parser DoS or memory issues
+    if date_str is not None and len(date_str) > 64:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "ValidationError",
+                "detail": "Invalid date parameter.",
+                "message": "Invalid date parameter.",
+            },
+        )
+    if issue_time_str is not None and len(issue_time_str) > 64:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "ValidationError",
+                "detail": "Invalid issue_time parameter.",
+                "message": "Invalid issue_time parameter.",
+            },
+        )
+
+    parsed_date_val: date | None = None
+    if date_str is not None:
+        try:
+            parsed_date_val = date.fromisoformat(date_str.strip())
+        except Exception:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "ValidationError",
+                    "detail": "Invalid date parameter.",
+                    "message": "Invalid date parameter.",
+                },
+            ) from None
+
+    parsed_ts: pd.Timestamp | None = None
+    if issue_time_str is not None:
+        clean_issue_str = issue_time_str.strip()
+        # Handle + in query strings unquoted to space before timezone offset (e.g. " 01:00")
+        clean_issue_str = re.sub(
+            r"(\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)\s+([0-9]{2}:?[0-9]{2})$",
+            r"\1+\2",
+            clean_issue_str,
+        )
+        try:
+            parsed_ts = pd.Timestamp(clean_issue_str)
+            if parsed_ts is pd.NaT:
+                raise ValueError("NaT timestamp")
+        except Exception:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "ValidationError",
+                    "detail": "Invalid issue_time parameter.",
+                    "message": "Invalid issue_time parameter.",
+                },
+            ) from None
+
+        if parsed_ts.tzinfo is None:
+            parsed_ts = parsed_ts.tz_localize("UTC")
+        else:
+            parsed_ts = parsed_ts.tz_convert("UTC")
+
+        # Verify that the instant is exactly 00:00 Europe/London
+        ts_london = parsed_ts.tz_convert(LONDON_TZ)
+        if (
+            ts_london.hour != 0
+            or ts_london.minute != 0
+            or ts_london.second != 0
+            or ts_london.microsecond != 0
+            or getattr(ts_london, "nanosecond", 0) != 0
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "ValidationError",
+                    "detail": "Anchors must be 00:00 Europe/London.",
+                    "message": "Anchors must be 00:00 Europe/London.",
+                },
+            )
+
+    if parsed_date_val is not None:
+        date_anchor = issue_time_for_date(parsed_date_val)
+        if parsed_ts is not None and date_anchor != parsed_ts:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "ValidationError",
+                    "detail": "date and issue_time specify conflicting anchors.",
+                    "message": "date and issue_time specify conflicting anchors.",
+                },
+            )
+        return date_anchor
+
+    return parsed_ts
 
 
 def create_app(
@@ -475,15 +703,19 @@ def create_app(
     content_sha256 = get_model_artifact_hash(m_p)
     interval_sha256 = _file_sha256(i_p) if i_p.exists() else ""
 
-    service_state = ServiceState(
+    init_snapshot = ModelSnapshot(
         booster=booster,
         interval_data=interval_data,
+        content_sha256=content_sha256,
+        interval_sha256=interval_sha256,
+        state_version=1,
+    )
+    service_state = ServiceState(
+        snapshot=init_snapshot,
         model_path=m_p,
         interval_path=i_p,
         curated_dir=c_p,
         scores_path=s_p,
-        content_sha256=content_sha256,
-        interval_sha256=interval_sha256,
     )
 
     registry = CollectorRegistry()
@@ -505,6 +737,17 @@ def create_app(
         ["series", "status", "plane", "horizons"],
         registry=registry,
     )
+    last_measured_mae_samples = Gauge(
+        "gridcast_last_measured_mae_samples",
+        "Sample count (row count) for last measured MAE metric",
+        ["series", "plane"],
+        registry=registry,
+    )
+    served_issue_age_seconds = Gauge(
+        "gridcast_served_issue_age_seconds",
+        "Age of served issue in seconds relative to current time",
+        registry=registry,
+    )
 
     application = FastAPI(
         title="gridcast",
@@ -516,11 +759,12 @@ def create_app(
     application.state.requests_total = requests_total
     application.state.request_duration = request_duration
     application.state.last_measured_mae = last_measured_mae
+    application.state.last_measured_mae_samples = last_measured_mae_samples
+    application.state.served_issue_age_seconds = served_issue_age_seconds
 
     @application.middleware("http")
     async def metrics_middleware(request: Request, call_next: Any) -> Response:
         start_time = time.perf_counter()
-        endpoint = request.url.path
         status_code = 500
         try:
             response = await call_next(request)
@@ -531,6 +775,8 @@ def create_app(
             raise
         finally:
             elapsed = time.perf_counter() - start_time
+            route = request.scope.get("route")
+            endpoint = getattr(route, "path", None) or "unmatched"
             requests_total.labels(endpoint=endpoint, status=str(status_code)).inc()
             request_duration.labels(endpoint=endpoint).observe(elapsed)
 
@@ -546,8 +792,31 @@ def create_app(
             },
         )
 
+    @application.exception_handler(Exception)
+    async def unhandled_exception_handler(
+        _request: Request, exc: Exception
+    ) -> JSONResponse:
+        logger.error("Unhandled server exception: %s", exc, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "InternalServerError",
+                "message": "Internal Server Error: An unexpected error occurred.",
+            },
+        )
+
+    def _sync_served_issue_age() -> float:
+        st = application.state.service
+        snap = st.snapshot
+        served_ts, _, _, _ = get_served_issue_status(st, snap)
+        now_utc = datetime.now(timezone.utc)
+        served_utc = served_ts.tz_convert(timezone.utc)
+        age_seconds = max(0.0, (now_utc - served_utc).total_seconds())
+        served_issue_age_seconds.set(age_seconds)
+        return age_seconds
+
     def _sync_mae_metrics() -> None:
-        """Sync last measured MAE metrics from scores.csv."""
+        """Sync last measured MAE metrics and sample counts from scores.csv."""
         sp = application.state.service.scores_path
         if not sp.exists():
             return
@@ -558,26 +827,37 @@ def create_app(
 
             def _get_horizons_label(sub_df: pd.DataFrame, default: str = "settled") -> str:
                 if "horizon" in sub_df.columns and not sub_df.empty:
-                    h_vals = pd.to_numeric(sub_df["horizon"], errors="coerce")
-                    if (h_vals >= 49).any():
-                        return "settled"
-                    return "partial"
+                    h_vals = pd.to_numeric(sub_df["horizon"], errors="coerce").dropna()
+                    if not h_vals.empty:
+                        min_h = int(h_vals.min())
+                        max_h = int(h_vals.max())
+                        if min_h == 1 and max_h >= 49:
+                            return "settled"
+                        return f"{min_h}-{max_h}"
                 return default
 
             # Persistence series
             if "model_version" in scores_df.columns and "abs_error" in scores_df.columns:
                 pers_mask = scores_df["model_version"].str.startswith("persistence")
-                pers_sub = scores_df.loc[pers_mask, "abs_error"].dropna()
-                pers_sub = pers_sub[pers_sub != ""]
-                pers_h_label = _get_horizons_label(scores_df.loc[pers_mask], default="settled")
+                pers_sub = scores_df.loc[pers_mask].dropna(subset=["abs_error"]).copy()
+                pers_sub = pers_sub[pers_sub["abs_error"] != ""]
+                pers_h_label = _get_horizons_label(pers_sub, default="settled")
                 if not pers_sub.empty:
-                    p_val = float(pers_sub.astype(float).mean())
+                    pers_sub["abs_error"] = pers_sub["abs_error"].astype(float)
+                    if "horizon" in pers_sub.columns:
+                        p_val = float(pers_sub.groupby("horizon")["abs_error"].mean().mean())
+                    else:
+                        p_val = float(pers_sub["abs_error"].mean())
                     last_measured_mae.labels(
                         series="persistence",
                         status="settled",
                         plane="live_scoreboard",
                         horizons=pers_h_label,
                     ).set(p_val)
+                    last_measured_mae_samples.labels(
+                        series="persistence",
+                        plane="live_scoreboard",
+                    ).set(float(len(pers_sub)))
                 else:
                     last_measured_mae.labels(
                         series="persistence",
@@ -585,6 +865,10 @@ def create_app(
                         plane="live_scoreboard",
                         horizons="settled",
                     ).set(float("nan"))
+                    last_measured_mae_samples.labels(
+                        series="persistence",
+                        plane="live_scoreboard",
+                    ).set(0.0)
 
             # Operator series
             if "neso_abs_error" in scores_df.columns:
@@ -592,16 +876,25 @@ def create_app(
                     scores_df["neso_abs_error"].notna()
                     & (scores_df["neso_abs_error"] != "")
                 )
-                oper_sub = scores_df.loc[oper_mask, "neso_abs_error"]
-                oper_h_label = _get_horizons_label(scores_df.loc[oper_mask], default="partial")
+                oper_sub = scores_df.loc[oper_mask].copy()
+                oper_h_label = _get_horizons_label(oper_sub, default="1-33")
                 if not oper_sub.empty:
-                    o_val = float(oper_sub.astype(float).mean())
+                    oper_sub["neso_abs_error"] = oper_sub["neso_abs_error"].astype(float)
+                    if "horizon" in oper_sub.columns:
+                        o_val = float(oper_sub.groupby("horizon")["neso_abs_error"].mean().mean())
+                    else:
+                        o_val = float(oper_sub["neso_abs_error"].mean())
+                    # Do not call operator settled; label partial with its horizon range
                     last_measured_mae.labels(
                         series="operator",
-                        status="settled",
+                        status="partial",
                         plane="live_scoreboard",
                         horizons=oper_h_label,
                     ).set(o_val)
+                    last_measured_mae_samples.labels(
+                        series="operator",
+                        plane="live_scoreboard",
+                    ).set(float(len(oper_sub)))
                 else:
                     last_measured_mae.labels(
                         series="operator",
@@ -609,21 +902,33 @@ def create_app(
                         plane="live_scoreboard",
                         horizons="partial",
                     ).set(float("nan"))
+                    last_measured_mae_samples.labels(
+                        series="operator",
+                        plane="live_scoreboard",
+                    ).set(0.0)
 
             # Candidate series (lgbm-v2)
             if "model_version" in scores_df.columns and "abs_error" in scores_df.columns:
                 cand_mask = scores_df["model_version"] == "lgbm-v2"
-                cand_sub = scores_df.loc[cand_mask, "abs_error"].dropna()
-                cand_sub = cand_sub[cand_sub != ""]
-                cand_h_label = _get_horizons_label(scores_df.loc[cand_mask], default="settled")
+                cand_sub = scores_df.loc[cand_mask].dropna(subset=["abs_error"]).copy()
+                cand_sub = cand_sub[cand_sub["abs_error"] != ""]
+                cand_h_label = _get_horizons_label(cand_sub, default="settled")
                 if not cand_sub.empty:
-                    c_val = float(cand_sub.astype(float).mean())
+                    cand_sub["abs_error"] = cand_sub["abs_error"].astype(float)
+                    if "horizon" in cand_sub.columns:
+                        c_val = float(cand_sub.groupby("horizon")["abs_error"].mean().mean())
+                    else:
+                        c_val = float(cand_sub["abs_error"].mean())
                     last_measured_mae.labels(
                         series="candidate",
                         status="settled",
                         plane="live_scoreboard",
                         horizons=cand_h_label,
                     ).set(c_val)
+                    last_measured_mae_samples.labels(
+                        series="candidate",
+                        plane="live_scoreboard",
+                    ).set(float(len(cand_sub)))
                 else:
                     # Expose absent series with label and NaN, no plausible constant
                     last_measured_mae.labels(
@@ -632,49 +937,75 @@ def create_app(
                         plane="live_scoreboard",
                         horizons="settled",
                     ).set(float("nan"))
+                    last_measured_mae_samples.labels(
+                        series="candidate",
+                        plane="live_scoreboard",
+                    ).set(0.0)
         except Exception:
             pass
 
     @application.get("/health")
     def get_health() -> JSONResponse:
         st = application.state.service
+        snap = st.snapshot
         try:
             freshness_dt = get_data_freshness_at(st.curated_dir)
-            now_utc = datetime.now(timezone.utc)
-            is_stale = (now_utc - freshness_dt) > timedelta(hours=48)
             freshness_iso = freshness_dt.isoformat()
         except Exception as e:
-            freshness_dt = datetime.min.replace(tzinfo=timezone.utc)
-            is_stale = True
-            freshness_iso = str(e)
+            logger.warning("Failed to inspect data freshness: %s", e)
+            freshness_iso = "unavailable"
 
-        served_ts, is_current, _, _ = get_served_issue_status(st)
+        served_ts, is_current, _, _ = get_served_issue_status(st, snap)
 
         payload: dict[str, Any] = {
-            "status": "unhealthy" if is_stale else "healthy",
-            "model_version": st.version,
-            "version": st.version,
-            "training_date": st.training_date,
-            "training_window": st.training_window,
+            "status": "healthy",
+            "model_version": snap.version,
+            "version": snap.version,
+            "training_date": snap.training_date,
+            "training_window": snap.training_window,
             "data_freshness_at": freshness_iso,
             "served_issue_time": served_ts.isoformat(),
             "is_current_issue": is_current,
-            "content_sha256": st.content_sha256,
-            "sha256": st.content_sha256,
-            "artifact_sha256": st.content_sha256,
-            "feature_count": st.feature_count,
-            "interval_sha256": st.interval_sha256,
+            "content_sha256": snap.content_sha256,
+            "sha256": snap.content_sha256,
+            "artifact_sha256": snap.content_sha256,
+            "feature_count": snap.feature_count,
+            "interval_sha256": snap.interval_sha256,
+            "generation": snap.generation,
         }
-        if is_stale:
+        return JSONResponse(status_code=200, content=payload)
+
+    @application.get("/ready")
+    def get_ready() -> JSONResponse:
+        st = application.state.service
+        snap = st.snapshot
+        served_ts, is_current, fallback_reason, _ = get_served_issue_status(st, snap)
+        age_seconds = _sync_served_issue_age()
+        threshold_seconds = 27.0 * 3600.0
+        is_ready = age_seconds <= threshold_seconds
+
+        payload: dict[str, Any] = {
+            "status": "ready" if is_ready else "not_ready",
+            "served_issue_time": served_ts.isoformat(),
+            "served_issue_age_seconds": age_seconds,
+            "is_current_issue": is_current,
+            "threshold_hours": 27.0,
+            "generation": snap.generation,
+        }
+        if not is_ready:
+            age_hours = age_seconds / 3600.0
             payload["detail"] = (
-                f"Curated data freshness ({freshness_iso}) is older than 48 hours."
+                f"Served issue ({served_ts.isoformat()}) is {age_hours:.1f} hours old, "
+                f"exceeding readiness threshold of 27 hours."
             )
             return JSONResponse(status_code=503, content=payload)
         return JSONResponse(status_code=200, content=payload)
 
     @application.get("/forecast")
     def get_forecast(
-        hours: int = Query(default=48, description="Forecast horizon in hours (1..48)"),
+        hours: int = Query(
+            default=48, description="Forecast horizon in hours counted from anchor (1..48)"
+        ),
         date: str | None = Query(default=None, description="Optional Europe/London issue date"),
         issue_time: str | None = Query(default=None, description="Optional ISO issue timestamp"),
     ) -> dict[str, Any]:
@@ -689,48 +1020,38 @@ def create_app(
                 },
             )
 
+        anchor_ts = _parse_and_validate_anchor(date, issue_time)
+
         st = application.state.service
+        snap = st.snapshot
         today_date = datetime.now(LONDON_TZ).date()
         today_anchor = issue_time_for_date(today_date)
         generated_at = datetime.now(timezone.utc).isoformat()
 
-        target_param = issue_time or date
         fallback_reason: str | None = None
 
-        if target_param is None:
+        if anchor_ts is None:
             # Default request: serve newest buildable issue
-            served_ts, is_current, fallback_reason, feature_df = get_served_issue_status(st)
+            served_ts, is_current, fallback_reason, feature_df = get_served_issue_status(st, snap)
             if feature_df is None:
                 feature_df = resolve_features_for_issue(
                     issue_time=served_ts,
-                    booster=st.booster,
+                    booster=snap.booster,
                     curated_dir=st.curated_dir,
                     mix_dir=MIX_DIR_DEFAULT,
                 )
         else:
-            # Explicit date or timestamp: refuse to build if source gap exists
-            if isinstance(target_param, str):
-                try:
-                    req_ts = issue_time_for_date(target_param)
-                except Exception:
-                    req_ts = pd.Timestamp(target_param)
-                    if req_ts.tzinfo is None:
-                        req_ts = req_ts.tz_localize("UTC")
-                    else:
-                        req_ts = req_ts.tz_convert("UTC")
-            else:
-                req_ts = issue_time_for_date(target_param)
-
+            # Explicit date or issue_time anchor
             feature_df = resolve_features_for_issue(
-                issue_time=req_ts,
-                booster=st.booster,
+                issue_time=anchor_ts,
+                booster=snap.booster,
                 curated_dir=st.curated_dir,
                 mix_dir=MIX_DIR_DEFAULT,
             )
-            served_ts = req_ts
+            served_ts = anchor_ts
             is_current = (served_ts == today_anchor)
             if not is_current:
-                _, _, today_reason, _ = get_served_issue_status(st)
+                _, _, today_reason, _ = get_served_issue_status(st, snap)
                 if today_reason:
                     fallback_reason = today_reason
                 else:
@@ -740,11 +1061,11 @@ def create_app(
                     )
 
         # Select declared inputs and predict
-        X_mat = select_model_inputs(feature_df, feature_columns=st.booster.feature_name())
-        predictions = predict_lgbm(st.booster, X_mat)
+        X_mat = select_model_inputs(feature_df, feature_columns=snap.booster.feature_name())
+        predictions = predict_lgbm(snap.booster, X_mat)
 
         num_points = hours * 2
-        quantiles = st.interval_data.get("quantiles", {})
+        quantiles = snap.interval_data.get("quantiles", {})
 
         points: list[dict[str, Any]] = []
         for h in range(1, num_points + 1):
@@ -771,54 +1092,58 @@ def create_app(
         retrospective_horizons = sum(
             1 for pt in points if pd.Timestamp(pt["target_time"]) < gen_ts
         )
+        contains_future_points = any(
+            pd.Timestamp(pt["target_time"]) >= gen_ts for pt in points
+        )
 
         response_dict: dict[str, Any] = {
             "issue_time": served_ts.isoformat(),
             "generated_at": generated_at,
             "is_current_issue": is_current,
             "retrospective_horizons": retrospective_horizons,
+            "contains_future_points": contains_future_points,
             "hours": hours,
+            "model_version": snap.version,
+            "content_sha256": snap.content_sha256,
+            "interval_sha256": snap.interval_sha256,
+            "model_hash": snap.content_sha256,
+            "interval_hash": snap.interval_sha256,
+            "state_version": snap.state_version,
+            "generation": snap.generation,
             "points": points,
         }
         if not is_current and fallback_reason is not None:
-            response_dict = {
-                "issue_time": served_ts.isoformat(),
-                "generated_at": generated_at,
-                "is_current_issue": is_current,
-                "retrospective_horizons": retrospective_horizons,
-                "fallback_reason": fallback_reason,
-                "hours": hours,
-                "points": points,
-            }
+            response_dict["fallback_reason"] = fallback_reason
 
         return response_dict
 
     @application.get("/metrics")
     def get_metrics() -> Response:
         _sync_mae_metrics()
+        _sync_served_issue_age()
         output = generate_latest(application.state.registry)
         return Response(content=output, media_type=CONTENT_TYPE_LATEST)
 
     @application.get("/model")
     def get_model() -> dict[str, Any]:
-        st = application.state.service
+        snap = application.state.service.snapshot
         return {
-            "version": st.version,
-            "model_version": st.version,
-            "content_sha256": st.content_sha256,
-            "sha256": st.content_sha256,
-            "artifact_sha256": st.content_sha256,
-            "training_window": st.training_window,
-            "training_date": st.training_date,
-            "feature_count": st.feature_count,
-            "interval_sha256": st.interval_sha256,
+            "version": snap.version,
+            "model_version": snap.version,
+            "content_sha256": snap.content_sha256,
+            "sha256": snap.content_sha256,
+            "artifact_sha256": snap.content_sha256,
+            "training_window": snap.training_window,
+            "training_date": snap.training_date,
+            "feature_count": snap.feature_count,
+            "interval_sha256": snap.interval_sha256,
+            "generation": snap.generation,
         }
 
     @application.post("/reload")
     async def post_reload(
         request: Request,
-        token: str | None = Query(default=None),
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         expected_token = os.environ.get("GRIDCAST_RELOAD_TOKEN")
         if not expected_token:
             raise HTTPException(
@@ -826,22 +1151,15 @@ def create_app(
                 detail="Service Unavailable: Reload token not configured in environment.",
             )
 
-        # Extract token from Authorization header, X-Reload-Token header, query, or body
+        # Extract token ONLY from Authorization: Bearer <token> header or X-Reload-Token header
         provided_token = None
         auth_hdr = request.headers.get("Authorization")
         if auth_hdr:
-            provided_token = auth_hdr[7:] if auth_hdr.startswith("Bearer ") else auth_hdr
+            parts = auth_hdr.split(None, 1)
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                provided_token = parts[1].strip()
         elif request.headers.get("X-Reload-Token"):
-            provided_token = request.headers.get("X-Reload-Token")
-        elif token:
-            provided_token = token
-        else:
-            try:
-                body = await request.json()
-                if isinstance(body, dict) and "token" in body:
-                    provided_token = str(body["token"])
-            except Exception:
-                pass
+            provided_token = request.headers.get("X-Reload-Token", "").strip()
 
         if not provided_token or not secrets.compare_digest(provided_token, expected_token):
             raise HTTPException(
@@ -865,20 +1183,33 @@ def create_app(
             new_content_sha256 = get_model_artifact_hash(st.model_path)
             new_interval_sha256 = _file_sha256(st.interval_path)
         except Exception as e:
-            # On missing or corrupt artifact, return 500 while preserving in-memory state
+            # On missing or corrupt artifact, return 500 without leaking host paths
+            logger.error("Failed to reload model artifact: %s", e, exc_info=True)
             raise HTTPException(
                 status_code=500,
-                detail=f"Internal Server Error: Failed to reload model artifact: {e}",
+                detail="Internal Server Error: Failed to reload model artifact.",
             ) from e
 
-        # Atomic state update
-        st.booster = new_booster
-        st.interval_data = new_interval_data
-        st.content_sha256 = new_content_sha256
-        st.interval_sha256 = new_interval_sha256
-        st._cached_status = None
+        # Atomic state swap under lock
+        curr_snap = st.snapshot
+        new_snap = ModelSnapshot(
+            booster=new_booster,
+            interval_data=new_interval_data,
+            content_sha256=new_content_sha256,
+            interval_sha256=new_interval_sha256,
+            version=curr_snap.version,
+            training_window=curr_snap.training_window,
+            training_date=curr_snap.training_date,
+            generation=curr_snap.generation + 1,
+            state_version=curr_snap.state_version + 1,
+        )
+        st.swap_snapshot(new_snap)
 
-        return {"status": "reloaded", "model_version": st.version}
+        return {
+            "status": "reloaded",
+            "model_version": new_snap.version,
+            "generation": new_snap.generation,
+        }
 
     return application
 
