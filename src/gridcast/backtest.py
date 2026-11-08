@@ -1200,6 +1200,24 @@ def refresh_eval_fixture(
     return parquet_path, sidecar_path, parquet_sha, results.gate_value
 
 
+def _version_matches(pkg: str, recorded: str, current: str) -> bool:
+    """Compare a recorded runtime version with the running one.
+
+    Python patch releases are interchangeable here: setup-python serves whatever 3.10.x is current,
+    while the fixture records the patch that happened to run when it was built. Libraries that touch
+    floating point (numpy, pandas, lightgbm) are compared exactly, because a different build can
+    move the numbers.
+    """
+    if pkg != "python":
+        return current == recorded
+    try:
+        rec = tuple(int(part) for part in recorded.split(".")[:2])
+        cur = tuple(int(part) for part in current.split(".")[:2])
+    except ValueError:
+        return current == recorded
+    return cur == rec
+
+
 def check_sidecar_library_versions(
     sidecar_meta: dict[str, Any],
 ) -> list[str]:
@@ -1216,7 +1234,7 @@ def check_sidecar_library_versions(
         curr_ver = current_versions.get(pkg)
         if curr_ver is None:
             mismatches.append(f"{pkg}: recorded {exp_ver}, but package is not installed/detected")
-        elif curr_ver != exp_ver:
+        elif not _version_matches(pkg, str(exp_ver), curr_ver):
             mismatches.append(f"{pkg}: recorded {exp_ver}, current environment has {curr_ver}")
     return mismatches
 

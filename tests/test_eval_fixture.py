@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -485,6 +486,26 @@ def test_check_sidecar_library_versions() -> None:
     assert len(mismatches) == 1
     assert "lightgbm" in mismatches[0]
     assert "99.99.99" in mismatches[0]
+
+
+def test_sidecar_python_patch_tolerated_but_minor_rejected() -> None:
+    """A different Python patch is fine; a different minor version is not.
+
+    The CI runner serves whatever 3.10.x is current, while the fixture records the patch that ran
+    when it was built. Demanding the exact patch failed every run for a difference that cannot move
+    a float. A minor difference still fails, because that can.
+    """
+    current = sys.version.split()[0]
+    major, minor = current.split(".")[:2]
+
+    same_minor = check_sidecar_library_versions({"versions": {"python": f"{major}.{minor}.0"}})
+    assert same_minor == [], f"Python patch difference must be tolerated, got {same_minor}"
+
+    other_minor_version = f"{major}.{int(minor) + 1}.0"
+    other_minor = check_sidecar_library_versions({"versions": {"python": other_minor_version}})
+    assert len(other_minor) == 1, f"Python minor difference must be rejected, got {other_minor}"
+    assert "python" in other_minor[0]
+
 
 
 def test_reproduce_eval_fixture_mocked_execution(
