@@ -8,7 +8,7 @@ PYTHON ?= python3
 PY ?= .venv/bin/python
 endif
 
-.PHONY: help install test data-check clean ingest features train eval eval-refresh eval-reproduce ablation-weather serve docker lint typecheck check metrics-fixture
+.PHONY: help install test data-check clean ingest features train eval gate-negative eval-refresh eval-reproduce ablation-weather serve docker lint typecheck check metrics-fixture
 .DEFAULT_GOAL := help
 
 help:
@@ -21,6 +21,7 @@ help:
 	@echo   features        - Build and inspect the example feature frame
 	@echo   train           - Run model training CLI
 	@echo   eval            - Run model evaluation benchmark from frozen fixture
+	@echo   gate-negative   - Run gate on negative control fixture and assert rejection
 	@echo   eval-refresh    - Rebuild and refresh frozen evaluation fixture (slow, manual)
 	@echo   eval-reproduce  - Retrain 15 folds and verify candidate predictions against fixture (slow, manual)
 	@echo   ablation-weather - Run pre-registered weather removal ablation against fixture
@@ -58,6 +59,9 @@ train:
 
 eval:
 	"$(PY)" -m gridcast.cli eval
+
+gate-negative:
+	"$(PY)" -m gridcast.cli gate-negative
 
 eval-refresh:
 	"$(PY)" -m gridcast.cli eval-refresh

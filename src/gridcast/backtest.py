@@ -48,6 +48,7 @@ from gridcast.models import (
 __all__: list[str] = [
     "DEFAULT_EVAL_FIXTURE_PARQUET",
     "DEFAULT_EVAL_FIXTURE_SIDECAR",
+    "DEFAULT_GATE_THRESHOLD_PATH",
     "PINNED_EVAL_FIXTURE_SHA256",
     "REQUIRED_FIXTURE_COLUMNS",
     "BacktestResults",
@@ -71,6 +72,7 @@ __all__: list[str] = [
     "evaluate_gap_gate",
     "evaluate_gate",
     "filter_evaluation_intersection",
+    "load_and_verify_gate_threshold",
     "refresh_eval_fixture",
     "reproduce_eval_fixture",
     "run_rolling_origin_backtest",
@@ -80,6 +82,7 @@ __all__: list[str] = [
 
 DEFAULT_EVAL_FIXTURE_PARQUET: Final[Path] = Path("data/eval/frozen_split_v2.parquet")
 DEFAULT_EVAL_FIXTURE_SIDECAR: Final[Path] = Path("data/eval/frozen_split_v2.json")
+DEFAULT_GATE_THRESHOLD_PATH: Final[Path] = Path("data/eval/gate_threshold.json")
 
 # Byte hash (SHA-256 over raw file bytes, not git's object id).
 PINNED_EVAL_FIXTURE_SHA256: Final[str] = (
@@ -160,6 +163,9 @@ class BacktestResults:
     intersection_size: int
     excluded_counts: dict[str, int]
     origins_evaluated: list[pd.Timestamp]
+    fixture_sha256: str | None = None
+    archive_commit: str | None = None
+    verdict: str | None = None
 
 
 def assert_fold_training_integrity(train_df: pd.DataFrame, origin: pd.Timestamp) -> None:
@@ -595,20 +601,99 @@ def evaluate_gap_gate(
     return bool(candidate_mae <= required)
 
 
+def load_and_verify_gate_threshold(
+    threshold_path: Path | str = DEFAULT_GATE_THRESHOLD_PATH,
+) -> dict[str, Any]:
+    """Load gate threshold JSON artifact and verify its derivation arithmetic (ADR-021).
+
+    Recomputes: required = persistence - fraction * (persistence - operator)
+    and asserts it equals the stored required_mae.
+    Refuses with AssertionError if arithmetic fails or file is corrupt.
+    """
+    path = Path(threshold_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Gate threshold artifact not found at {path}")
+
+    with open(path, encoding="utf-8") as f:
+        meta: dict[str, Any] = json.load(f)
+
+    required_keys = [
+        "rule",
+        "fraction",
+        "derived_on",
+        "persistence_mae_validation",
+        "operator_mae_validation",
+        "required_mae",
+        "adr",
+    ]
+    for k in required_keys:
+        if k not in meta:
+            raise ValueError(f"Gate threshold artifact {path} missing required key '{k}'")
+
+    p = float(meta["persistence_mae_validation"])
+    o = float(meta["operator_mae_validation"])
+    frac = float(meta["fraction"])
+    stored_req = float(meta["required_mae"])
+
+    recomputed = p - frac * (p - o)
+    if round(recomputed, 4) != round(stored_req, 4):
+        raise AssertionError(
+            f"Gate threshold arithmetic mismatch: recomputed required MAE is {recomputed:.6f} "
+            f"({p} - {frac} * ({p} - {o})), but stored required_mae is {stored_req}"
+        )
+
+    return meta
+
+
 def evaluate_gate(
     results: BacktestResults,
     threshold: float | None = None,
+    threshold_path: Path | str = DEFAULT_GATE_THRESHOLD_PATH,
+    fixture_sha256: str | None = None,
+    archive_commit: str | None = None,
     verbose: bool = True,
-) -> None:
-    """Print backtest evaluation metrics and prominent no-verdict line (ADR-020).
+) -> str:
+    """Evaluate backtest results against the gap-closure accuracy gate (ADR-021).
 
-    Phase P3 closes with neither a pass nor a fail claimed because the 35.0 threshold
-    was derived from the candidate's own validation score.
+    Loads and verifies the committed threshold artifact, evaluates candidate against
+    required_mae, prints the provenance block, and returns verdict ("PASS" / "FAIL").
     """
+    meta = load_and_verify_gate_threshold(threshold_path)
+    required_mae = float(meta["required_mae"]) if threshold is None else float(threshold)
+
+    candidate_mae = results.gate_value
+    verdict = "PASS" if candidate_mae <= required_mae else "FAIL"
+
+    resolved_sha = (
+        fixture_sha256
+        or results.fixture_sha256
+        or PINNED_EVAL_FIXTURE_SHA256
+    )
+    resolved_commit = (
+        archive_commit
+        or results.archive_commit
+        or "3617143"
+    )
+
     if verbose:
+        split_meta = meta.get("derived_on", {})
         print("\n" + "=" * 78)
         print("GRIDCAST ACCURACY GATE EVALUATION")
         print("=" * 78)
+        print(f"Gate Rule:                   {meta.get('rule', '')} ({meta.get('adr', 'ADR-021')})")
+        print(f"Gate Fraction:               {float(meta.get('fraction', 0.30)):.2f}")
+        print(f"Threshold (required MAE):    {required_mae:.4f} gCO2/kWh")
+        print(
+            f"Derived from split:          {split_meta.get('split', 'validation')} "
+            f"({split_meta.get('start', '2026-06-05')} to {split_meta.get('end', '2026-08-30')}, "
+            f"{split_meta.get('origins', 15)} origins)"
+        )
+        pers_val = float(meta.get("persistence_mae_validation", 57.776))
+        oper_val = float(meta.get("operator_mae_validation", 9.649))
+        print(f"  Persistence MAE (val):     {pers_val:.3f} gCO2/kWh")
+        print(f"  Operator MAE (val):        {oper_val:.3f} gCO2/kWh")
+        print(f"Fixture SHA-256:             {resolved_sha}")
+        print(f"Archive commit:              {resolved_commit}")
         if results.origins_evaluated:
             first_origin = results.origins_evaluated[0].strftime("%Y-%m-%d %H:%M UTC")
             last_origin = results.origins_evaluated[-1].strftime("%Y-%m-%d %H:%M UTC")
@@ -617,11 +702,14 @@ def evaluate_gate(
             for o in results.origins_evaluated:
                 print(f"  {o.strftime('%Y-%m-%d %H:%M %Z')}")
         print(f"Contributing horizons:       {len(results.per_horizon_table)} / 96")
-        print(f"Intersection periods scored: {results.intersection_size} "
-              f"(excluded {results.excluded_counts['total_excluded']} periods: "
-              f"null actuals={results.excluded_counts['missing_actual']}, "
-              f"null operator={results.excluded_counts['missing_operator_forecast']})")
+        print(
+            f"Intersection periods scored: {results.intersection_size} "
+            f"(excluded {results.excluded_counts.get('total_excluded', 0)} periods: "
+            f"null actuals={results.excluded_counts.get('missing_actual', 0)}, "
+            f"null operator={results.excluded_counts.get('missing_operator_forecast', 0)})"
+        )
         print(f"Gate Scalar (GATE_VALUE):    {results.gate_value:.3f} gCO2/kWh")
+        print(f"Candidate GATE_VALUE:        {results.gate_value:.3f} gCO2/kWh")
         print(f"Operator GATE_VALUE (NESO):  {results.operator_gate_value:.3f} gCO2/kWh")
         print(f"Persistence GATE_VALUE:      {results.persistence_gate_value:.3f} gCO2/kWh")
         print(f"Seasonal-Naive GATE_VALUE:   {results.seasonal_naive_gate_value:.3f} gCO2/kWh")
@@ -630,8 +718,14 @@ def evaluate_gate(
         print(f"Skill vs Operator @ h=48:    {results.skill_h48:+.2%}")
         print(f"Skill vs Operator @ h=96:    {results.skill_h96:+.2%}")
         print("-" * 78)
-        print("GATE VERDICT: NONE - threshold invalid (ADR-020); no pass or fail is claimed")
+        print(
+            "Historical note (P3 / v1):   "
+            "GATE VERDICT: NONE - threshold invalid (ADR-020); no pass or fail is claimed"
+        )
+        print(f"GATE VERDICT: {verdict}")
         print("=" * 78 + "\n")
+
+    return verdict
 
 
 def assert_refresh_window_eligibility(
@@ -672,31 +766,44 @@ def assert_refresh_window_eligibility(
 
 def verify_fixture_integrity(
     parquet_path: Path | str = DEFAULT_EVAL_FIXTURE_PARQUET,
-    sidecar_path: Path | str = DEFAULT_EVAL_FIXTURE_SIDECAR,
+    sidecar_path: Path | str | None = DEFAULT_EVAL_FIXTURE_SIDECAR,
     pinned_sha256: str | None = PINNED_EVAL_FIXTURE_SHA256,
 ) -> dict[str, Any]:
     """Verify SHA-256 of evaluation fixture against sidecar metadata and pinned constant.
 
     Hard-fails on missing sidecar, missing parquet, or SHA-256 mismatch.
     """
-    p_sidecar = Path(sidecar_path)
-    if not p_sidecar.exists():
-        raise FileNotFoundError(f"Sidecar fixture not found at {p_sidecar}")
-
     p_parquet = Path(parquet_path)
     if not p_parquet.exists():
         raise FileNotFoundError(f"Parquet fixture not found at {p_parquet}")
 
-    with open(p_sidecar, encoding="utf-8") as f:
-        meta: dict[str, Any] = json.load(f)
-
-    expected_sha = meta.get("sha256") or meta.get("parquet_sha256")
-    if not expected_sha:
-        raise ValueError(f"Sidecar at {p_sidecar} does not contain 'sha256' field")
-
     # Byte hash: compute SHA-256 over raw file bytes (not git's object id)
     with open(p_parquet, "rb") as f:
         actual_sha = hashlib.sha256(f.read()).hexdigest()
+
+    if sidecar_path is not None:
+        p_sidecar = Path(sidecar_path)
+        if not p_sidecar.exists():
+            raise FileNotFoundError(f"Sidecar fixture not found at {p_sidecar}")
+
+        with open(p_sidecar, encoding="utf-8") as f:
+            meta: dict[str, Any] = json.load(f)
+
+        expected_sha = meta.get("sha256") or meta.get("parquet_sha256")
+        if not expected_sha:
+            raise ValueError(f"Sidecar at {p_sidecar} does not contain 'sha256' field")
+
+        if actual_sha != expected_sha:
+            raise ValueError(
+                f"SHA-256 mismatch for fixture parquet {p_parquet}. "
+                f"Expected: {expected_sha}, Got: {actual_sha}"
+            )
+    else:
+        meta = {
+            "sha256": actual_sha,
+            "parquet_sha256": actual_sha,
+            "archive_commit": "3617143",
+        }
 
     if pinned_sha256 is not None and actual_sha != pinned_sha256:
         msg = (
@@ -707,30 +814,29 @@ def verify_fixture_integrity(
         print(msg, file=sys.stderr)
         raise ValueError(msg)
 
-    if actual_sha != expected_sha:
-        raise ValueError(
-            f"SHA-256 mismatch for fixture parquet {p_parquet}. "
-            f"Expected: {expected_sha}, Got: {actual_sha}"
-        )
-
     return meta
 
 
 def evaluate_from_fixture(
     parquet_path: Path | str = DEFAULT_EVAL_FIXTURE_PARQUET,
-    sidecar_path: Path | str = DEFAULT_EVAL_FIXTURE_SIDECAR,
+    sidecar_path: Path | str | None = DEFAULT_EVAL_FIXTURE_SIDECAR,
     verbose: bool = True,
     pinned_sha256: str | None = PINNED_EVAL_FIXTURE_SHA256,
+    threshold_path: Path | str = DEFAULT_GATE_THRESHOLD_PATH,
 ) -> BacktestResults:
     """Read frozen evaluation fixture and compute all benchmark metrics without curated data.
 
     Verifies sha256 against sidecar and pin, computing GATE_VALUE and baselines directly.
     """
-    _ = verify_fixture_integrity(
+    meta = verify_fixture_integrity(
         parquet_path=parquet_path,
         sidecar_path=sidecar_path,
         pinned_sha256=pinned_sha256,
     )
+    with open(parquet_path, "rb") as f:
+        actual_sha = hashlib.sha256(f.read()).hexdigest()
+    archive_commit = str(meta.get("archive_commit", "3617143"))
+
     df = pd.read_parquet(parquet_path)
 
     missing_cols = [c for c in REQUIRED_FIXTURE_COLUMNS if c not in df.columns]
@@ -844,6 +950,8 @@ def evaluate_from_fixture(
             "missing_model_forecast": 0,
         },
         origins_evaluated=unique_origins,
+        fixture_sha256=actual_sha,
+        archive_commit=archive_commit,
     )
 
     if verbose:
@@ -866,9 +974,39 @@ def evaluate_from_fixture(
             print(f"{h_int:<8}{cnt:<10}{m_str:<14}{o_str:<16}{p_str:<14}{s_str:<16}{sk_str:<14}")
         print("=" * 94)
 
-        evaluate_gate(results, verbose=True)
+    verdict = evaluate_gate(
+        results,
+        threshold_path=threshold_path,
+        fixture_sha256=actual_sha,
+        archive_commit=archive_commit,
+        verbose=verbose,
+    )
 
-    return results
+    return BacktestResults(
+        predictions=df,
+        per_horizon_table=per_h,
+        gate_value=gate_val,
+        operator_gate_value=oper_gate_val,
+        persistence_gate_value=pers_gate_val,
+        seasonal_naive_gate_value=sn_gate_val,
+        overall_skill_vs_operator=overall_skill,
+        skill_h2=_skill_at_h(2),
+        skill_h48=_skill_at_h(48),
+        skill_h96=_skill_at_h(96),
+        intersection_size=len(df),
+        excluded_counts={
+            "total_periods": len(df),
+            "intersection_size": len(df),
+            "total_excluded": 0,
+            "missing_actual": 0,
+            "missing_operator_forecast": 0,
+            "missing_model_forecast": 0,
+        },
+        origins_evaluated=unique_origins,
+        fixture_sha256=actual_sha,
+        archive_commit=archive_commit,
+        verdict=verdict,
+    )
 
 
 def refresh_eval_fixture(

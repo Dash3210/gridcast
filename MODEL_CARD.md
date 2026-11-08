@@ -149,19 +149,79 @@ The operator forecast is read from the curated `forecast` column at `target_time
 
 The introduction of `forecast_first_seen_at` to the curated contract records the timestamp when a forecast is first observed going forward, but this does not recover the true day-ahead value for anything already backfilled. Comparisons against this archived baseline carry the statement: *Published NESO forecast for the same periods, vintage unverified*. No claim of beating or losing to the operator is made without this caveat.
 
-### Gate Verdict Status (ADR-020)
+### Gate Verdict Status (ADR-020, ADR-030)
 
-Phase P3 closes with **no gate verdict (neither a pass nor a fail)**. The previously considered threshold of 35.0 gCO2/kWh was derived from the candidate's own validation score (33.815 gCO2/kWh) plus 3.5%. It was therefore never an external standard: a model cannot be judged against a bar computed from itself. The first scoring is void, no pass or fail is claimed, and `make eval` prints:
+Phase P3 closed with **no gate verdict (neither a pass nor a fail)**. The previously considered threshold of 35.0 gCO2/kWh was derived from the candidate's own validation score (33.815 gCO2/kWh) plus 3.5%. It was therefore never an external standard: a model cannot be judged against a bar computed from itself. The first scoring is void, no pass or fail is claimed, and ADR-020's void P3 result stays recorded as history:
 
 ```
 GATE VERDICT: NONE - threshold invalid (ADR-020); no pass or fail is claimed
 ```
 
-and exits 0. Nothing failed, because nothing was judged.
+Nothing failed, because nothing was judged.
 
-### The Phase P4 Evaluation Gate (ADR-021)
+For Phase P5 (ADR-030), the external gap-closure gate defined in ADR-021 is wired against the committed threshold artifact `data/eval/gate_threshold.json`. The gate rule requires closing >= 30% of the persistence-to-operator MAE gap, derived from the validation split (`2026-06-05` to `2026-08-30`, 15 origins; persistence MAE 57.776, operator MAE 9.649), establishing the external required MAE threshold of **43.3379 gCO2/kWh**.
 
-The evaluation gate rule for Phase P4 is defined outside the model:
+On the active pinned evaluation split (frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins), the candidate scores **`GATE_VALUE = 39.118 gCO2/kWh`** (closing 34.75% of the gap relative to persistence 53.741 gCO2/kWh, seasonal-naive 51.495 gCO2/kWh, and NESO operator 11.666 gCO2/kWh). Because 39.118 <= 43.3379, the current model on fixture v2 passes the wired gate with verdict **PASS**:
+
+```
+==============================================================================
+GRIDCAST ACCURACY GATE EVALUATION
+==============================================================================
+Gate Rule:                   candidate closes >= 30% of the persistence-to-operator MAE gap (ADR-021)
+Gate Fraction:               0.30
+Threshold (required MAE):    43.3379 gCO2/kWh
+Derived from split:          validation (2026-06-05 to 2026-08-30, 15 origins)
+  Persistence MAE (val):     57.776 gCO2/kWh
+  Operator MAE (val):        9.649 gCO2/kWh
+Fixture SHA-256:             87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51
+Archive commit:              3617143
+Evaluated origin window:     2026-09-05 00:00 UTC to 2026-11-01 00:00 UTC
+Origins evaluated (15):
+  2026-09-05 00:00 UTC
+  2026-09-09 00:00 UTC
+  2026-09-13 00:00 UTC
+  2026-09-17 00:00 UTC
+  2026-09-21 00:00 UTC
+  2026-09-25 00:00 UTC
+  2026-09-29 00:00 UTC
+  2026-10-03 00:00 UTC
+  2026-10-07 00:00 UTC
+  2026-10-11 00:00 UTC
+  2026-10-15 00:00 UTC
+  2026-10-19 00:00 UTC
+  2026-10-23 00:00 UTC
+  2026-10-27 00:00 UTC
+  2026-10-31 00:00 UTC
+Contributing horizons:       96 / 96
+Intersection periods scored: 1440 (excluded 0 periods: null actuals=0, null operator=0)
+Gate Scalar (GATE_VALUE):    39.118 gCO2/kWh
+Candidate GATE_VALUE:        39.118 gCO2/kWh
+Operator GATE_VALUE (NESO):  11.666 gCO2/kWh
+Persistence GATE_VALUE:      53.741 gCO2/kWh
+Seasonal-Naive GATE_VALUE:   51.495 gCO2/kWh
+Overall Skill vs Operator:   -235.32%
+Skill vs Operator @ h=2:     -82.56%
+Skill vs Operator @ h=48:    -273.50%
+Skill vs Operator @ h=96:    -332.61%
+------------------------------------------------------------------------------
+Historical note (P3 / v1):   GATE VERDICT: NONE - threshold invalid (ADR-020); no pass or fail is claimed
+GATE VERDICT: PASS
+==============================================================================
+```
+
+### Negative Control Verification (`data/eval/negative_control.parquet`)
+
+A gate that has never failed is not a gate. The negative control artifact `data/eval/negative_control.parquet` preserves the exact ground truth of the pinned evaluation fixture, replacing `candidate_pred` with `persistence_pred` (scoring 53.741 gCO2/kWh). `make gate-negative` runs the identical gate function on this control, verifying rejection:
+
+```
+GATE VERDICT: FAIL
+```
+
+exiting 0 only because rejection was expected. If the gate function is weakened to pass unconditionally, `make gate-negative` immediately fails with non-zero exit code.
+
+### The Evaluation Gate Rule (ADR-021, ADR-030)
+
+The evaluation gate rule is defined outside the model:
 
 > On the frozen evaluation split, with candidate, persistence and operator measured on identical periods:
 > the candidate must close at least 30 percent of the MAE gap between issue-anchored persistence and the
@@ -181,7 +241,7 @@ The frozen-split threshold is deliberately not computed or quoted in this ADR: t
 
 Why 30 percent: a floor demanding much of the distance between doing nothing and the operator, without requiring a solo model to beat an operator with information it does not have. State that the fraction is a policy choice fixed now, changeable only before a model is trained, never after a score is seen.
 
-The gate is not wired into CI until Phase P5.
+The gate is wired into CI in Phase P5 (ADR-030).
 
 The benchmark is a data source, not an oracle, and needs the same alignment discipline as any feature; the vintage of an archived forecast is a property to be recorded, not assumed; the only fair comparison is between two forecasts made at the same instant.
 

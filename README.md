@@ -2,7 +2,7 @@
 
 **Target.** gridcast is a forecasting service for Great Britain's half-hourly grid carbon intensity (to be containerised in Phase P5), forecasting 48 hours ahead and will be gated in CI on forecast accuracy. It aims to answer whether a solo open-source model can beat the National Energy System Operator's (NESO) published forecast on a permanent, public scoreboard.
 
-> Phase P3 closes with no gate verdict (neither a pass nor a fail; ADR-020). The previously proposed 35.0 gCO2/kWh threshold was derived from the candidate's own validation score and was mathematically invalid to judge it. On the frozen evaluation split (frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins; 2026-09-04 23:00 UTC to 2026-10-31 00:00 UTC), the candidate model scores GATE_VALUE = 39.118 gCO2/kWh against persistence (53.741 gCO2/kWh), seasonal-naive (51.495 gCO2/kWh), and NESO operator (11.666 gCO2/kWh) (archive commit 3617143, restated from 39.032 gCO2/kWh at commit 3617143; frozen fixture v2). An external gap-closure gate referencing persistence and operator baselines is defined in ADR-021 for Phase P4.
+> Phase P3 closes with no gate verdict (neither a pass nor a fail; ADR-020). The previously proposed 35.0 gCO2/kWh threshold was derived from the candidate's own validation score and was mathematically invalid to judge it. On the frozen evaluation split (frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins; 2026-09-04 23:00 UTC to 2026-10-31 00:00 UTC), the candidate model scores GATE_VALUE = 39.118 gCO2/kWh against persistence (53.741 gCO2/kWh), seasonal-naive (51.495 gCO2/kWh), and NESO operator (11.666 gCO2/kWh) (archive commit 3617143, restated from 39.032 gCO2/kWh at commit 3617143; frozen fixture v2). An external gap-closure gate referencing persistence and operator baselines is defined in ADR-021 and committed as an automated CI gate in ADR-030 for Phase P5.
 
 > Note: Upon completion of Phase P7, this README will open with the live forecast-vs-actual scoreboard table comparing gridcast models against the NESO baseline, positioned directly above the Quickstart.
 
@@ -15,7 +15,7 @@
 | P2 | Features: feature extraction and temporal leakage test suite | done |
 | P3 | Models: baseline models, backtesting engine, and evaluation gate | closed (no gate verdict; ADR-020) |
 | P4 | Service: FastAPI prediction API and Prometheus metrics endpoint | done |
-| P5 | Packaging: Docker containerisation and GitHub Actions CI workflow | not started |
+| P5 | Packaging: Docker containerisation and GitHub Actions CI workflow | in progress (P5-a gate wired) |
 | P6 | Verification: deliberately failing pull request demonstrating accuracy gate | not started |
 | P7 | Deployment: automated schedule, documentation, and scoreboard publication | not started |
 
@@ -79,7 +79,7 @@ python -m gridcast version
 
 ## What works today
 
-Today (Phase P4), the working automation targets are:
+Today (Phase P5-a), the working automation targets are:
 - `make install` — creates the virtual environment and installs dependencies in editable mode
 - `make test` — runs the test suite with coverage enforcement (>= 85%) and temporal leakage validation
 - `make lint` — checks codebase formatting and linting rules with ruff
@@ -88,7 +88,9 @@ Today (Phase P4), the working automation targets are:
 - `make ingest` — runs the nightly half-hourly ingest CLI (`gridcast ingest --days 2` followed by `gridcast ingest --reconcile-recent`)
 - `make features` — builds and inspects the canonical example feature frame keyed by `(issue_time, horizon)`
 - `make train` — trains the native LightGBM model on settled features and writes artifact hash
-- `make eval` — runs the rolling-origin backtest across 15 origins and evaluates the single scalar accuracy gate
+- `make eval` — evaluates candidate model from frozen fixture against the wired threshold (43.3379 gCO2/kWh), printing full provenance block and gate verdict (PASS)
+- `make gate-negative` — runs gate on negative control fixture and asserts rejection (FAIL)
+- `make eval-reproduce` — retrains 15 folds and verifies candidate predictions reproduce fixture with zero delta
 - `make data-check` — asserts integrity and completeness of the committed curated dataset
 
 ### Features

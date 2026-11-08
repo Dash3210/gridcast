@@ -251,6 +251,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable detailed table output.",
     )
 
+    gate_negative_parser = subparsers.add_parser(
+        "gate-negative",
+        help="Run gate on negative control fixture and assert it returns FAIL.",
+    )
+    gate_negative_parser.add_argument(
+        "--fixture",
+        type=str,
+        default="data/eval/negative_control.parquet",
+        help="Path to negative control fixture (default: data/eval/negative_control.parquet).",
+    )
+    gate_negative_parser.add_argument(
+        "--threshold",
+        type=str,
+        default="data/eval/gate_threshold.json",
+        help="Path to gate threshold artifact (default: data/eval/gate_threshold.json).",
+    )
+    gate_negative_parser.add_argument(
+        "--no-verbose",
+        dest="verbose",
+        action="store_false",
+        default=True,
+        help="Disable detailed progress and table output.",
+    )
+
     eval_refresh_parser = subparsers.add_parser(
         "eval-refresh",
         help="Rebuild frame and refresh evaluation fixture (slow, manual).",
@@ -585,6 +609,35 @@ def run_eval_cli(
         return 1
 
 
+def run_gate_negative_cli(
+    fixture_path: Path | str = "data/eval/negative_control.parquet",
+    threshold_path: Path | str = "data/eval/gate_threshold.json",
+    verbose: bool = True,
+) -> int:
+    """Run gate on negative control fixture and assert it returns FAIL."""
+    from gridcast.backtest import evaluate_from_fixture
+
+    try:
+        results = evaluate_from_fixture(
+            parquet_path=fixture_path,
+            sidecar_path=None,
+            verbose=verbose,
+            pinned_sha256=None,
+            threshold_path=threshold_path,
+        )
+        if results.verdict != "FAIL":
+            print(
+                f"Gate negative control failed: expected verdict 'FAIL', got '{results.verdict}'",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Negative control verified: gate rejected candidate with verdict {results.verdict}")
+        return 0
+    except Exception as e:
+        print(f"Gate negative control execution error: {e}", file=sys.stderr)
+        return 1
+
+
 def run_eval_reproduce_cli(
     fixture_path: Path | str = "data/eval/frozen_split_v2.parquet",
     sidecar_path: Path | str = "data/eval/frozen_split_v2.json",
@@ -700,6 +753,13 @@ def main(argv: list[str] | None = None) -> int:
         return run_eval_cli(
             fixture_path=args.fixture,
             sidecar_path=args.sidecar,
+            verbose=args.verbose,
+        )
+
+    if args.subcommand == "gate-negative":
+        return run_gate_negative_cli(
+            fixture_path=args.fixture,
+            threshold_path=args.threshold,
             verbose=args.verbose,
         )
 

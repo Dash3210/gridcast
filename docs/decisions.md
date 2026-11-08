@@ -682,3 +682,44 @@
   - Clamping negative lower bounds to 0 (rejected: corrupts empirical calibration and silently alters published coverage).
   - Retaining 503 on late nightly publish in `/ready` (rejected: converts data freshness delays into complete service downtime).
   - Multiple deadline constants (rejected: risk of disagreement between alert and routing logic).
+
+## ADR-030 — CI evaluation gate wiring, provenance exposition, and negative control verification
+- Status: accepted
+- Date: 2026-11-08
+- Context:
+  Phase P3 (ADR-020) voided the preliminary 35.0 gCO2/kWh threshold because it was derived from the candidate model's own validation score plus 3.5%, leaving no external standard. ADR-021 formulated an external gap-closure rule: the candidate must close >= 30% of the persistence-to-operator MAE gap, but the threshold number lived only in prose.
+  Phase P5-a requires wiring this gate into automated CI, committing the threshold as an immutable artifact with self-verifying arithmetic, presenting complete evaluation provenance in one block, proving rejection on a negative control artifact, and asserting number consistency across documentation.
+- Decision:
+  1. Threshold artifact commitment (`data/eval/gate_threshold.json`):
+     The gate threshold is committed as a concrete artifact:
+     ```json
+     {
+       "rule": "candidate closes >= 30% of the persistence-to-operator MAE gap",
+       "fraction": 0.30,
+       "derived_on": {"split": "validation", "start": "2026-06-05", "end": "2026-08-30", "origins": 15},
+       "persistence_mae_validation": 57.776,
+       "operator_mae_validation": 9.649,
+       "required_mae": 43.3379,
+       "adr": "ADR-021"
+     }
+     ```
+     `load_and_verify_gate_threshold()` dynamically recomputes `required = persistence - fraction * (persistence - operator)` from these stored parameters and asserts it strictly equals `required_mae` (`round(recomputed, 4) == 43.3379`). If the arithmetic or constants are altered without a synchronized update, the gate refuses rather than silently moving.
+  2. Single evaluation implementation with full provenance exposition:
+     `make eval` (`gridcast.cli eval` invoking `evaluate_from_fixture`) evaluates the candidate on the pinned fixture against `required_mae`.
+     On the frozen evaluation split (frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins; 2026-09-04 23:00 UTC to 2026-10-31 00:00 UTC), the candidate model scores GATE_VALUE = 39.118 gCO2/kWh against persistence (53.741 gCO2/kWh), seasonal-naive (51.495 gCO2/kWh), and NESO operator (11.666 gCO2/kWh).
+     Because 39.118 <= 43.3379, the candidate passes the gate with verdict `PASS` (closing 34.75% of the gap on the frozen test split).
+     The evaluation prints in one unified block: rule, fraction, required MAE, validation split derivation, fixture SHA-256, archive commit, origin window, candidate / operator / persistence / seasonal GATE_VALUEs, skill metrics, historical note recording ADR-020's void P3 result, and the current gate verdict. This single function will be reused by the public scoreboard in P7.
+  3. Negative control rejection (`make gate-negative`):
+     A gate that has never failed is not a gate. `data/eval/negative_control.parquet` preserves the exact ground truth of the pinned evaluation fixture, replacing `candidate_pred` with `persistence_pred` (scoring 53.741 gCO2/kWh).
+     `make gate-negative` runs the identical gate function on `negative_control.parquet` and asserts verdict `FAIL`, exiting 0 solely because rejection was the expected outcome. If the gate function is weakened to return PASS unconditionally, `make gate-negative` immediately fails with non-zero exit code.
+  4. Numbers consistency across documentation:
+     Extended `tests/test_model_card_consistency.py` to parse published figures from `README.md`, `MODEL_CARD.md`, and `docs/decisions.md` and assert candidate `39.118`, operator `11.666`, persistence `53.741`, and seasonal `51.495` match the fixture at published precision. Tests verify that altering any single figure in any of the three files causes an assertion failure.
+  5. Hermetic CI workflow (`.github/workflows/ci.yml`):
+     Runs on push and pull request. CI steps execute `make check`, `make eval` (asserting `GATE VERDICT: PASS` and fixture SHA-256), `make gate-negative` (asserting `GATE VERDICT: FAIL`), `make eval-reproduce` (asserting zero delta `0.00000000`), and `git diff --exit-code`.
+     No job may read `data/scoreboard/scores.csv`: the gate is strictly a function of the model and the pinned fixture. All checks run offline with zero network calls and zero file modifications under `data/`.
+- Consequences:
+  The accuracy gate is fully wired, verified for negative control rejection, mathematically safeguarded against arithmetic drift, and hermetically validated in CI.
+- Alternatives rejected:
+  - Storing the threshold only as a Python constant (rejected: vulnerable to untracked parameter drift).
+  - Creating a synthetic mock for the negative control comparison (rejected: must exercise the identical production evaluation gate).
+  - Re-evaluating against the live scoreboard during CI (rejected: scoreboard mutates as late actuals arrive; CI gate must depend strictly on pinned fixture).

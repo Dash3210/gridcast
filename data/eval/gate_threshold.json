@@ -1,0 +1,14 @@
+{
+  "rule": "candidate closes >= 30% of the persistence-to-operator MAE gap",
+  "fraction": 0.30,
+  "derived_on": {
+    "split": "validation",
+    "start": "2026-06-05",
+    "end": "2026-08-30",
+    "origins": 15
+  },
+  "persistence_mae_validation": 57.776,
+  "operator_mae_validation": 9.649,
+  "required_mae": 43.3379,
+  "adr": "ADR-021"
+}

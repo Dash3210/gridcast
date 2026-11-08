@@ -227,6 +227,128 @@ def test_readme_scalars_match_fixture() -> None:
         assert f"{entry['seasonal_naive']:.3f}" == f"{expected['seasonal_naive']:.3f}"
 
 
+def parse_decisions_scalars(decisions_text: str) -> list[dict[str, float]]:
+    """Extract quoted GATE_VALUE blocks from docs/decisions.md."""
+    pattern = re.compile(
+        r"GATE_VALUE\s*=\s*`?([0-9]+\.[0-9]+)`?\s*gCO2/kWh"
+        r"(?:(?!##).)*?"
+        r"persistence\s*\(?`?([0-9]+\.[0-9]+)`?\s*(?:gCO2/kWh)?\)?"
+        r"(?:(?!##).)*?"
+        r"seasonal-naive\s*\(?`?([0-9]+\.[0-9]+)`?\s*(?:gCO2/kWh)?\)?"
+        r"(?:(?!##).)*?"
+        r"NESO operator\s*\(?`?([0-9]+\.[0-9]+)`?\s*(?:gCO2/kWh)?\)?",
+        re.DOTALL,
+    )
+    matches = []
+    for m in pattern.finditer(decisions_text):
+        matches.append({
+            "model": float(m.group(1)),
+            "persistence": float(m.group(2)),
+            "seasonal_naive": float(m.group(3)),
+            "operator": float(m.group(4)),
+        })
+    return matches
+
+
+def test_decisions_scalars_match_fixture() -> None:
+    """Verify that scalar figures quoted in docs/decisions.md match fixture at 3 decimals."""
+    computed = compute_published_metrics()
+    decisions_text = DECISIONS_PATH.read_text(encoding="utf-8")
+    parsed_entries = parse_decisions_scalars(decisions_text)
+
+    assert len(parsed_entries) >= 1, "Expected at least 1 GATE_VALUE reference in docs/decisions.md"
+    expected = computed["scalars"]
+
+    for entry in parsed_entries:
+        assert f"{entry['model']:.3f}" == f"{expected['model']:.3f}"
+        assert f"{entry['operator']:.3f}" == f"{expected['operator']:.3f}"
+        assert f"{entry['persistence']:.3f}" == f"{expected['persistence']:.3f}"
+        assert f"{entry['seasonal_naive']:.3f}" == f"{expected['seasonal_naive']:.3f}"
+
+
+def test_published_figures_exact_precision_in_three_files() -> None:
+    """Verify published figures in README, MODEL_CARD, and docs/decisions.md match fixture.
+
+    Asserts each file contains candidate 39.118, operator 11.666, persistence 53.741,
+    seasonal 51.495 matching fixture values at published precision.
+    """
+    computed = compute_published_metrics()
+    expected = computed["scalars"]
+    cand_str = f"{expected['model']:.3f}"
+    oper_str = f"{expected['operator']:.3f}"
+    pers_str = f"{expected['persistence']:.3f}"
+    sn_str = f"{expected['seasonal_naive']:.3f}"
+
+    assert cand_str == "39.118"
+    assert oper_str == "11.666"
+    assert pers_str == "53.741"
+    assert sn_str == "51.495"
+
+    # 1. MODEL_CARD.md
+    card_scalars = parse_model_card_gate_scalars(MODEL_CARD_PATH.read_text(encoding="utf-8"))
+    assert f"{card_scalars['model']:.3f}" == cand_str
+    assert f"{card_scalars['operator']:.3f}" == oper_str
+    assert f"{card_scalars['persistence']:.3f}" == pers_str
+    assert f"{card_scalars['seasonal_naive']:.3f}" == sn_str
+
+    # 2. README.md
+    readme_entries = parse_readme_scalars(README_PATH.read_text(encoding="utf-8"))
+    assert len(readme_entries) >= 1
+    for r in readme_entries:
+        assert f"{r['model']:.3f}" == cand_str
+        assert f"{r['operator']:.3f}" == oper_str
+        assert f"{r['persistence']:.3f}" == pers_str
+        assert f"{r['seasonal_naive']:.3f}" == sn_str
+
+    # 3. docs/decisions.md
+    decisions_entries = parse_decisions_scalars(DECISIONS_PATH.read_text(encoding="utf-8"))
+    assert len(decisions_entries) >= 1
+    for d in decisions_entries:
+        assert f"{d['model']:.3f}" == cand_str
+        assert f"{d['operator']:.3f}" == oper_str
+        assert f"{d['persistence']:.3f}" == pers_str
+        assert f"{d['seasonal_naive']:.3f}" == sn_str
+
+
+@pytest.mark.parametrize(
+    "file_path,search_str,replacement_str",
+    [
+        (README_PATH, "39.118", "39.999"),
+        (MODEL_CARD_PATH, "11.666", "11.999"),
+        (DECISIONS_PATH, "53.741", "53.999"),
+    ],
+)
+def test_published_figures_fail_on_tamper(
+    file_path: Path, search_str: str, replacement_str: str
+) -> None:
+    """Prove consistency test fails when one figure is changed in one file."""
+    original_text = file_path.read_text(encoding="utf-8")
+    assert search_str in original_text, f"Expected {search_str} in {file_path}"
+    tampered_text = original_text.replace(search_str, replacement_str)
+
+    with pytest.raises(AssertionError):
+        if file_path == README_PATH:
+            entries = parse_readme_scalars(tampered_text)
+            for e in entries:
+                assert f"{e['model']:.3f}" == "39.118"
+                assert f"{e['operator']:.3f}" == "11.666"
+                assert f"{e['persistence']:.3f}" == "53.741"
+                assert f"{e['seasonal_naive']:.3f}" == "51.495"
+        elif file_path == MODEL_CARD_PATH:
+            scalars = parse_model_card_gate_scalars(tampered_text)
+            assert f"{scalars['model']:.3f}" == "39.118"
+            assert f"{scalars['operator']:.3f}" == "11.666"
+            assert f"{scalars['persistence']:.3f}" == "53.741"
+            assert f"{scalars['seasonal_naive']:.3f}" == "51.495"
+        elif file_path == DECISIONS_PATH:
+            entries = parse_decisions_scalars(tampered_text)
+            for e in entries:
+                assert f"{e['model']:.3f}" == "39.118"
+                assert f"{e['operator']:.3f}" == "11.666"
+                assert f"{e['persistence']:.3f}" == "53.741"
+                assert f"{e['seasonal_naive']:.3f}" == "51.495"
+
+
 def test_published_figures_carry_window() -> None:
     """Assert that every published number carries its origin window description."""
     computed = compute_published_metrics()

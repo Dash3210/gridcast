@@ -1,0 +1,56 @@
+name: CI
+
+# No job may read data/scoreboard/scores.csv: the gate is a function of the model and the pinned fixture, nothing else.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: CI Accuracy Gate & Integrity Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        # The Makefile resolves its interpreter to .venv/bin/python, so create that venv rather
+        # than installing into the runner's system Python.
+        run: |
+          make install PYTHON=python
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Run check suite (lint, typecheck, test, data-check)
+        run: make check
+
+      # No job may read data/scoreboard/scores.csv: the gate is a function of the model and the pinned fixture, nothing else.
+      - name: Run evaluation gate and assert PASS with fixture SHA-256
+        run: |
+          EVAL_OUTPUT=$(make eval)
+          echo "$EVAL_OUTPUT"
+          echo "$EVAL_OUTPUT" | grep -F "GATE VERDICT: PASS"
+          echo "$EVAL_OUTPUT" | grep -F "87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51"
+
+      - name: Run gate on negative control (assert rejection)
+        run: make gate-negative
+
+      - name: Verify bitwise model reproduction (assert zero delta)
+        run: |
+          REPRODUCE_OUTPUT=$(make eval-reproduce)
+          echo "$REPRODUCE_OUTPUT"
+          echo "$REPRODUCE_OUTPUT" | grep -F "0.00000000"
+
+      - name: Assert clean working tree (no writes under data/ or repository)
+        run: git diff --exit-code
