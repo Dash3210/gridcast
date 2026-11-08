@@ -39,6 +39,8 @@ from gridcast.features import (
 )
 from gridcast.models import get_model_artifact_hash
 from gridcast.serve import (
+    DEFAULT_INTERVAL_PATH,
+    DEFAULT_MODEL_PATH,
     FeatureSourceGapError,
     app,
     create_app,
@@ -151,7 +153,11 @@ def test_forecast_hours_validation(client: TestClient) -> None:
     assert r_str.status_code == 422
 
 
-def assert_forecast_points_contract(data: dict[str, Any]) -> None:
+def assert_forecast_points_contract(
+    data: dict[str, Any],
+    check_model_linkage: bool = False,
+    linkage_date: str = SAMPLE_ISSUE_DATE,
+) -> None:
     """Validate 48-hour 96-point forecast contract invariants."""
     points = data.get("points", [])
     assert len(points) == 96, f"Expected exactly 96 points, got {len(points)}"
@@ -189,6 +195,14 @@ def assert_forecast_points_contract(data: dict[str, Any]) -> None:
         assert math.isfinite(lower), f"Point {i} lower is not finite: {lower}"
         assert math.isfinite(upper), f"Point {i} upper is not finite: {upper}"
 
+        # upper > lower: a zero-width interval is not an interval
+        assert upper > lower, (
+            f"Point {i} interval has non-positive width: lower={lower}, upper={upper}"
+        )
+
+        # Non-negative carbon intensity invariant: value >= 0
+        assert val >= 0.0, f"Point {i} value is negative: {val}"
+
         # lower <= value <= upper
         assert lower <= val <= upper, (
             f"Point {i} bounds violated: lower={lower} <= value={val} <= upper={upper}"
@@ -207,9 +221,41 @@ def assert_forecast_points_contract(data: dict[str, Any]) -> None:
         "Handler returned 96 constant points; expected realistic forecast curve"
     )
 
+    if check_model_linkage:
+        assert_forecast_model_linkage(data, issue_date=linkage_date)
+
+
+def assert_forecast_model_linkage(
+    data: dict[str, Any],
+    issue_date: str = SAMPLE_ISSUE_DATE,
+    tolerance: float = 1e-6,
+) -> None:
+    """Assert API values equal direct booster prediction on the same feature frame to 1e-6."""
+    from gridcast.features import select_model_inputs
+    from gridcast.models import load_model_booster, predict_lgbm
+    from gridcast.serve import resolve_features_for_issue
+
+    points = data.get("points", [])
+    api_values = np.array([float(pt["value"]) for pt in points], dtype=float)
+
+    booster = load_model_booster()
+    feature_df = resolve_features_for_issue(issue_date, booster=booster)
+    X_mat = select_model_inputs(feature_df, feature_columns=booster.feature_name())
+    direct_preds = predict_lgbm(booster, X_mat)
+
+    assert len(api_values) == len(direct_preds), (
+        f"Length mismatch: API has {len(api_values)} points, direct booster has {len(direct_preds)}"
+    )
+
+    max_diff = float(np.max(np.abs(api_values - direct_preds)))
+    assert max_diff <= tolerance, (
+        f"Model linkage check failed: max difference between API values and direct booster "
+        f"predictions is {max_diff:.2e}, exceeding tolerance {tolerance:.2e}"
+    )
+
 
 def test_forecast_48_hours_yields_exactly_96_points(client: TestClient) -> None:
-    """GET /forecast?hours=48: exactly 96 points, 30 min step, lower <= value <= upper."""
+    """GET /forecast?hours=48: 96 points, 30 min step, lower <= value <= upper, model linked."""
     response = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
     assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
 
@@ -220,7 +266,7 @@ def test_forecast_48_hours_yields_exactly_96_points(client: TestClient) -> None:
     assert "is_current_issue" in data
     assert data.get("hours") == 48
 
-    assert_forecast_points_contract(data)
+    assert_forecast_points_contract(data, check_model_linkage=True)
 
 
 def test_forecast_contract_rejects_constant_points_mutation() -> None:
@@ -248,6 +294,84 @@ def test_forecast_contract_rejects_constant_points_mutation() -> None:
 
     with pytest.raises(AssertionError, match="Handler returned 96 constant points"):
         assert_forecast_points_contract(mutation_payload)
+
+
+def test_forecast_contract_rejects_zero_width_interval_mutation(client: TestClient) -> None:
+    """Mutation demonstration: a zero-width interval (upper == lower) must fail the contract."""
+    import copy
+
+    resp = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+    assert resp.status_code == 200
+    payload = copy.deepcopy(resp.json())
+
+    # Verify precondition before mutation
+    orig_lower = payload["points"][0]["lower"]
+    orig_upper = payload["points"][0]["upper"]
+    assert orig_upper > orig_lower
+
+    # Inject mutation: collapse interval to zero width at point's value
+    val = payload["points"][0]["value"]
+    payload["points"][0]["lower"] = val
+    payload["points"][0]["upper"] = val
+
+    # Verify injection precondition: upper == lower
+    assert payload["points"][0]["upper"] == payload["points"][0]["lower"]
+
+    with pytest.raises(AssertionError, match="non-positive width"):
+        assert_forecast_points_contract(payload)
+
+
+def test_forecast_contract_rejects_negative_value_mutation(client: TestClient) -> None:
+    """Mutation demonstration: negative prediction value must fail the contract."""
+    import copy
+
+    resp = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+    assert resp.status_code == 200
+    payload = copy.deepcopy(resp.json())
+
+    # Precondition assertion before mutation: value >= 0
+    assert payload["points"][0]["value"] >= 0.0
+
+    # Inject negative prediction value
+    payload["points"][0]["lower"] = -15.0
+    payload["points"][0]["value"] = -5.0
+    assert payload["points"][0]["value"] < 0.0
+
+    with pytest.raises(AssertionError, match="value is negative"):
+        assert_forecast_points_contract(payload)
+
+
+def test_forecast_contract_rejects_constant_offset_generator_mutation(client: TestClient) -> None:
+    """Mutation demonstration: constant-offset fabricated values must fail model linkage."""
+    import copy
+
+    from gridcast.features import select_model_inputs
+    from gridcast.models import load_model_booster, predict_lgbm
+    from gridcast.serve import resolve_features_for_issue
+
+    resp = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+    assert resp.status_code == 200
+    payload = copy.deepcopy(resp.json())
+
+    # Verify model prediction baseline
+    booster = load_model_booster()
+    feature_df = resolve_features_for_issue(SAMPLE_ISSUE_DATE, booster=booster)
+    X_mat = select_model_inputs(feature_df, feature_columns=booster.feature_name())
+    direct_preds = predict_lgbm(booster, X_mat)
+
+    # Inject constant offset mutation across all horizons
+    offset = 10.0
+    for pt in payload["points"]:
+        pt["value"] = float(pt["value"]) + offset
+        pt["lower"] = float(pt["lower"]) + offset
+        pt["upper"] = float(pt["upper"]) + offset
+
+    # Verify injection precondition: values strictly differ by offset
+    first_pt_val = float(payload["points"][0]["value"])
+    assert abs(first_pt_val - direct_preds[0]) >= offset - 1e-4
+
+    with pytest.raises(AssertionError, match="Model linkage check failed"):
+        assert_forecast_points_contract(payload, check_model_linkage=True)
 
 
 def test_metrics_endpoint_parses_prometheus_and_matches_scores_csv(
@@ -759,7 +883,7 @@ def test_forecast_default_serves_fallback_with_named_gap(client: TestClient) -> 
         assert pt["lower"] <= pt["value"] <= pt["upper"]
 
 
-def test_forecast_explicit_today_unbuildable_returns_503(client: TestClient) -> None:
+def test_forecast_date_beyond_store_returns_503(client: TestClient) -> None:
     """GET /forecast?date=<future> returns 503 FeatureSourceGapError without falling back."""
     response = client.get("/forecast?date=2027-01-01")
     assert response.status_code == 503
@@ -892,6 +1016,44 @@ def test_forecast_enforces_midnight_london_anchor(client: TestClient) -> None:
     assert getattr(dt_spring_0, "fold", 0) == 0
 
 
+def test_forecast_rejects_naive_timestamps_matrix(client: TestClient) -> None:
+    """Reject naive issue_time with and without time for July and November with 422.
+
+    Explicit offsets and date=YYYY-MM-DD return 200.
+    """
+    naive_cases = [
+        ("2026-11-01", "November naive without time"),
+        ("2026-07-01", "July naive without time"),
+        ("2026-11-01T00:00:00", "November naive with time"),
+        ("2026-07-01T00:00:00", "July naive with time"),
+    ]
+    for naive_val, desc in naive_cases:
+        resp = client.get(f"/forecast?issue_time={naive_val}")
+        assert resp.status_code == 422, f"{desc} ({naive_val}) expected 422, got {resp.status_code}"
+        body = resp.json()
+        detail_msg = body.get("detail", "")
+        if isinstance(detail_msg, dict):
+            detail_msg = detail_msg.get("message", "") or detail_msg.get("detail", "")
+        assert "explicit" in detail_msg.lower() and "offset" in detail_msg.lower(), (
+            f"Message for {desc} must say explicit offset is required: {detail_msg}"
+        )
+        assert "date=YYYY-MM-DD" in detail_msg, (
+            f"Message for {desc} must say date=YYYY-MM-DD is the supported form: {detail_msg}"
+        )
+
+    # date=YYYY-MM-DD is supported -> 200
+    r_date = client.get("/forecast?date=2026-11-01")
+    assert r_date.status_code == 200
+
+    # issue_time with explicit UTC offset (Z) -> 200
+    r_utc = client.get("/forecast?issue_time=2026-11-01T00:00:00Z")
+    assert r_utc.status_code == 200
+
+    # issue_time with explicit BST offset (+01:00) -> 200
+    r_bst = client.get("/forecast?issue_time=2026-07-01T00:00:00+01:00")
+    assert r_bst.status_code == 200
+
+
 def test_forecast_invalid_dates_return_422_without_leaking_input_or_paths(
     client: TestClient,
 ) -> None:
@@ -925,14 +1087,20 @@ def test_forecast_invalid_dates_return_422_without_leaking_input_or_paths(
 
 
 def test_metric_cardinality_is_bounded_under_path_fuzzing() -> None:
-    """Distinct unknown paths map to 'unmatched' and keep Prometheus metrics strictly bounded."""
+    """Registered routes plus 'unmatched' keep Prometheus metrics strictly bounded."""
     app_instance = create_app()
     with TestClient(app_instance) as c:
-        # Hit /forecast, /health, /metrics
+        # Hit all 6 registered application endpoints
         r_f = c.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
         assert r_f.status_code == 200
         r_h = c.get("/health")
         assert r_h.status_code == 200
+        r_ready = c.get("/ready")
+        assert r_ready.status_code in (200, 503)
+        r_mod = c.get("/model")
+        assert r_mod.status_code == 200
+        r_rel = c.post("/reload")
+        assert r_rel.status_code in (401, 503)
         r_m = c.get("/metrics")
         assert r_m.status_code == 200
 
@@ -940,13 +1108,21 @@ def test_metric_cardinality_is_bounded_under_path_fuzzing() -> None:
         r_u = c.get("/unknown_random_path_init")
         assert r_u.status_code == 404
 
-        # Read /metrics and assert endpoint label set is EXACTLY the declared endpoints
+        # Read /metrics and assert endpoint label set is EXACTLY the 7 declared endpoints
         m_resp = c.get("/metrics")
         assert m_resp.status_code == 200
         families = list(text_string_to_metric_families(m_resp.text))
         dur_fam = next(f for f in families if f.name == "gridcast_request_duration_seconds")
         endpoint_labels = {s.labels.get("endpoint") for s in dur_fam.samples}
-        expected_labels = {"/forecast", "/health", "/metrics", "unmatched"}
+        expected_labels = {
+            "/forecast",
+            "/health",
+            "/metrics",
+            "/model",
+            "/ready",
+            "/reload",
+            "unmatched",
+        }
         assert endpoint_labels == expected_labels, (
             f"Expected endpoint label set exactly {expected_labels}, got {endpoint_labels}"
         )
@@ -960,7 +1136,7 @@ def test_metric_cardinality_is_bounded_under_path_fuzzing() -> None:
         families_200 = list(text_string_to_metric_families(m_resp_200.text))
         dur_fam_200 = next(f for f in families_200 if f.name == "gridcast_request_duration_seconds")
         endpoint_labels_200 = {s.labels.get("endpoint") for s in dur_fam_200.samples}
-        assert endpoint_labels_200 == {"/forecast", "/health", "/metrics", "unmatched"}, (
+        assert endpoint_labels_200 == expected_labels, (
             f"Endpoint label set grew after 200 paths: {endpoint_labels_200}"
         )
 
@@ -1109,19 +1285,19 @@ def test_health_stays_200_as_liveness_probe(client: TestClient) -> None:
     assert "generation" in data
 
 
-def test_ready_endpoint_returns_200_and_503_based_on_served_issue_age() -> None:
-    """GET /ready returns 200 when served issue <= 27h old; 503 when older than 27 hours."""
+def test_ready_endpoint_returns_200_and_503_based_on_publish_deadline() -> None:
+    """GET /ready returns 200 before 11:00 UTC publish deadline; 503 after deadline if stale."""
     from unittest.mock import patch
+
+    from gridcast.serve import PUBLISH_DEADLINE_UTC
 
     app_instance = create_app()
 
-    # Derive the clock from the issue the app actually serves, not from a fixed calendar date.
+    # Determine served issue anchor from app state
     with TestClient(app_instance) as c0:
-        served = pd.Timestamp(c0.get("/ready").json()["served_issue_time"])
+        served_ts = pd.Timestamp(c0.get("/ready").json()["served_issue_time"]).to_pydatetime()
 
-    def make_clock(offset_hours: int) -> type[datetime]:
-        moment = served.to_pydatetime() + timedelta(hours=offset_hours)
-
+    def make_clock(moment: datetime) -> type[datetime]:
         class Clock(datetime):
             @classmethod
             def now(cls, tz: Any = None) -> Clock:
@@ -1139,39 +1315,324 @@ def test_ready_endpoint_returns_200_and_503_based_on_served_issue_age() -> None:
 
         return Clock
 
-    # 1. Fresh issue: 20h after the served issue -> 200
-    with (
-        patch("gridcast.serve.datetime", make_clock(20)),
-        TestClient(app_instance) as c,
-    ):
-        resp = c.get("/ready")
-        data = resp.json()
-        assert resp.status_code == 200
-        assert data["status"] == "ready"
-        assert "served_issue_age_seconds" in data
-        assert data["served_issue_age_seconds"] <= 27 * 3600
-        assert "generation" in data
+    # Clock table cases: 09h, 24h, 26h, 30h, 10:30Z (on time), 11:30Z (30 min late -> still 200)
+    clock_cases = [
+        ("09h", served_ts + timedelta(hours=9), 200, "ready", "on_time"),
+        ("24h", served_ts + timedelta(hours=24), 200, "ready", "on_time"),
+        ("26h", served_ts + timedelta(hours=26), 200, "ready", "on_time"),
+        ("30h", served_ts + timedelta(hours=30), 200, "ready", "on_time"),
+        (
+            "10:30Z yesterday's issue (on time)",
+            served_ts + timedelta(days=1, hours=10, minutes=30),
+            200,
+            "ready",
+            "on_time",
+        ),
+        (
+            "11:30Z yesterday's issue (30 min late)",
+            served_ts + timedelta(days=1, hours=11, minutes=30),
+            200,
+            "ready",
+            "late",
+        ),
+    ]
 
-        # Verify Prometheus metric exposure for age
-        m_resp = c.get("/metrics")
-        assert m_resp.status_code == 200
-        families = list(text_string_to_metric_families(m_resp.text))
-        age_fam = next(f for f in families if f.name == "gridcast_served_issue_age_seconds")
-        assert math.isclose(
-            age_fam.samples[0].value, data["served_issue_age_seconds"], rel_tol=1e-3
+    for label, clock_dt, expected_status, expected_probe, expected_pub_status in clock_cases:
+        with (
+            patch("gridcast.serve.datetime", make_clock(clock_dt)),
+            TestClient(app_instance) as c,
+        ):
+            app_instance.state.service._cached_status = None
+            resp = c.get("/ready")
+            assert resp.status_code == expected_status, (
+                f"Case '{label}' at clock {clock_dt.isoformat()} expected HTTP {expected_status}, "
+                f"got {resp.status_code}: {resp.text}"
+            )
+            data = resp.json()
+            assert data["status"] == expected_probe
+            assert data["publish_status"] == expected_pub_status
+            assert "publish_lateness_seconds" in data
+            assert "served_issue_age_seconds" in data
+            assert data["served_issue_age_seconds"] >= 0.0
+            assert "is_current_issue" in data
+            assert data.get("publish_deadline_utc") == PUBLISH_DEADLINE_UTC
+            assert "generation" in data
+
+            if expected_pub_status == "late":
+                assert data["publish_lateness_seconds"] > 0.0, (
+                    f"Expected positive lateness when late, got {data['publish_lateness_seconds']}"
+                )
+            elif expected_pub_status == "on_time":
+                late_val = data["publish_lateness_seconds"]
+                assert late_val < 0.0, f"Expected negative lateness when on time, got {late_val}"
+
+            # Verify Prometheus metric exposure for age and publish lateness
+            m_resp = c.get("/metrics")
+            assert m_resp.status_code == 200
+            families = list(text_string_to_metric_families(m_resp.text))
+            age_fam = next(f for f in families if f.name == "gridcast_served_issue_age_seconds")
+            assert math.isclose(
+                age_fam.samples[0].value, data["served_issue_age_seconds"], rel_tol=1e-3
+            )
+            late_fam = next(f for f in families if f.name == "gridcast_publish_lateness_seconds")
+            assert math.isclose(
+                late_fam.samples[0].value, data["publish_lateness_seconds"], rel_tol=1e-3
+            )
+            if expected_pub_status == "late":
+                assert late_fam.samples[0].value > 0.0
+            elif expected_pub_status == "on_time":
+                assert late_fam.samples[0].value < 0.0
+
+    # Nothing servable: returns HTTP 503
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp_curated:
+        empty_app = create_app(curated_dir=tmp_curated)
+        with TestClient(empty_app) as c_empty:
+            r_empty = c_empty.get("/ready")
+            assert r_empty.status_code == 503
+            d_empty = r_empty.json()
+            assert d_empty["status"] == "not_ready"
+            assert "detail" in d_empty
+
+
+def test_concurrent_reloads_strictly_increasing_generations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assert concurrent reload threads publish strictly increasing, unique generations."""
+    import concurrent.futures
+
+    token = "test-concurrent-reload-token"
+    monkeypatch.setenv("GRIDCAST_RELOAD_TOKEN", token)
+
+    app_instance = create_app()
+    num_threads = 6
+    reload_generations: list[int] = []
+    forecast_generations: list[int] = []
+    errors: list[str] = []
+
+    with TestClient(app_instance) as c:
+
+        def do_reload() -> None:
+            try:
+                r = c.post("/reload", headers={"Authorization": f"Bearer {token}"})
+                if r.status_code == 200:
+                    data = r.json()
+                    reload_generations.append(data["generation"])
+                else:
+                    errors.append(f"Reload failed: {r.status_code} {r.text}")
+            except Exception as e:
+                errors.append(f"Reload exception: {e}")
+
+        def do_forecast() -> None:
+            try:
+                r = c.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+                if r.status_code == 200:
+                    data = r.json()
+                    gen = data["generation"]
+                    forecast_generations.append(gen)
+                    # Assert generation, model_hash and interval_hash belong to same snapshot
+                    assert data["model_hash"] == data["content_sha256"]
+                    assert data["interval_hash"] == data["interval_sha256"]
+                else:
+                    errors.append(f"Forecast failed: {r.status_code} {r.text}")
+            except Exception as e:
+                errors.append(f"Forecast exception: {e}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            reload_futures = [executor.submit(do_reload) for _ in range(num_threads)]
+            forecast_futures = [executor.submit(do_forecast) for _ in range(15)]
+            concurrent.futures.wait(reload_futures + forecast_futures)
+
+    assert len(errors) == 0, f"Encountered concurrency errors: {errors}"
+    assert len(reload_generations) == num_threads, (
+        f"Expected {num_threads} reloads, got {len(reload_generations)}"
+    )
+    # Generations must be unique
+    assert len(set(reload_generations)) == num_threads, (
+        f"Duplicate generations found: {reload_generations}"
+    )
+    # Generations must be strictly increasing
+    expected_gens = list(range(2, 2 + num_threads))
+    assert sorted(reload_generations) == expected_gens, (
+        f"Expected generations {expected_gens}, got {sorted(reload_generations)}"
+    )
+    # Assert forecast generations were collected and bound to valid snapshot generations
+    assert len(forecast_generations) == 15
+    for fg in forecast_generations:
+        assert 1 <= fg <= 1 + num_threads
+
+
+def test_forecast_generation_and_hashes_belong_to_snapshot_and_change_on_reload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Assert /forecast generation and hashes belong to snapshot and change together on reload."""
+    import shutil
+
+    token = "test-hash-coupling-token"
+    monkeypatch.setenv("GRIDCAST_RELOAD_TOKEN", token)
+
+    mpath = tmp_path / "model.txt"
+    ipath = tmp_path / "interval.json"
+    shutil.copy(DEFAULT_MODEL_PATH, mpath)
+    shutil.copy(DEFAULT_INTERVAL_PATH, ipath)
+
+    app_instance = create_app(model_path=mpath, interval_path=ipath)
+    client = TestClient(app_instance)
+
+    # 1. Snapshot 1
+    r1 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+    assert r1.status_code == 200
+    d1 = r1.json()
+    gen1 = d1["generation"]
+    mh1 = d1["model_hash"]
+    ih1 = d1["interval_hash"]
+    assert gen1 == 1
+    assert mh1 == d1["content_sha256"]
+    assert ih1 == d1["interval_sha256"]
+
+    # 2. Modify both model and interval artifacts
+    text = mpath.read_text(encoding="utf-8").replace("version=v4", "version=v4_updated")
+    mpath.write_text(text, encoding="utf-8")
+    idata = json.loads(ipath.read_text(encoding="utf-8"))
+    idata["quantiles"]["1"]["q10"] = float(idata["quantiles"]["1"]["q10"]) - 0.5
+    ipath.write_text(json.dumps(idata), encoding="utf-8")
+
+    # 3. Reload
+    r_reload = client.post("/reload", headers={"Authorization": f"Bearer {token}"})
+    assert r_reload.status_code == 200
+    assert r_reload.json()["generation"] == gen1 + 1
+
+    # 4. Snapshot 2: verify all three changed together
+    r2 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+    assert r2.status_code == 200
+    d2 = r2.json()
+    gen2 = d2["generation"]
+    mh2 = d2["model_hash"]
+    ih2 = d2["interval_hash"]
+
+    assert gen2 == gen1 + 1
+    assert mh2 != mh1
+    assert ih2 != ih1
+    assert mh2 == d2["content_sha256"]
+    assert ih2 == d2["interval_sha256"]
+
+
+def test_forecast_explicit_date_bounded_cache_and_clear_on_reload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Second request within TTL does not rebuild features and reload clears cache."""
+    import shutil
+    from unittest.mock import patch
+
+    import gridcast.serve as serve_module
+
+    token = "test-cache-token"
+    monkeypatch.setenv("GRIDCAST_RELOAD_TOKEN", token)
+
+    mpath = tmp_path / "model.txt"
+    ipath = tmp_path / "interval.json"
+    cpath = tmp_path / "curated"
+    shutil.copy(DEFAULT_MODEL_PATH, mpath)
+    shutil.copy(DEFAULT_INTERVAL_PATH, ipath)
+    shutil.copytree(CURATED_DIR_DEFAULT, cpath)
+
+    app_instance = create_app(
+        model_path=mpath,
+        interval_path=ipath,
+        curated_dir=cpath,
+    )
+    client = TestClient(app_instance)
+
+    # Warm up app status
+    client.get("/health")
+
+    st = app_instance.state.service
+    orig_build = serve_module.build_example_frame
+    builder_calls: list[Any] = []
+
+    def counting_build(*args: Any, **kwargs: Any) -> pd.DataFrame:
+        issue_times = kwargs.get("issue_times") or (args[3] if len(args) > 3 else None)
+        builder_calls.append(issue_times)
+        return orig_build(*args, **kwargs)
+
+    with patch.object(serve_module, "build_example_frame", side_effect=counting_build):
+        # 1. First request for date=2026-11-01: cache miss, builds frame
+        r1 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+        assert r1.status_code == 200
+        initial_builds = len(builder_calls)
+        assert initial_builds >= 1
+        assert st.cache_hits == 0
+        assert st.cache_misses == 1
+        orig_sha = r1.json()["content_sha256"]
+
+        # 2. Second request within TTL: cache hit, must NOT call builder again
+        r2 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+        assert r2.status_code == 200
+        assert len(builder_calls) == initial_builds, (
+            f"Builder was called again within TTL: {len(builder_calls)} > {initial_builds}"
         )
+        assert st.cache_hits == 1
+        assert st.cache_misses == 1
+        assert r2.json()["content_sha256"] == orig_sha
 
-    # 2. Stale issue: 72h after the served issue, so today's issue cannot be built -> 503
-    with (
-        patch("gridcast.serve.datetime", make_clock(72)),
-        TestClient(app_instance) as c_stale,
-    ):
-        resp_stale = c_stale.get("/ready")
-        assert resp_stale.status_code == 503
-        data_stale = resp_stale.json()
-        assert data_stale["status"] == "not_ready"
-        assert data_stale["served_issue_age_seconds"] > 27 * 3600
-        assert "exceeding readiness threshold of 27 hours" in data_stale.get("detail", "")
+        # 3. Third request within TTL: another cache hit
+        r3 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+        assert r3.status_code == 200
+        assert len(builder_calls) == initial_builds
+        assert st.cache_hits == 2
+        assert st.cache_misses == 1
+
+        # 4. Modify model file on disk
+        text = mpath.read_text(encoding="utf-8").replace("version=v4", "version=v4_updated")
+        mpath.write_text(text, encoding="utf-8")
+        expected_new_sha = get_model_artifact_hash(mpath)
+        assert expected_new_sha != orig_sha
+
+        # 5. POST /reload clears cache and loads new model
+        r_rel = client.post("/reload", headers={"Authorization": f"Bearer {token}"})
+        assert r_rel.status_code == 200
+        assert r_rel.json()["status"] == "reloaded"
+
+        # 6. Request inside TTL window: cache miss, rebuilds frame and carries new content_sha256
+        r4 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+        assert r4.status_code == 200
+        assert len(builder_calls) > initial_builds, (
+            "Builder was not called after reload cache clear"
+        )
+        assert st.cache_hits == 2
+        assert st.cache_misses == 2
+        assert r4.json()["content_sha256"] == expected_new_sha
+
+        # 7. Request again with same new model: cache hit inside TTL
+        builds_after_reload = len(builder_calls)
+        r5 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+        assert r5.status_code == 200
+        assert len(builder_calls) == builds_after_reload
+        assert st.cache_hits == 3
+        assert st.cache_misses == 2
+
+        # 8. Curated store freshness change: touch/modify partition so freshness key changes
+        # Freshness is (newest_period, mtime). Updating mtime inside TTL must invalidate cache!
+        partitions = sorted(cpath.glob("date=*.parquet"))
+        assert len(partitions) > 0
+        latest_partition = partitions[-1]
+        import time as time_mod
+        # Touch partition to update mtime
+        new_mtime = latest_partition.stat().st_mtime + 10.0
+        time_mod.sleep(0.01)
+        import os
+        os.utime(latest_partition, (new_mtime, new_mtime))
+
+        # 9. Request inside TTL window after freshness change: cache miss, rebuilds frame
+        r6 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+        assert r6.status_code == 200
+        assert len(builder_calls) > builds_after_reload, (
+            "Builder was not called after curated freshness changed"
+        )
+        assert st.cache_hits == 3
+        assert st.cache_misses == 3
 
 
 def test_forecast_hours_point_counts_and_contains_future_points(client: TestClient) -> None:

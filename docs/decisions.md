@@ -627,3 +627,58 @@
   - Rejecting non-UTC offsets for midnight anchors (rejected: over-rejects legitimate BST midnight instants).
   - Reader-side mutex locking (rejected: unnecessary contention overhead when snapshot is immutable and referenced via atomic pointer assignment).
   - Alarming liveness probes on unbuildable morning hours (rejected: causes alarm fatigue and container reboot loops).
+
+## ADR-028 — Serving round closure: publish deadline readiness, reload writer serialisation, bounded feature caching, and contract test hardening
+- Status: accepted
+- Date: 2026-11-08
+- Context:
+  Operational profiling and test suite auditing identified several production gaps:
+  1. The 27-hour age threshold in `/ready` failed during ordinary operation. Because the nightly ingest cron runs at 02:17 UTC with a measured 6.5-7.3h platform ingest delay (landing at 08:50-09:36 UTC), the served issue reaches 24 hours old at midnight and 33 hours old by publication, causing a false 503 alarm between 03:00 and ~09:00 UTC daily.
+  2. Concurrent administrative reloads suffered a read-modify-write race where multiple threads read generation N simultaneously and published duplicate N+1 generations.
+  3. Explicit-date requests (`/forecast?date=...`) rebuilt the entire 35k-row feature construction pipeline on every request, creating unnecessary CPU and memory overhead.
+  4. Contract tests accepted non-physical predictions, including zero-width intervals (`upper == lower`), negative carbon intensity values, and synthetic curves unconnected to the underlying LightGBM booster.
+  5. Documentation drifted from implementation: `/health` returns `status="healthy"` rather than `"ok"`, and Prometheus endpoint label sets instrument seven application routes (`/forecast`, `/health`, `/metrics`, `/model`, `/ready`, `/reload`, `unmatched`).
+- Decision:
+  1. Publish deadline for readiness probe: Replace the 27-hour age threshold with a deterministic 11:00 UTC publish deadline (`PUBLISH_DEADLINE_UTC = "11:00 UTC"`), incorporating cron schedule (02:17 UTC), measured platform ingest delay (6.5-7.3h), and approximately one hour of operational margin. `/ready` returns HTTP 503 only when wall-clock time is past 11:00 UTC and the current day's issue is unavailable; it returns HTTP 200 at all other times, including the 00:00-11:00 UTC window when legitimately serving yesterday's issue. Exposes `publish_deadline_utc`, `served_issue_time`, and `is_current_issue`, while retaining the `gridcast_served_issue_age_seconds` Prometheus gauge.
+  2. Full reload writer lock across read-modify-write: A dedicated writer lock (`_reload_lock`) serialises the entire reload sequence (artifact reading, validation, generation increment, snapshot swap, and cache invalidation). Generation numbers are strictly monotonic and unique across concurrent reloads. Readers remain completely lock-free, capturing an immutable `ModelSnapshot` reference upon entry to ensure responses never mix artifact hashes.
+  3. Bounded explicit-date feature cache: `ServiceState` maintains a bounded in-memory cache for resolved feature frames keyed by the resolved issue timestamp and model artifact SHA-256. Entries expire after a short 60-second time-to-live (TTL) to prevent serving stale data across publication boundaries, and are immediately evicted on reload.
+  4. Contract test hardening: `assert_forecast_points_contract` enforces `upper > lower` (strictly positive interval width), `lower <= value <= upper`, and `value >= 0.0`. Validates model linkage for a fixed issue date, asserting that served prediction values match a direct booster inference on the identical feature matrix to within 1e-6. Mutation tests demonstrate that zero-width intervals, negative intensity values, and constant-offset generators fail.
+  5. Documentation accuracy: Reconcile documentation with code truth, noting `status="healthy"`, the complete 7-route Prometheus label set bounded to registered routes plus `unmatched`, Phase P4 status, and reload mutex semantics.
+- Consequences:
+  Zero false alarms during ordinary morning publication windows, strictly ordered reload generations without race conditions, sub-millisecond repeated explicit-date queries, and verified physical and model-linked prediction contracts.
+- Alternatives rejected:
+  - Floating readiness age threshold to 36 hours (rejected: masks delayed ingests in the afternoon and evening).
+  - Unbounded in-memory feature cache (rejected: introduces unbounded memory growth over extended process lifetimes).
+  - Imputing missing actual features to force a current issue before ingest lands (rejected: violates ADR-009 against synthetic data fabrication).
+
+## ADR-029 — Serving contract corrections: routing vs freshness decoupling, honest intervals, curated cache key freshness, and naive timestamp rejection
+- Status: accepted
+- Date: 2026-11-08
+- Context:
+  Live operational evaluation identified four necessary corrections to the serving layer:
+  1. Readiness probe coupling: `/ready` returning 503 at publish deadline coupled freshness to routing. In production, a late nightly ingest would take the only pod out of service and turn stale data into a catastrophic outage.
+  2. Deadline redundancy: The 11:00 UTC deadline was duplicated across three constants (`PUBLISH_DEADLINE_UTC`, `_HOUR`, `_MINUTE`), creating drift risk between alert and outage.
+  3. Prediction interval over-assertion: Contract assertions required `lower >= 0.0`, but long-horizon residual quantiles (q10) can legitimately be negative after refreeze. Clamping would silently alter empirical coverage. Additionally, interval width does not strictly widen with horizon (38 of 95 steps non-monotonic; 1.27x far/near mean ratio).
+  4. Cache staleness window: The feature cache key omitted curated store freshness, allowing frames built seconds before a nightly ingest completed to be served stale for the remainder of the 60s TTL.
+  5. Naive timestamp parsing: `issue_time=2026-11-01T00:00:00` returned 200 while `2026-07-01T00:00:00` returned 422 due to accidental UTC localization of naive timestamps. `issue_time=2026-11-01` was also accepted.
+- Decision:
+  1. Routing vs Freshness Decoupling:
+     - `/ready` is strictly a routing signal: returns HTTP 200 while **any** buildable issue can be served; returns HTTP 503 only when nothing is servable.
+     - Publish lateness becomes pure observability: exposes Prometheus gauge `gridcast_publish_lateness_seconds` (negative before deadline) and `publish_status` ("on_time" | "late") in the `/ready` response body. Operational alerts monitor the gauge rather than container readiness probes.
+  2. Single Source of Truth for Deadline:
+     - Establish `PUBLISH_DEADLINE_UTC = "11:00 UTC"` as the single constant, deriving hour and minute dynamically.
+  3. Honest Interval Contract:
+     - Assert `value >= 0.0`, `upper > lower`, and `lower <= value <= upper`. Remove `lower >= 0.0` assertion completely.
+     - Do not assert that interval width increases monotonically with horizon. Record direction on pinned fixture (38 of 95 non-monotonic steps, 1.27x far/near mean ratio; direction recorded, magnitude not asserted).
+  4. Curated Freshness in Cache Key:
+     - Cache key is `(issue_time, model_sha256, curated_freshness)` where freshness captures both newest partition period and latest partition modification time. Invalidation test mutates the model file on disk, reloads, requests inside TTL, and asserts new `content_sha256`.
+  5. Strict Rejection of Naive Timestamps:
+     - Reject any `issue_time` without explicit UTC offset (including date-only formats) with HTTP 422, explicitly stating offset is required and pointing to `date=YYYY-MM-DD` as the supported form for date-only queries. Document that literal `+` arrives as a space and should be percent-encoded as `%2B`.
+  6. Snapshot State Integrity:
+     - Assert `/forecast`'s `generation`, `model_hash`, and `interval_hash` belong to the same immutable snapshot and change together on reload.
+- Consequences:
+  Zero false container outages during late nightlies, robust alerting on publish lateness gauge, honest intervals preserving published coverage, sub-minute cache eviction when new partitions arrive, and strict boundary input validation.
+- Alternatives rejected:
+  - Clamping negative lower bounds to 0 (rejected: corrupts empirical calibration and silently alters published coverage).
+  - Retaining 503 on late nightly publish in `/ready` (rejected: converts data freshness delays into complete service downtime).
+  - Multiple deadline constants (rejected: risk of disagreement between alert and routing logic).

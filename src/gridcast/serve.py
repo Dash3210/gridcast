@@ -63,6 +63,45 @@ MODEL_VERSION: str = "lgbm-v2"
 TRAINING_WINDOW: str = "2024-11-08 to 2026-11-07"
 TRAINING_DATE: str = "2026-11-07"
 
+# Single source of truth for the publish deadline: nightly ingest cron runs at 02:17 UTC
+# with measured 6.5-7.3h platform ingest delay (landing at 08:50-09:36 UTC).
+# Adding ~1h margin establishes the 11:00 UTC publish deadline.
+PUBLISH_DEADLINE_UTC: str = "11:00 UTC"
+
+
+def parse_publish_deadline(deadline_str: str = PUBLISH_DEADLINE_UTC) -> tuple[int, int]:
+    """Parse hour and minute from the single publish deadline constant string."""
+    time_part = deadline_str.split()[0]
+    hour_str, minute_str = time_part.split(":")
+    return int(hour_str), int(minute_str)
+
+
+def get_curated_freshness(
+    curated_dir: Path | str = CURATED_DIR_DEFAULT,
+) -> tuple[datetime | None, float]:
+    """Return curated freshness token: (newest_period_start_utc, latest_partition_mtime)."""
+    c_p = Path(curated_dir)
+    if not c_p.exists():
+        return (None, 0.0)
+    partitions = sorted(c_p.glob("date=*.parquet"))
+    if not partitions:
+        partitions = sorted(c_p.glob("*.parquet"))
+    if not partitions:
+        return (None, 0.0)
+    latest_file = partitions[-1]
+    try:
+        mtime = latest_file.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    try:
+        freshness_dt: datetime | None = get_data_freshness_at(c_p)
+    except Exception:
+        freshness_dt = None
+    return (freshness_dt, mtime)
+
+FEATURE_CACHE_TTL_SECONDS: float = 60.0
+FEATURE_CACHE_MAX_ENTRIES: int = 64
+
 
 class FeatureSourceGapError(RuntimeError):
     """Raised when a required model feature is unobtainable or null due to a source gap."""
@@ -385,6 +424,7 @@ class ServiceState:
         self.curated_dir = curated_dir
         self.scores_path = scores_path
         self._lock = threading.Lock()
+        self._reload_lock = threading.Lock()
         self._cached_status: (
             tuple[
                 str,
@@ -397,6 +437,11 @@ class ServiceState:
             ]
             | None
         ) = None
+        self._feature_cache: dict[
+            tuple[pd.Timestamp, str, Any], tuple[float, pd.DataFrame]
+        ] = {}
+        self.cache_hits: int = 0
+        self.cache_misses: int = 0
 
     @property
     def snapshot(self) -> ModelSnapshot:
@@ -435,11 +480,62 @@ class ServiceState:
     def feature_count(self) -> int:
         return self.snapshot.feature_count
 
+    def get_cached_features(
+        self,
+        issue_time: pd.Timestamp,
+        model_sha256: str,
+        freshness: Any = None,
+    ) -> pd.DataFrame | None:
+        """Lookup cached resolved feature frame for issue instant if not expired."""
+        now = time.monotonic()
+        key = (issue_time, model_sha256, freshness)
+        with self._lock:
+            entry = self._feature_cache.get(key)
+            if entry is not None:
+                cached_time, cached_df = entry
+                if now - cached_time < FEATURE_CACHE_TTL_SECONDS:
+                    self.cache_hits += 1
+                    return cached_df.copy()
+                self._feature_cache.pop(key, None)
+            self.cache_misses += 1
+            return None
+
+    def set_cached_features(
+        self,
+        issue_time: pd.Timestamp,
+        model_sha256: str,
+        freshness: Any,
+        df: pd.DataFrame,
+    ) -> None:
+        """Store resolved feature frame in bounded cache with current monotonic timestamp."""
+        now = time.monotonic()
+        key = (issue_time, model_sha256, freshness)
+        with self._lock:
+            if len(self._feature_cache) >= FEATURE_CACHE_MAX_ENTRIES:
+                expired = [
+                    k
+                    for k, (t, _) in self._feature_cache.items()
+                    if now - t >= FEATURE_CACHE_TTL_SECONDS
+                ]
+                for k in expired:
+                    self._feature_cache.pop(k, None)
+                if len(self._feature_cache) >= FEATURE_CACHE_MAX_ENTRIES:
+                    oldest_key = next(iter(self._feature_cache))
+                    self._feature_cache.pop(oldest_key, None)
+            self._feature_cache[key] = (now, df.copy())
+
+    def clear_cache(self) -> None:
+        """Clear both issue status cache and explicit-date feature cache."""
+        with self._lock:
+            self._feature_cache.clear()
+            self._cached_status = None
+
     def swap_snapshot(self, new_snapshot: ModelSnapshot) -> None:
-        """Publish a new immutable snapshot with a single assignment under lock."""
+        """Publish a new immutable snapshot with a single assignment under lock and clear caches."""
         with self._lock:
             self._snapshot = new_snapshot
             self._cached_status = None
+            self._feature_cache.clear()
 
 
 def get_served_issue_status(
@@ -645,9 +741,21 @@ def _parse_and_validate_anchor(
             ) from None
 
         if parsed_ts.tzinfo is None:
-            parsed_ts = parsed_ts.tz_localize("UTC")
-        else:
-            parsed_ts = parsed_ts.tz_convert("UTC")
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "ValidationError",
+                    "detail": (
+                        "issue_time requires an explicit UTC offset (e.g. 'Z' or '+00:00'). "
+                        "date=YYYY-MM-DD is the supported form for date-only queries."
+                    ),
+                    "message": (
+                        "issue_time requires an explicit UTC offset (e.g. 'Z' or '+00:00'). "
+                        "date=YYYY-MM-DD is the supported form for date-only queries."
+                    ),
+                },
+            )
+        parsed_ts = parsed_ts.tz_convert("UTC")
 
         # Verify that the instant is exactly 00:00 Europe/London
         ts_london = parsed_ts.tz_convert(LONDON_TZ)
@@ -748,6 +856,11 @@ def create_app(
         "Age of served issue in seconds relative to current time",
         registry=registry,
     )
+    publish_lateness_seconds = Gauge(
+        "gridcast_publish_lateness_seconds",
+        "Publish lateness in seconds relative to publish deadline (negative before deadline)",
+        registry=registry,
+    )
 
     application = FastAPI(
         title="gridcast",
@@ -761,6 +874,7 @@ def create_app(
     application.state.last_measured_mae = last_measured_mae
     application.state.last_measured_mae_samples = last_measured_mae_samples
     application.state.served_issue_age_seconds = served_issue_age_seconds
+    application.state.publish_lateness_seconds = publish_lateness_seconds
 
     @application.middleware("http")
     async def metrics_middleware(request: Request, call_next: Any) -> Response:
@@ -814,6 +928,38 @@ def create_app(
         age_seconds = max(0.0, (now_utc - served_utc).total_seconds())
         served_issue_age_seconds.set(age_seconds)
         return age_seconds
+
+    def _compute_publish_lateness(
+        now_utc: datetime,
+        is_current: bool,
+    ) -> tuple[float, str]:
+        """Compute publish lateness in seconds and status ('on_time' | 'late')."""
+        deadline_h, deadline_m = parse_publish_deadline(PUBLISH_DEADLINE_UTC)
+        today_deadline = datetime(
+            now_utc.year,
+            now_utc.month,
+            now_utc.day,
+            deadline_h,
+            deadline_m,
+            tzinfo=timezone.utc,
+        )
+        if is_current:
+            next_deadline = today_deadline + timedelta(days=1)
+            lateness = (now_utc - next_deadline).total_seconds()
+            status = "on_time"
+        else:
+            lateness = (now_utc - today_deadline).total_seconds()
+            status = "late" if lateness > 0 else "on_time"
+        return lateness, status
+
+    def _sync_publish_lateness() -> tuple[float, str]:
+        st = application.state.service
+        snap = st.snapshot
+        _, is_current, _, _ = get_served_issue_status(st, snap)
+        now_utc = datetime.now(timezone.utc)
+        lateness_sec, pub_status = _compute_publish_lateness(now_utc, is_current)
+        publish_lateness_seconds.set(lateness_sec)
+        return lateness_sec, pub_status
 
     def _sync_mae_metrics() -> None:
         """Sync last measured MAE metrics and sample counts from scores.csv."""
@@ -979,24 +1125,28 @@ def create_app(
     def get_ready() -> JSONResponse:
         st = application.state.service
         snap = st.snapshot
-        served_ts, is_current, fallback_reason, _ = get_served_issue_status(st, snap)
+        served_ts, is_current, fallback_reason, feature_df = get_served_issue_status(st, snap)
         age_seconds = _sync_served_issue_age()
-        threshold_seconds = 27.0 * 3600.0
-        is_ready = age_seconds <= threshold_seconds
+        lateness_seconds, publish_status = _sync_publish_lateness()
+
+        is_servable = feature_df is not None
 
         payload: dict[str, Any] = {
-            "status": "ready" if is_ready else "not_ready",
+            "status": "ready" if is_servable else "not_ready",
+            "publish_status": publish_status,
+            "publish_lateness_seconds": lateness_seconds,
             "served_issue_time": served_ts.isoformat(),
             "served_issue_age_seconds": age_seconds,
             "is_current_issue": is_current,
-            "threshold_hours": 27.0,
+            "publish_deadline_utc": PUBLISH_DEADLINE_UTC,
+            "deadline": PUBLISH_DEADLINE_UTC,
             "generation": snap.generation,
         }
-        if not is_ready:
-            age_hours = age_seconds / 3600.0
+        if not is_servable:
             payload["detail"] = (
-                f"Served issue ({served_ts.isoformat()}) is {age_hours:.1f} hours old, "
-                f"exceeding readiness threshold of 27 hours."
+                "No servable forecast issue is available."
+                if not fallback_reason
+                else f"No servable forecast issue: {fallback_reason}"
             )
             return JSONResponse(status_code=503, content=payload)
         return JSONResponse(status_code=200, content=payload)
@@ -1042,12 +1192,18 @@ def create_app(
                 )
         else:
             # Explicit date or issue_time anchor
-            feature_df = resolve_features_for_issue(
-                issue_time=anchor_ts,
-                booster=snap.booster,
-                curated_dir=st.curated_dir,
-                mix_dir=MIX_DIR_DEFAULT,
-            )
+            freshness = get_curated_freshness(st.curated_dir)
+            cached_df = st.get_cached_features(anchor_ts, snap.content_sha256, freshness)
+            if cached_df is not None:
+                feature_df = cached_df
+            else:
+                feature_df = resolve_features_for_issue(
+                    issue_time=anchor_ts,
+                    booster=snap.booster,
+                    curated_dir=st.curated_dir,
+                    mix_dir=MIX_DIR_DEFAULT,
+                )
+                st.set_cached_features(anchor_ts, snap.content_sha256, freshness, feature_df)
             served_ts = anchor_ts
             is_current = (served_ts == today_anchor)
             if not is_current:
@@ -1121,6 +1277,7 @@ def create_app(
     def get_metrics() -> Response:
         _sync_mae_metrics()
         _sync_served_issue_age()
+        _sync_publish_lateness()
         output = generate_latest(application.state.registry)
         return Response(content=output, media_type=CONTENT_TYPE_LATEST)
 
@@ -1141,7 +1298,7 @@ def create_app(
         }
 
     @application.post("/reload")
-    async def post_reload(
+    def post_reload(
         request: Request,
     ) -> dict[str, Any]:
         expected_token = os.environ.get("GRIDCAST_RELOAD_TOKEN")
@@ -1168,48 +1325,49 @@ def create_app(
             )
 
         st = application.state.service
-        # Attempt to load new artifacts safely without mutating current state
-        try:
-            new_booster = load_model_booster(st.model_path)
-            if not new_booster.feature_name():
-                raise ValueError("Reloaded booster declares no features.")
+        # Hold reload writer lock across load, generation increment and swap
+        with st._reload_lock:
+            try:
+                new_booster = load_model_booster(st.model_path)
+                if not new_booster.feature_name():
+                    raise ValueError("Reloaded booster declares no features.")
 
-            new_interval_data: dict[str, Any] = {}
-            if st.interval_path.exists():
-                new_interval_data = json.loads(st.interval_path.read_text(encoding="utf-8"))
-            if not new_interval_data or "quantiles" not in new_interval_data:
-                raise ValueError("Reloaded interval artifact is missing or invalid.")
+                new_interval_data: dict[str, Any] = {}
+                if st.interval_path.exists():
+                    new_interval_data = json.loads(st.interval_path.read_text(encoding="utf-8"))
+                if not new_interval_data or "quantiles" not in new_interval_data:
+                    raise ValueError("Reloaded interval artifact is missing or invalid.")
 
-            new_content_sha256 = get_model_artifact_hash(st.model_path)
-            new_interval_sha256 = _file_sha256(st.interval_path)
-        except Exception as e:
-            # On missing or corrupt artifact, return 500 without leaking host paths
-            logger.error("Failed to reload model artifact: %s", e, exc_info=True)
-            raise HTTPException(
-                status_code=500,
-                detail="Internal Server Error: Failed to reload model artifact.",
-            ) from e
+                new_content_sha256 = get_model_artifact_hash(st.model_path)
+                new_interval_sha256 = _file_sha256(st.interval_path)
+            except Exception as e:
+                # On missing or corrupt artifact, return 500 without leaking host paths
+                logger.error("Failed to reload model artifact: %s", e, exc_info=True)
+                raise HTTPException(
+                    status_code=500,
+                    detail="Internal Server Error: Failed to reload model artifact.",
+                ) from e
 
-        # Atomic state swap under lock
-        curr_snap = st.snapshot
-        new_snap = ModelSnapshot(
-            booster=new_booster,
-            interval_data=new_interval_data,
-            content_sha256=new_content_sha256,
-            interval_sha256=new_interval_sha256,
-            version=curr_snap.version,
-            training_window=curr_snap.training_window,
-            training_date=curr_snap.training_date,
-            generation=curr_snap.generation + 1,
-            state_version=curr_snap.state_version + 1,
-        )
-        st.swap_snapshot(new_snap)
+            # Atomic state swap under lock with strictly increasing generation
+            curr_snap = st.snapshot
+            new_snap = ModelSnapshot(
+                booster=new_booster,
+                interval_data=new_interval_data,
+                content_sha256=new_content_sha256,
+                interval_sha256=new_interval_sha256,
+                version=curr_snap.version,
+                training_window=curr_snap.training_window,
+                training_date=curr_snap.training_date,
+                generation=curr_snap.generation + 1,
+                state_version=curr_snap.state_version + 1,
+            )
+            st.swap_snapshot(new_snap)
 
-        return {
-            "status": "reloaded",
-            "model_version": new_snap.version,
-            "generation": new_snap.generation,
-        }
+            return {
+                "status": "reloaded",
+                "model_version": new_snap.version,
+                "generation": new_snap.generation,
+            }
 
     return application
 
