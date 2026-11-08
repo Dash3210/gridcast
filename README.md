@@ -278,9 +278,33 @@ Audit logs are stored in `data/audit/` and created lazily only when anomalies oc
 - `data/audit/source-gaps.csv`: Records settlement periods genuinely absent from auxiliary stores (`mix` or `weather`) where the upstream API returned empty responses (`upstream_empty`) after targeted boundary retries. Created lazily, automatically reconciled if data appears on subsequent re-ingestion, and strictly verified by `make data-check`.
 - `data/audit/conflicts.csv`: Records upstream retractions where an incoming payload presents a null value for a period where a non-null observation is already stored in curated partitions.
 
-Phase milestones not yet arrived fail on purpose:
-- `make serve` and `make docker` exit non-zero with explicit messages indicating the future phase in which they arrive (P4 and P5).
+Phase milestones:
+- `make serve` runs the FastAPI forecast prediction service (P4).
+- `make docker` exits non-zero with an explicit message indicating the future phase in which it arrives (P5).
 - `make train` and `make eval` are active automation targets for Phase P3.
+
+### Serving API (Phase P4)
+
+The prediction service is served by FastAPI + uvicorn, exposing five contracts:
+
+- **`GET /health`**: Returns HTTP 200 when healthy; exposes `model_version`, `training_date`, `training_window`, `content_sha256`, `feature_count`, `interval_sha256`, `data_freshness_at`, `served_issue_time`, and `is_current_issue`. Returns HTTP 503 when curated partition freshness is older than 48 hours relative to current time while continuing to report `served_issue_time` and `is_current_issue`.
+- **`GET /forecast?hours=48`**: Returns half-hourly forecast points in a response envelope with `issue_time`, `generated_at`, `is_current_issue`, `retrospective_horizons`, `hours`, and `points`. When `is_current_issue` is false, includes `fallback_reason` naming the null feature and date. Parameter `hours` is strictly validated (1..48 integer; invalid inputs return HTTP 422 with accepted range `[1, 48]`). For `hours=48`, `points` contains exactly 96 points with timestamps increasing at exactly 30 minutes; each point includes `horizon`, `timestamp`, `target_time`, `value`, `lower`, and `upper` where `lower <= value <= upper`.
+- **`GET /metrics`**: Prometheus text exposition format containing request counts (`gridcast_requests_total`), latency histogram (`gridcast_request_duration_seconds`), and last measured MAE (`gridcast_last_measured_mae` with `plane="live_scoreboard"` and `horizons` labels) recomputed from `data/scoreboard/scores.csv` for candidate, operator, and persistence series. Unsettled series (candidate) are exposed as absent with label `status="absent"` and NaN value.
+- **`GET /model`**: Exposes JSON matching `MODEL_CARD.md`: `version` (`lgbm-v2`), content `sha256` (`1cd13471...`), `training_window` (`2024-11-08 to 2026-11-07`), `feature_count` (26), and `interval_sha256`.
+- **`POST /reload`**: Atomically reloads model and interval artifacts. Authenticated via `GRIDCAST_RELOAD_TOKEN` using `secrets.compare_digest`. Returns HTTP 401 for a missing or wrong token when configured; HTTP 503 if unconfigured (endpoint closed); HTTP 200 on success; HTTP 500 on missing or unreadable artifact while keeping the active in-memory booster intact.
+
+**Prediction Intervals**:
+Prediction intervals are calibrated using per-horizon empirical residual quantiles from the **validation split only** (`2026-06-05` to `2026-08-30`, 87 daily issue dates, 8,352 points), written to `data/models/interval_v2.json`. Bounds are defined by `lower = pred + q10(h)` and `upper = pred + q90(h)`. Empirical coverage on the validation split is **79.31%** (a calibration sample, not a guarantee). `data/eval` is never used for calibration to prevent leakage.
+
+**Source Gap Policy**:
+The request path shares the canonical builder `build_example_frame`. If any required feature contains null values due to an upstream source gap, the service refuses the request with named structured error `FeatureSourceGapError` (HTTP 503). No silent NaNs reach the model.
+
+**Operational Characteristics & Serving Contract (ADR-025)**:
+- Today's issue becomes buildable only after the nightly ingest lands (~09:00Z) because `actual_recent_3h` requires the previous day's 21:00 actual.
+- Prior to that, the service serves the newest buildable issue and labels it with `is_current_issue: false`, `fallback_reason`, and `retrospective_horizons`.
+- Horizons earlier than publication time are retrospective (`target_time < generated_at`).
+- Anchors are strictly fixed at 00:00 Europe/London; arbitrary anchors would require a v3 model trained across a spread of anchor hours, with its own fixture - not a serving-time change.
+- Refusing to build with a null feature is deliberate: imputing missing actuals would be fabrication.
 
 ## Layout
 

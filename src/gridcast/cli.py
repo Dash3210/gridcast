@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from gridcast import __version__
-from gridcast._phase import todo
 from gridcast.features import (
     build_example_frame,
     default_issue_schedule,
@@ -389,7 +388,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Suppress progress and table output.",
     )
 
-    subparsers.add_parser("serve", help="Run forecast API service.")
+    serve_parser = subparsers.add_parser("serve", help="Run forecast API service.")
+    serve_parser.add_argument(
+        "--run",
+        action="store_true",
+        default=False,
+        help="Run the server process.",
+    )
+    serve_parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host to bind service to (default: 127.0.0.1).",
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to bind service to (default: 8000).",
+    )
+    serve_parser.add_argument(
+        "--model-path",
+        type=str,
+        default="data/models/lgbm_model.txt",
+        help="Path to model artifact (default: data/models/lgbm_model.txt).",
+    )
+    serve_parser.add_argument(
+        "--interval-path",
+        type=str,
+        default="data/models/interval_v2.json",
+        help="Path to interval artifact (default: data/models/interval_v2.json).",
+    )
+    serve_parser.add_argument(
+        "--curated-dir",
+        type=str,
+        default="data/curated",
+        help="Path to curated archive directory (default: data/curated).",
+    )
+    serve_parser.add_argument(
+        "--scores-path",
+        type=str,
+        default="data/scoreboard/scores.csv",
+        help="Path to scores CSV store (default: data/scoreboard/scores.csv).",
+    )
     subparsers.add_parser("version", help="Print package version.")
 
     return parser
@@ -832,7 +873,21 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.subcommand == "serve":
-        todo("P4", "serve")
+        if not args.run:
+            from gridcast._phase import todo
+
+            todo("P4", "serve")
+
+        from gridcast.serve import run_serve_cli
+
+        return run_serve_cli(
+            host=args.host,
+            port=args.port,
+            model_path=args.model_path,
+            interval_path=args.interval_path,
+            curated_dir=args.curated_dir,
+            scores_path=args.scores_path,
+        )
 
     return 0
 

@@ -19,6 +19,7 @@ dependencies = [
     "lightgbm>=4.5,<5",
     "pydantic>=2.7,<3",
     "prometheus-client>=0.20,<1",
+    "httpx>=0.27,<1",
     "tzdata",
 ]
 

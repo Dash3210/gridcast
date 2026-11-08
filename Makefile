@@ -73,7 +73,7 @@ metrics-fixture:
 
 
 serve:
-	"$(PY)" -m gridcast.cli serve
+	"$(PY)" -m gridcast.cli serve --run
 
 docker:
 	"$(PY)" -c "from gridcast._phase import todo; todo('P5', 'Dockerfile')"

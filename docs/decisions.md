@@ -362,11 +362,11 @@
      - `h = 2`:  W = 13.9344, N = 13.9959, delta = +0.0615 gCO2/kWh (+0.44%)
      - `h = 48`: W = 53.9933, N = 54.0323, delta = +0.0390 gCO2/kWh (+0.07%)
      - `h = 96`: W = 39.1453, N = 36.6272, delta = -2.5181 gCO2/kWh (-6.43%)
-  3. Horizon-band tension:
-     The per-horizon data exhibits a clear structural tension across horizon bands:
-     - No-weather is better at `h = 96` (-6.43%, -2.518 gCO2/kWh) and across roughly `h = 49..65` (e.g., h=52 is -4.31%, h=60 is -5.56%, h=62 is -5.87%, h=63 is -6.31%).
-     - Weather is better across roughly `h = 82..93` (+11% to +15% degradation without weather, e.g., h=82 is +12.44%, h=88 is +13.73%, h=89 is +14.56%).
-     The pre-registered rule is an unweighted mean test across horizons and it says DROP. A horizon-weighted rule that placed high premium on day-2 evening peak hours (h=82..93) would have decided differently. However, we do not re-decide after observing the data: the rule was fixed in advance as an unweighted mean test, both aggregate and tail conditions hold, and DROP stands.
+  3. Horizon-band description:
+     The per-horizon data across bands:
+     - No-weather is lower error at `h = 96` (-6.43%, -2.518 gCO2/kWh) and across roughly `h = 49..65` (e.g., h=52 is -4.31%, h=60 is -5.56%, h=62 is -5.87%, h=63 is -6.31%).
+     - Weather is lower error across roughly `h = 82..93` (+11% to +15% difference without weather, e.g., h=82 is +12.44%, h=88 is +13.73%, h=89 is +14.56%).
+     Each horizon has **15 origins**. The +11-15% / -6.4% differences are consistent with sampling noise at that sample size; they are not evidence of horizon dependence, and must **not** be used to justify a horizon-weighted gate; answering that question needs more origins, not more analysis of these 15. The pre-registered rule was fixed in advance as an unweighted mean test, both aggregate and tail conditions hold, and DROP stands.
 - Decision:
   DROP weather features from the production feature set.
   Implementation details (Phase P4-d):
@@ -529,3 +529,45 @@
 - Alternatives rejected:
   - Re-reading `data/curated` during `make eval` (rejected: subject to upstream backfill revisions; breaks metric stability).
   - Silently mutating numbers without commit and hash references (rejected: breaks reproducibility).
+
+## ADR-024 — Serving API contracts, empirical prediction intervals, and source gap refusal policy
+- Status: accepted
+- Date: 2026-11-08
+- Context:
+  Phase P4 packages the LightGBM candidate (`lgbm-v2`) into an operational HTTP prediction service. Contracts must specify exact behavior across all endpoints, interval calibration method, authentication, and source gap failure modes.
+- Decision:
+  1. The five endpoints (`GET /health`, `GET /forecast?hours=48`, `GET /metrics`, `GET /model`, `POST /reload`):
+     - `GET /health`: Returns 200 when healthy; reports `model_version`, `training_date`, `training_window`, `content_sha256`, `feature_count`, `interval_sha256`, and `data_freshness_at`. Returns non-200 (503) when `data_freshness_at` is older than 48 hours relative to current time.
+     - `GET /forecast?hours=48`: Strictly validates `hours` in range 1..48 (invalid inputs return 422 with accepted range). For `hours=48`, returns exactly 96 points with strictly increasing 30-minute intervals and bounds `lower <= value <= upper`.
+     - `GET /metrics`: Prometheus text exposition format exposing request count (`gridcast_requests_total`), latency histogram (`gridcast_request_duration_seconds`), and last measured MAE (`gridcast_last_measured_mae`) recomputed from `data/scoreboard/scores.csv`. Series without settled rows (candidate) are labeled with `status="absent"` and NaN without emitting plausible constants.
+     - `GET /model`: Exposes JSON matching `MODEL_CARD.md`: version (`lgbm-v2`), content sha256 (`1cd13471...`), training window (`2024-11-08 to 2026-11-07`), feature count (26), and interval sha256.
+     - `POST /reload`: Reloads model and interval artifacts. Authenticated via `GRIDCAST_RELOAD_TOKEN` (constant-time `secrets.compare_digest`). Returns 503 if token unconfigured in environment; 401 if invalid or missing token; 200 on success; 500 on missing/corrupt artifact while maintaining the active in-memory booster intact.
+  2. Prediction intervals: Calibrated using per-horizon empirical residual quantiles from the **validation split only** (`2026-06-05` to `2026-08-30`, 87 daily issues, 8,352 points, 87 per horizon), written to `data/models/interval_v2.json`. Bounds are defined by `lower = pred + q10(h)` and `upper = pred + q90(h)`. Empirical coverage on the validation split is **79.31%** (a calibration sample, not a guarantee). Test fixture `data/eval` is never used for calibration to prevent test data leakage into served predictions.
+  3. Single feature path: The serving request path drives `resolve_features_for_issue()`, which calls the identical builder `build_example_frame()` used by backtesting, verified by row-for-row assertions.
+  4. Source gap refusal: No silent NaNs or fabricated values reach the model. Upstream source gaps causing null features refuse with named structured error `FeatureSourceGapError` (HTTP 503).
+- Consequences:
+  Deterministic, robust, and audited serving layer adhering strictly to the contract-first specification.
+- Alternatives rejected:
+  - Native interval estimation or quantile regression retraining on boot (rejected: changes model architecture and introduces boot latency; empirical residual quantiles on validation split provide honest calibration).
+  - Silently imputing missing features with mean or forward-fill (rejected: violates ADR-009 by fabricating inputs and masking upstream outages).
+  - Unauthenticated or non-constant-time token reload (rejected: security vulnerability).
+
+## ADR-025 — Serving contract: issue availability timing, explicit fallback labeling, and no-imputation policy
+- Status: accepted
+- Date: 2026-11-08
+- Context:
+  Live operational characteristics at inference reveal that `data/curated/date=2026-11-07.parquet` contains 31 of 48 actuals null because the 11-07 nightly ingest ran before that afternoon settled. Today's issue (`2026-11-08`) requires the 2026-11-07 21:00 actual for `actual_recent_3h`, making it unbuildable until the 11-08 nightly ingest lands (~09:00Z). A default service that silently serves yesterday's issue without stating the issue instant and provenance prevents consumers from distinguishing fresh curves from day-old curves.
+- Decision:
+  1. Buildability timing: The current-day issue becomes buildable only after the nightly ingest, because `actual_recent_3h` needs the previous day's 21:00 actual and the ingest runs around 09:00Z.
+  2. Provenance envelope and explicit fallback: Before that, the service serves the newest buildable issue and says so via `issue_time` and `is_current_issue`. When `is_current_issue` is `false`, the response includes `fallback_reason` naming why today's issue was not obtainable (the null feature and the date). No silent fallback is permitted.
+  3. No imputation: Refusing to build with a null feature is deliberate: imputing the missing actual would be fabrication (violating ADR-009). Explicit requests for unbuildable dates (`/forecast?date=2026-11-08`) return HTTP 503 `FeatureSourceGapError`.
+  4. Health transparency: `/health` exposes `served_issue_time` and `is_current_issue`. Data freshness can be healthy while the served issue is a day old; monitors can observe both states while HTTP 200/503 health check semantics remain unchanged.
+  5. Fixed 00:00 Europe/London anchor invariant: Training and the frozen evaluation use 00:00 Europe/London anchors only. Serving at an arbitrary run time (e.g., 09:30) with an arbitrary anchor hour would present an anchor hour, calendar features, and an `actual_recent_3h` reading the model never saw during training. Deriving an anchor from `now()` is prohibited; any anchor derivation must strictly take today's local date and call `issue_time_for_date`. Arbitrary anchors would require a v3 model trained across a spread of anchor hours, with its own fixture - not a serving-time change.
+  6. Retrospective horizons: A response can legitimately contain targets earlier than `generated_at` when serving the previous day's issue. The response envelope states `retrospective_horizons` as the count of points whose `target_time < generated_at` (0 when the issue is current and generated at anchor).
+  7. Plane labeling on metrics: The two evaluation planes (frozen backtest vs live scoreboard) must not share a label. `/metrics` adds `plane="live_scoreboard"` and `horizons` (`"settled"` or `"partial"`) labels to `gridcast_last_measured_mae` so scrapers cannot mistake live scoreboard metrics for frozen fixture values.
+- Consequences:
+  Complete operational transparency at serving time.
+- Alternatives rejected:
+  - Silently serving yesterday's issue as if it were today's (rejected: deceptive and masks ingest timing dependencies).
+  - Imputing missing recent actuals with forward-fill or persistence (rejected: violates no-fabrication contract).
+  - Deriving or floating the anchor from run time `now()` to fix staleness (rejected: presents out-of-distribution anchor hours and features the model never saw; arbitrary anchors require a v3 model trained across a spread of anchor hours with its own fixture, not an ad-hoc serving-time change).

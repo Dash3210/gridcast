@@ -38,7 +38,7 @@ pending measurement: `first_seen_at` now records when each actual first appeared
 tightened from that distribution once enough nights have accumulated.
 
 **Weather features dropped (ADR-018):**
-Weather features (`temperature`, `temperature_24h_mean`, `temperature_24h_min`) were dropped by a pre-registered decision rule in ADR-018. At inference the targets are in the future, and previous-runs has no future values, producing an irreconcilable train/serve lead distribution mismatch. An empirical ablation on the frozen 15-origin split (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins) demonstrated that removing weather features changed aggregate GATE_VALUE by only +0.086 gCO2/kWh (+0.22%) and long-horizon (h >= 48) error by +0.328 gCO2/kWh (+0.86%), satisfying both pre-registered drop criteria. Dropping weather features costs roughly 11-15% at h=82-93 and gains roughly 5-6% at h=49-65 and h=96; the decision was a pre-registered mean test.
+Weather features (`temperature`, `temperature_24h_mean`, `temperature_24h_min`) were dropped by a pre-registered decision rule in ADR-018. At inference the targets are in the future, and previous-runs has no future values, producing an irreconcilable train/serve lead distribution mismatch. An empirical ablation on the frozen 15-origin split (frozen fixture v1, sha256 205222ce9b109e9ff28f663bef979c9c6d6d6be7c5c8e6ea7086b6067e40e7d4, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins) demonstrated that removing weather features changed aggregate GATE_VALUE by only +0.086 gCO2/kWh (+0.22%) and long-horizon (h >= 48) error by +0.328 gCO2/kWh (+0.86%), satisfying both pre-registered drop criteria. Across horizon bands, each horizon has 15 origins; the +11-15% and -6.4% differences are consistent with sampling noise at that sample size rather than evidence of horizon dependence, and answering that question requires more origins, not more analysis of these 15. The decision was a pre-registered mean test.
 
 ## Service Metadata (GET /model contract)
 
@@ -46,8 +46,43 @@ The prediction service exposes `GET /model`, returning the following computed me
 
 - **Model Version**: `lgbm-v2`
 - **Artifact SHA-256**: `1cd13471d793735748f81d17fb195e34f6f784e8f642ac60a16f016280c45310`
+- **Interval Artifact SHA-256**: `ab94aa7135bc797e4c81993a65c96702088dc02d845d0c4262aaf133e46b8965`
 - **Training Window**: `2024-11-08` to `2026-11-07` (730 issue dates, 00:00 Europe/London daily)
 - **Feature Count**: 26 declared features
+
+### Prediction Intervals (Empirical Residual Quantiles)
+
+The model has no native interval. Prediction intervals are generated using per-horizon empirical residual quantiles from the **validation split only** (`2026-06-05` to `2026-08-30`), 10th and 90th percentiles, written to `data/models/interval_v2.json`.
+
+- **Calibration method**: For each horizon $h \in [1, 96]$, calculate empirical residual $r = y - \hat{y}$ on the validation split. Let $q_{10}(h) = \text{quantile}_{0.10}(r)$ and $q_{90}(h) = \text{quantile}_{0.90}(r)$.
+- **Interval construction**: `lower = pred + q10(h)`, `upper = pred + q90(h)`.
+- **Bracketing invariant**: By construction, $q_{10}(h) \le 0 \le q_{90}(h)$ guarantees that `lower <= value <= upper` for every horizon. All 96 horizons satisfy this natively without widening.
+- **Empirical validation coverage**: The empirical coverage of these bands on the validation split is **79.31%** (6,624 of 8,352 points covered).
+- **Caveat & Calibration Notice**: This is a calibration sample, not a guarantee.
+- **Fixture Isolation**: Quantiles are calibrated strictly on the validation split (`2026-06-05` to `2026-08-30`) and never on `data/eval`, preventing evaluation test data leakage into served predictions.
+
+### Serving Endpoints (Phase P4 Contracts)
+
+| Endpoint | Method | Contract & Invariants |
+|---|---|---|
+| `/health` | `GET` | Returns HTTP 200 when healthy; reports `model_version`, `training_date`, `training_window`, `content_sha256`, `feature_count`, `interval_sha256`, `data_freshness_at`, `served_issue_time`, and `is_current_issue`. Returns HTTP 503 (unhealthy) when `data_freshness_at` is older than 48 hours relative to current time while still exposing `served_issue_time` and `is_current_issue`. |
+| `/forecast` | `GET` | Query parameter `hours` validated to `1..48` integer (invalid values return HTTP 422 with accepted range `[1, 48]`). Returns response wrapper with `issue_time`, `generated_at`, `is_current_issue`, `retrospective_horizons`, `hours`, and `points`. When `is_current_issue` is false, includes `fallback_reason` naming the null feature and date. When `hours=48`, `points` contains exactly **96** points with timestamps strictly increasing by 30 minutes; each point contains `horizon`, `timestamp`, `target_time`, `value`, `lower`, and `upper` where `lower <= value <= upper`. |
+| `/metrics` | `GET` | Exposes Prometheus text exposition including request counter (`gridcast_requests_total`), latency histogram (`gridcast_request_duration_seconds`), and last measured MAE (`gridcast_last_measured_mae` with `plane="live_scoreboard"` and `horizons` labels) from `data/scoreboard/scores.csv` for candidate, operator, and persistence. Unsettled series (candidate) are exposed as absent with status label and NaN without printing plausible constants. |
+| `/model` | `GET` | Returns JSON matching model card metadata: `version`, `content_sha256`, `training_window`, `feature_count`, and `interval_sha256`. |
+| `/reload` | `POST` | Reloads model and interval artifacts. Authenticated via `GRIDCAST_RELOAD_TOKEN` (constant-time `secrets.compare_digest`). Status codes: 401 for a missing or wrong token when a token is configured, 503 when `GRIDCAST_RELOAD_TOKEN` is unset (no auth configured, so the endpoint is closed), 200 on success, 500 when the artifact cannot be loaded and the old booster is kept. |
+
+### Feature Path & Source Gap Handling
+
+- **Single feature path**: In-service feature resolution calls `resolve_features_for_issue()`, which drives `build_example_frame()`, asserting row-for-row equality with the backtest frame.
+- **No nulls reach the model**: When an upstream source gap causes null values in any required model feature, the service refuses the request with named structured error `FeatureSourceGapError` (HTTP 503), reporting the corrupted features and timestamp. Silent NaNs are strictly forbidden.
+
+### Operational Characteristics and Serving Contract (ADR-025)
+
+- **Issue availability timing**: The current-day issue becomes buildable only after the nightly ingest, because `actual_recent_3h` needs the previous day's 21:00 actual and the ingest runs around 09:00Z.
+- **Explicit fallback labeling**: Before the nightly ingest lands, the service serves the newest buildable issue and says so via `issue_time` and `is_current_issue` (with `fallback_reason` naming the null feature and date when `is_current_issue` is false). Refusing to build with a null feature is deliberate: imputing the missing actual would be fabrication.
+- **Retrospective horizons**: Horizons earlier than the publication time are retrospective (`retrospective_horizons`), because the 00:00 issue is published when the nightly ingest makes it buildable.
+- **Fixed 00:00 Europe/London anchor**: Anchors are fixed at 00:00 Europe/London. Arbitrary anchors would require a v3 model trained across a spread of anchor hours, with its own fixture - not a serving-time change.
+- **Reload status codes**: 401 for a missing or wrong token when a token is configured, 503 when `GRIDCAST_RELOAD_TOKEN` is unset (no auth configured, so the endpoint is closed), 200 on success, 500 when the artifact cannot be loaded and the old booster is kept.
 
 ### Lineage and Historical Artifacts
 Model version `lgbm-v1` existed previously with 29 features:
@@ -98,9 +133,9 @@ Evaluated on the frozen split (frozen fixture v2, sha256 87d322235bdc9de95c32a96
 | candidate | GATE_VALUE (gCO2/kWh) | Notes |
 |---|---|---|
 | LightGBM candidate | 39.118 | Archive commit 3617143 (restated from 39.032 at commit 3617143; frozen fixture v2) |
-| persistence (issue-anchored) | 53.741 | Unchanged across commits |
+| persistence (frozen backtest, 15 origins) | 53.741 | Unchanged across commits |
 | seasonal-naive | 51.495 | Unchanged across commits |
-| NESO operator | 11.666 | Published NESO forecast, vintage unverified (ADR-022) |
+| NESO operator (frozen backtest, 15 origins) | 11.666 | Published NESO forecast, vintage unverified (ADR-022) |
 
 The candidate beats its own baselines by roughly a quarter and loses to the operator by about three times, on a fixed window, so any future number must be quoted beside its window. Do not describe this as accuracy, as a pass, or as meeting a standard.
 
@@ -169,25 +204,20 @@ All skill metrics are computed inside `compute_skill_score` asserting identical 
 - **Two Data Planes**: The evaluation fixture is immutable, read exclusively by `make eval`; the live scoreboard reads the reconciled store so it captures late actuals.
 - **Guard blind spot**: `test_model_card_consistency.py` previously compared documents to a static JSON fixture. Under ADR-023, it computes published metrics directly from `data/eval/` at test time, making `data/eval/` the single source of truth. Every published number is qualified with: `frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins`.
 
-## Known failure modes (to be quantified in P3)
+### Comparison Across the Two Evaluation Planes
 
-- **Wind droughts**: multi-day low-wind periods where intensity stays high and persistence is poor.
-- **Public holidays**: demand and generation patterns break the weekly rhythm; the UK bank holiday table
-  covers 2024–2027.
-- **Interconnector trips**: sudden imports or exports that move intensity by tens of gCO2/kWh within a
-  settlement period, invisible to every input in this table.
+```
+frozen fixture v2 (Sep 5 - Nov 1, 15 origins)   persistence 53.741   operator 11.666
+live scoreboard   (Nov 2 - Nov 7, settled)      persistence 28.625   operator  9.152
+```
 
-## The public record
+Card lines for both planes:
+- `persistence (frozen backtest, 15 origins)`: **53.741** gCO2/kWh
+- `operator (frozen backtest, 15 origins)`: **11.666** gCO2/kWh
+- `persistence (live scoreboard, settled horizons)`: **28.625** gCO2/kWh
+- `operator (live scoreboard, settled horizons)`: **9.152** gCO2/kWh
 
-The scoreboard starts at the first issued forecast and appends as targets settle. A forecast settles at
-`issue + 48h`, so the calendar claim lags the work:
-
-> 21 consecutive **settled** days from a 2026-11-02 start requires 21 issues (2026-11-02 … 2026-11-22),
-> the last of which settles at 2026-11-24. The earliest date the claim can honestly be made is therefore
-> **2026-11-24**, before allowing for any missed night.
-
-No history is backfilled. The date range in `docs/scoreboard.md` is the proof, and it can only be as
-long as the record has actually run.
+Persistence is the same definition in both planes: reconstructing a flat curve from `actual(issue - 3h)` over the live window gives 28.683 (bands 22.93 / 22.36 / 36.26), against the scoreboard's 28.625 (22.86 / 22.33 / 36.19). The live record is also not short-horizon weighted: 464 rows, 208 of them in h49-96, median horizon 44. The difference is the sample - six days were far more persistence-friendly (24h band 22.4 live vs 55.6 frozen) and calmer (mean 30-min change 4.00 vs 5.50, std 42.56 vs 51.51). The operator difference is coverage, not definition: the live operator series has no settled h49-96 rows, so 9.152 is over h1-48 only, while 11.666 covers all 96 horizons equally.
 
 ## Known failure modes (to be quantified in P3)
 
