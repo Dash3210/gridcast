@@ -1,13 +1,13 @@
 # Scoreboard
 
-scoreboard started 2026-11-02; consecutive days recorded: 11
+scoreboard started 2026-11-02; consecutive days recorded: 12
 
 ## Overview
 
 > Published NESO forecast for the same periods, vintage unverified.
 > Refusing to aggregate across sources; not eligible for skill comparison.
 
-- **Date range covered:** 2026-11-02 to 2026-11-12
+- **Date range covered:** 2026-11-02 to 2026-11-13
 - **Scored points:** 33
 - **Model MAE:** 24.67
 - **Operator MAE (vintage unverified):** 9.15
