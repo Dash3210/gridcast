@@ -39,6 +39,7 @@ from gridcast.models import (
     DEFAULT_LGBM_PARAMS,
     assert_baseline_provenance,
     get_model_artifact_hash,
+    load_model_booster,
     predict_lgbm,
     predict_persistence,
     predict_seasonal_naive,
@@ -49,7 +50,13 @@ __all__: list[str] = [
     "DEFAULT_EVAL_FIXTURE_PARQUET",
     "DEFAULT_EVAL_FIXTURE_SIDECAR",
     "DEFAULT_GATE_THRESHOLD_PATH",
+    "DEFAULT_INTERVAL_PATH",
+    "DEFAULT_MODEL_PATH",
     "PINNED_EVAL_FIXTURE_SHA256",
+    "PINNED_SERVE_INTERVAL_SHA256",
+    "PINNED_SERVE_ISSUE_DATE",
+    "PINNED_SERVE_MODEL_SHA256",
+    "PINNED_SERVE_PRED_SHA256",
     "REQUIRED_FIXTURE_COLUMNS",
     "BacktestResults",
     "EMBARGO_END_DATE",
@@ -78,15 +85,29 @@ __all__: list[str] = [
     "run_rolling_origin_backtest",
     "run_weather_ablation",
     "verify_fixture_integrity",
+    "verify_serve_artifact",
 ]
 
 DEFAULT_EVAL_FIXTURE_PARQUET: Final[Path] = Path("data/eval/frozen_split_v2.parquet")
 DEFAULT_EVAL_FIXTURE_SIDECAR: Final[Path] = Path("data/eval/frozen_split_v2.json")
 DEFAULT_GATE_THRESHOLD_PATH: Final[Path] = Path("data/eval/gate_threshold.json")
+DEFAULT_MODEL_PATH: Final[Path] = Path("data/models/lgbm_model.txt")
+DEFAULT_INTERVAL_PATH: Final[Path] = Path("data/models/interval_v2.json")
 
 # Byte hash (SHA-256 over raw file bytes, not git's object id).
 PINNED_EVAL_FIXTURE_SHA256: Final[str] = (
     "87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51"
+)
+# LF-normalized SHA-256 pins for the shipped serve-path artifacts and fixed-issue prediction digest.
+PINNED_SERVE_MODEL_SHA256: Final[str] = (
+    "1cd13471d793735748f81d17fb195e34f6f784e8f642ac60a16f016280c45310"
+)
+PINNED_SERVE_INTERVAL_SHA256: Final[str] = (
+    "ab94aa7135bc797e4c81993a65c96702088dc02d845d0c4262aaf133e46b8965"
+)
+PINNED_SERVE_ISSUE_DATE: Final[str] = "2026-11-01"
+PINNED_SERVE_PRED_SHA256: Final[str] = (
+    "1688bc3f46e4a8e3ae0e4768bf3d800a2771e6b4c96f4039bc919469586c6acf"
 )
 
 REQUIRED_FIXTURE_COLUMNS: Final[list[str]] = [
@@ -1239,6 +1260,150 @@ def check_sidecar_library_versions(
     return mismatches
 
 
+def _verify_interval_bounds(preds: np.ndarray, quantiles: dict[str, Any]) -> None:
+    """Verify all 96 horizons have valid empirical interval quantiles bracketing predictions."""
+    for h in range(1, 97):
+        q_info = quantiles.get(str(h))
+        if not isinstance(q_info, dict) or "q10" not in q_info or "q90" not in q_info:
+            raise ValueError(f"Interval artifact missing q10/q90 quantiles for horizon {h}")
+        pred_val = float(preds[h - 1])
+        lower = pred_val + float(q_info["q10"])
+        upper = pred_val + float(q_info["q90"])
+        if not (math.isfinite(lower) and math.isfinite(upper)):
+            raise ValueError(f"Interval bounds at horizon {h} are non-finite")
+        if not (upper > lower and lower <= pred_val <= upper):
+            raise ValueError(
+                f"Interval invariant violated at horizon {h}: "
+                f"lower={lower}, pred={pred_val}, upper={upper}"
+            )
+
+
+def verify_serve_artifact(
+    model_path: Path | str = DEFAULT_MODEL_PATH,
+    interval_path: Path | str = DEFAULT_INTERVAL_PATH,
+    issue_date: str = PINNED_SERVE_ISSUE_DATE,
+    pinned_model_sha256: str | None = PINNED_SERVE_MODEL_SHA256,
+    pinned_interval_sha256: str | None = PINNED_SERVE_INTERVAL_SHA256,
+    pinned_pred_sha256: str | None = PINNED_SERVE_PRED_SHA256,
+    curated_dir: Path | str = "data/curated",
+    mix_dir: Path | str = "data/mix",
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Verify pinned serving artifacts and deterministic prediction output across platforms.
+
+    Loads the shipped LightGBM booster and interval calibration artifact, verifies their
+    LF-normalized SHA-256 digests against pinned constants, resolves the 26 production
+    features for a fixed settled issue via ``resolve_features_for_issue``, asserts finite
+    non-negative predictions and valid interval bracketing, and compares the little-endian
+    float64 prediction digest against ``pinned_pred_sha256``.
+    """
+    from gridcast.serve import resolve_features_for_issue
+
+    m_path = Path(model_path)
+    model_sha = get_model_artifact_hash(m_path)
+    if pinned_model_sha256 is not None and model_sha != pinned_model_sha256:
+        raise ValueError(
+            f"Model artifact SHA-256 mismatch for {m_path}. "
+            f"Expected: {pinned_model_sha256}, Actual: {model_sha}"
+        )
+
+    i_path = Path(interval_path)
+    if not i_path.exists():
+        raise FileNotFoundError(f"Interval artifact not found at {i_path}")
+    interval_text = i_path.read_text(encoding="utf-8")
+    interval_sha = hashlib.sha256(interval_text.encode("utf-8")).hexdigest()
+    if pinned_interval_sha256 is not None and interval_sha != pinned_interval_sha256:
+        raise ValueError(
+            f"Interval artifact SHA-256 mismatch for {i_path}. "
+            f"Expected: {pinned_interval_sha256}, Actual: {interval_sha}"
+        )
+
+    interval_data = json.loads(interval_text)
+    quantiles = interval_data.get("quantiles")
+    if not isinstance(quantiles, dict):
+        raise ValueError(f"Interval artifact {i_path} missing 'quantiles' mapping")
+
+    booster = load_model_booster(m_path)
+    declared_features = booster.feature_name()
+    if declared_features != FEATURE_COLUMNS:
+        raise ValueError(
+            f"Booster declared features mismatch: got {len(declared_features)} features, "
+            f"expected {len(FEATURE_COLUMNS)} production features"
+        )
+
+    X_issue = resolve_features_for_issue(
+        issue_time=issue_date,
+        booster=booster,
+        model_path=m_path,
+        curated_dir=curated_dir,
+        mix_dir=mix_dir,
+    )
+    preds = np.asarray(
+        predict_lgbm(booster, X_issue, feature_columns=declared_features), dtype="<f8"
+    )
+    repeat_preds = np.asarray(
+        predict_lgbm(booster, X_issue, feature_columns=declared_features), dtype="<f8"
+    )
+    repeat_delta = float(np.max(np.abs(preds - repeat_preds)))
+
+    if len(preds) != 96:
+        raise ValueError(f"Expected 96 predictions for issue {issue_date}, got {len(preds)}")
+    if not np.isfinite(preds).all():
+        raise ValueError(f"Serve predictions for {issue_date} contain non-finite values")
+    if (preds < 0.0).any():
+        raise ValueError(f"Serve predictions for {issue_date} contain negative values")
+    if repeat_delta != 0.0:
+        raise ValueError(f"Serve prediction repeat delta non-zero: {repeat_delta:.8f}")
+
+    _verify_interval_bounds(preds, quantiles)
+
+    pred_sha256 = hashlib.sha256(preds.tobytes()).hexdigest()
+    pin_match_delta: float | None = None
+    if pinned_pred_sha256 is not None:
+        if pred_sha256 != pinned_pred_sha256:
+            raise ValueError(
+                f"Serve prediction SHA-256 mismatch for issue {issue_date}. "
+                f"Expected: {pinned_pred_sha256}, Actual: {pred_sha256}"
+            )
+        pin_match_delta = 0.0
+
+    if verbose:
+        print("\n" + "=" * 78)
+        print("GRIDCAST SERVE-PATH ARTIFACT VERIFICATION")
+        print("=" * 78)
+        print(f"Model artifact:              {m_path}")
+        print(f"Model SHA-256:               {model_sha}")
+        print(f"Interval artifact:           {i_path}")
+        print(f"Interval SHA-256:            {interval_sha}")
+        print(f"Declared features:           {len(declared_features)}")
+        print(f"Issue anchor:                {issue_date} ({len(preds)} horizons)")
+        print(f"Prediction SHA-256 (<f8):    {pred_sha256}")
+        if pin_match_delta is not None:
+            print(
+                f"Pin match delta:             {pin_match_delta:.8f} "
+                "(exact match to PINNED_SERVE_PRED_SHA256)"
+            )
+        else:
+            print("Pin match delta:             N/A (pinned_pred_sha256=None)")
+        print(f"In-process repeat delta:     {repeat_delta:.8f}")
+        print("Interval bracketing (96/96): lower <= pred <= upper, upper > lower")
+        print("-" * 78)
+        print("SERVE GATE VERDICT: PASS")
+        print("=" * 78 + "\n")
+
+    return {
+        "model_sha256": model_sha,
+        "interval_sha256": interval_sha,
+        "feature_count": len(declared_features),
+        "issue_date": issue_date,
+        "row_count": len(preds),
+        "pred_sha256": pred_sha256,
+        "pin_match_delta": pin_match_delta,
+        "repeat_delta": repeat_delta,
+        "verdict": "PASS",
+    }
+
+
 def reproduce_eval_fixture(
     parquet_path: Path | str = DEFAULT_EVAL_FIXTURE_PARQUET,
     sidecar_path: Path | str = DEFAULT_EVAL_FIXTURE_SIDECAR,
@@ -1248,10 +1413,13 @@ def reproduce_eval_fixture(
 ) -> dict[str, Any]:
     """Retrain 15 folds on frozen origins and verify candidate predictions against fixture.
 
-    Slow, manual reproduction check verifying:
+    Train-path manual reproduction check (Windows-frozen fixture):
     1. Per-row candidate_pred max absolute difference <= max_pred_tolerance.
     2. GATE_VALUE delta <= gate_value_tolerance.
     3. Library versions in sidecar reported as a mismatch rather than ignored.
+    Note: On Linux, 15-fold LightGBM retraining diverges structurally from the Windows-frozen
+    fixture (30/30 trees diverge; 40.0496 vs 39.1185) even with identical versions and
+    num_threads=1, so CI gates on ``eval`` + ``eval-serve`` rather than retraining.
     """
     import time
 

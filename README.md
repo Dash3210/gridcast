@@ -1,6 +1,6 @@
 # gridcast
 
-**Target.** gridcast is a forecasting service for Great Britain's half-hourly grid carbon intensity (to be containerised in Phase P5), forecasting 48 hours ahead and will be gated in CI on forecast accuracy. It aims to answer whether a solo open-source model can beat the National Energy System Operator's (NESO) published forecast on a permanent, public scoreboard.
+**Target.** gridcast is a forecasting service for Great Britain's half-hourly grid carbon intensity (containerised in Phase P5), forecasting 48 hours ahead and gated in CI on forecast accuracy. It aims to answer whether a solo open-source model can beat the National Energy System Operator's (NESO) published forecast on a permanent, public scoreboard.
 
 > Phase P3 closes with no gate verdict (neither a pass nor a fail; ADR-020). The previously proposed 35.0 gCO2/kWh threshold was derived from the candidate's own validation score and was mathematically invalid to judge it. On the frozen evaluation split (frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins; 2026-09-04 23:00 UTC to 2026-10-31 00:00 UTC), the candidate model scores GATE_VALUE = 39.118 gCO2/kWh against persistence (53.741 gCO2/kWh), seasonal-naive (51.495 gCO2/kWh), and NESO operator (11.666 gCO2/kWh) (archive commit 3617143, restated from 39.032 gCO2/kWh at commit 3617143; frozen fixture v2). An external gap-closure gate referencing persistence and operator baselines is defined in ADR-021 and committed as an automated CI gate in ADR-030 for Phase P5.
 
@@ -15,7 +15,7 @@
 | P2 | Features: feature extraction and temporal leakage test suite | done |
 | P3 | Models: baseline models, backtesting engine, and evaluation gate | closed (no gate verdict; ADR-020) |
 | P4 | Service: FastAPI prediction API and Prometheus metrics endpoint | done |
-| P5 | Packaging: Docker containerisation and GitHub Actions CI workflow | in progress (P5-a gate wired) |
+| P5 | Packaging: Docker containerisation and GitHub Actions CI workflow | ready for P5 gate (P5-a gate + P5-b container/CI) |
 | P6 | Verification: deliberately failing pull request demonstrating accuracy gate | not started |
 | P7 | Deployment: automated schedule, documentation, and scoreboard publication | not started |
 
@@ -79,19 +79,26 @@ python -m gridcast version
 
 ## What works today
 
-Today (Phase P5-a), the working automation targets are:
+Today (Phase P5), the working automation targets are:
 - `make install` — creates the virtual environment and installs dependencies in editable mode
 - `make test` — runs the test suite with coverage enforcement (>= 85%) and temporal leakage validation
 - `make lint` — checks codebase formatting and linting rules with ruff
 - `make typecheck` — validates static typing with mypy across `src` and `tests`
+- `make check` — runs `lint`, `typecheck`, `test`, and `data-check`
 - `make clean` — removes virtual environment, caches, and build artefacts
-- `make ingest` — runs the nightly half-hourly ingest CLI (`gridcast ingest --days 2` followed by `gridcast ingest --reconcile-recent`)
+- `make ingest` — automatically catches up curated, weather, and generation-mix stores from the latest local partition to today with a minimum 2-day window (`gridcast ingest --catch-up`, `--reconcile-recent`, `--weather --catch-up`, and `--mix --catch-up`)
 - `make features` — builds and inspects the canonical example feature frame keyed by `(issue_time, horizon)`
 - `make train` — trains the native LightGBM model on settled features and writes artifact hash
-- `make eval` — evaluates candidate model from frozen fixture against the wired threshold (43.3379 gCO2/kWh), printing full provenance block and gate verdict (PASS)
-- `make gate-negative` — runs gate on negative control fixture and asserts rejection (FAIL)
-- `make eval-reproduce` — retrains 15 folds and verifies candidate predictions reproduce fixture with zero delta
-- `make data-check` — asserts integrity and completeness of the committed curated dataset
+- `make eval` — evaluates candidate model from `data/eval/frozen_split_v2.parquet` against `data/eval/gate_threshold.json` (`43.3379 gCO2/kWh`), prints the full provenance block and `GATE VERDICT: PASS`, and exits non-zero (`1`) on gate failure or integrity mismatch
+- `make eval-serve` — verifies pinned serve artifacts (`data/models/lgbm_model.txt`, `data/models/interval_v2.json`), 26-feature resolution on settled issue `2026-11-01`, 96-horizon interval bracketing (`lower <= pred <= upper`, `upper > lower`), and bitwise `<f8` prediction SHA-256 (`1688bc3f...`) across platforms (`SERVE GATE VERDICT: PASS`)
+- `make gate-negative` — runs gate on `data/eval/negative_control.parquet` and asserts rejection (`GATE VERDICT: FAIL`, exiting `0` only when rejected)
+- `make eval-reproduce` — manual, platform-scoped train-path check that retrains 15 folds and compares predictions against `frozen_split_v2.parquet` (Windows and Linux LightGBM 4.7.0 wheels diverge structurally across 30/30 trees despite identical parameters/seeds, so CI runs `eval`, `gate-negative`, and `eval-serve` instead; see ADR-031)
+- `make eval-refresh` — manual command to rebuild and refresh the frozen evaluation fixture
+- `make ablation-weather` — runs the pre-registered weather removal ablation against the frozen fixture
+- `make metrics-fixture` — regenerates `tests/fixtures/frozen_split_metrics.json` hashes from `data/eval/`
+- `make serve` — runs the FastAPI prediction service (`python -m gridcast.cli serve --run`)
+- `make docker` — builds the multi-stage, non-root (`UID 10001`) production Docker image `gridcast:latest`
+- `make data-check` — runs `tests/test_data_integrity.py` to assert partition completeness and schema/audit invariants for `data/curated`, `data/mix`, and `data/weather` up to yesterday (`Europe/London`); a fresh clone behind today's date should run `make ingest` (or backfill via `gridcast ingest --days N` / `--weather` / `--mix`) before `make data-check` or `make check`
 
 ### Features
 
@@ -166,8 +173,8 @@ Phase P3 builds the forecast model, three comparison baselines, and the evaluati
   - The previously considered threshold of `35.000 gCO2/kWh` was derived from the candidate's own validation score (33.815 gCO2/kWh plus 3.5%) and was therefore invalid as an external gate. A model cannot be judged against a bar computed from itself; the first scoring is void, and Phase P3 closes with **no gate verdict (neither a pass nor a fail)**.
   - On the frozen test split (frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins; `2026-09-04 23:00 UTC` to `2026-10-31 00:00 UTC`), the candidate scores `GATE_VALUE = 39.118 gCO2/kWh` vs persistence `53.741 gCO2/kWh`, seasonal-naive `51.495 gCO2/kWh`, and NESO operator `11.666 gCO2/kWh` (archive commit 3617143, restated from 39.032 gCO2/kWh at commit 3617143; frozen fixture v2). The candidate beats its own baselines by roughly a quarter and loses to the operator by about three times, on a fixed window, so any future number must be quoted beside its window. Do not describe this as accuracy, as a pass, or as meeting a standard.
   - *Benchmark Target Mutability & Frozen Fixtures (ADR-023)*: The split was previously frozen in origins, not in targets; targets were a snapshot of the archive at run time. Revisions in recent partitions caused GATE_VALUE to move from 39.043 to 39.032. ADR-023 froze both origins and targets into immutable evaluation fixtures (`data/eval/frozen_split_v1.parquet` and `data/eval/frozen_split_v2.parquet`), separating evaluation from live archive reconciliations into dual data planes.
-  - `make eval` (`python -m gridcast.cli eval`) reports metrics on the frozen split, prints `GATE VERDICT: NONE - threshold invalid (ADR-020); no pass or fail is claimed`, and exits 0. Nothing failed, because nothing was judged.
-- **Phase P4 Gate Specification (ADR-021)**:
+  - In Phase P3 (ADR-020), `make eval` printed `GATE VERDICT: NONE - threshold invalid (ADR-020); no pass or fail is claimed` and exited `0` because no external bar existed yet. Under Phase P5 (ADR-030, ADR-031), `make eval` (`python -m gridcast.cli eval`) evaluates `data/eval/frozen_split_v2.parquet` against `data/eval/gate_threshold.json` (`43.3379 gCO2/kWh`), prints the full provenance block (retaining the historical P3 note) followed by `GATE VERDICT: PASS` (since `39.118 <= 43.3379`), and exits non-zero (`1`) on gate failure (`GATE VERDICT: FAIL`) or fixture SHA-256 mismatch. `make gate-negative` asserts rejection on `data/eval/negative_control.parquet`, and `make eval-serve` verifies cross-platform serve-path determinism (`SERVE GATE VERDICT: PASS`).
+- **Phase P4/P5 Gate Specification (ADR-021, ADR-030)**:
   - Defined prior to Phase P4 training in terms of external quantities:
     > On the frozen evaluation split, with candidate, persistence and operator measured on identical periods:
     > the candidate must close at least 30 percent of the MAE gap between issue-anchored persistence and the
@@ -176,7 +183,7 @@ Phase P3 builds the forecast model, three comparison baselines, and the evaluati
     > gap = MAE_persistence - MAE_operator
     > required = MAE_persistence - 0.30 * gap
     > passes only if MAE_candidate <= required
-  - Derived on the validation split only (`2026-06-05` to `2026-08-30`, 15 rolling origins: persistence 57.776, operator 9.649, gap 48.127, required 43.338). Gating in CI arrives in Phase P5.
+  - Derived on the validation split only (`2026-06-05` to `2026-08-30`, 15 rolling origins: persistence 57.776, operator 9.649, gap 48.127, required 43.338). Wired in CI in Phase P5 (`.github/workflows/ci.yml` runs `make check`, `make eval`, `make gate-negative`, `make eval-serve`, and the `docker` verification job; `make eval-reproduce` remains manual/platform-scoped per ADR-031).
 
 ### Ingest
 
@@ -227,9 +234,9 @@ data/
 
 - **Coverage & CLI Usage**:
   The repository maintains historical curated partitions from `2024-11-01` to the present day. Ingest coverage is managed and extended via the CLI:
-  - `gridcast ingest [--days N | --start YYYY-MM-DD --end YYYY-MM-DD]`: Ingest carbon intensity.
-  - `gridcast ingest --weather [--days N | --start YYYY-MM-DD --end YYYY-MM-DD]`: Ingest hourly weather forecasts.
-  - `gridcast ingest --mix [--days N | --start YYYY-MM-DD --end YYYY-MM-DD]`: Ingest half-hourly generation mix.
+  - `gridcast ingest [--days N | --catch-up | --start YYYY-MM-DD --end YYYY-MM-DD]`: Ingest carbon intensity (`--catch-up` computes `max(2, (today_london - latest_date).days + 2)` from the latest local partition).
+  - `gridcast ingest --weather [--days N | --catch-up | --start YYYY-MM-DD --end YYYY-MM-DD]`: Ingest hourly weather forecasts.
+  - `gridcast ingest --mix [--days N | --catch-up | --start YYYY-MM-DD --end YYYY-MM-DD]`: Ingest half-hourly generation mix.
   - `gridcast ingest --force`: Re-fetch and re-evaluate partitions that look complete.
   - `gridcast ingest --prune-cache`: Manually prune raw HTTP cache files older than 90 days.
 
@@ -259,13 +266,16 @@ data/
 `pd.read_parquet("data/curated")` is the supported loader and works out-of-the-box because `data/curated/` holds only pure Parquet partition files (`date=*.parquet`); audit CSV files live separately in `data/audit/`. If you load via filesystem globbing instead of directory loading, match `data/curated/date=*.parquet`.
 
 ```python
+import datetime
 import pandas as pd
 
 # Load the entire curated dataset directly from the partition directory
 df = pd.read_parquet("data/curated")
 
-# Sanity check: 731 daily partitions (2024-11-01 to 2026-11-01) = 35,088 half-hourly rows
-assert len(df) == 35088, f"Unexpected row count: {len(df)}"
+# Sanity check: historical backfill begins 2024-11-01 (731 partitions = 35,088 rows through 2026-11-01)
+# and grows nightly with new daily partitions
+assert len(df) >= 35088, f"Unexpected row count: {len(df)}"
+assert df["local_date"].min() == datetime.date(2024, 11, 1)
 assert df["period_start_utc"].is_monotonic_increasing, "Dataset must be sorted by period_start_utc"
 print(f"Loaded {len(df):,} rows successfully across {df['local_date'].nunique()} daily partitions.")
 ```
@@ -281,9 +291,9 @@ Audit logs are stored in `data/audit/` and created lazily only when anomalies oc
 - `data/audit/conflicts.csv`: Records upstream retractions where an incoming payload presents a null value for a period where a non-null observation is already stored in curated partitions.
 
 Phase milestones:
-- `make serve` runs the FastAPI forecast prediction service (P4).
-- `make docker` exits non-zero with an explicit message indicating the future phase in which it arrives (P5).
-- `make train` and `make eval` are active automation targets for Phase P3.
+- `make serve` runs the FastAPI forecast prediction service (`python -m gridcast.cli serve --run`, P4).
+- `make docker` builds the multi-stage, non-root (`UID 10001`) production Docker image `gridcast:latest` (P5).
+- `make train`, `make eval`, `make eval-serve`, and `make gate-negative` are active automation targets (P3/P5).
 
 ### Serving API (Phase P4)
 
@@ -294,7 +304,7 @@ The prediction service is served by FastAPI + uvicorn, exposing six contracts:
 - **`GET /forecast?hours=48`**: Returns half-hourly forecast points in a response envelope with `issue_time`, `generated_at`, `is_current_issue`, `contains_future_points`, `retrospective_horizons`, `hours`, `model_version`, `content_sha256`, `interval_sha256`, `model_hash`, `interval_hash`, `generation`, `state_version`, and `points`. Anchors (`date` or `issue_time`) are strictly enforced at the boundary to 00:00 Europe/London across timezones and offsets; non-midnight anchors, naive timestamps, or invalid dates return HTTP 422 with structured errors without reflecting inputs or host paths. Any `issue_time` without an explicit UTC offset (including date-only) is rejected with HTTP 422, requiring an explicit offset and pointing to `date=YYYY-MM-DD` as the supported form for date-only queries. A literal `+` arrives as a space and is read as an offset sign; percent-encode it as `%2B`. When `is_current_issue` is false, includes `fallback_reason` naming the null feature and date. Parameter `hours` is anchor-relative, counted strictly from the anchor (never from now), and validated to 1..48 integer (invalid inputs return HTTP 422 with accepted range `[1, 48]`). For `hours` in 1..48, `len(points) == hours * 2` with timestamps increasing at exactly 30 minutes; each point includes `horizon`, `timestamp`, `target_time`, `value`, `lower`, and `upper` where `lower <= value <= upper` and `value >= 0`. Features are cached in a bounded cache keyed by `(issue_time, model_sha256, curated_freshness)`.
 - **`GET /metrics`**: Prometheus text exposition format containing request counts (`gridcast_requests_total`), latency histogram (`gridcast_request_duration_seconds`), served issue age (`gridcast_served_issue_age_seconds`), publish lateness (`gridcast_publish_lateness_seconds`), and last measured MAE macro mean (`gridcast_last_measured_mae` with `plane="live_scoreboard"` and `horizons` labels) computed as the unweighted mean of per-horizon MAEs matching project scalar evaluation, accompanied by companion sample size gauge (`gridcast_last_measured_mae_samples{series,plane}`). The operator series is labeled `status="partial"`, `horizons="1-33"` (n=33), never "settled". Unsettled series (candidate) are exposed as absent with label `status="absent"` and NaN value. Endpoint cardinality is `{"/forecast", "/health", "/metrics", "/model", "/ready", "/reload", "unmatched"}`, strictly bounded to the registered application routes plus `"unmatched"`.
 - **`GET /model`**: Exposes JSON matching `MODEL_CARD.md`: `version` (`lgbm-v2`), content `sha256` (`1cd13471...`), `training_window` (`2024-11-08 to 2026-11-07`), `feature_count` (26), `interval_sha256`, and monotonic `generation`.
-- **`POST /reload`**: Reloads model and interval artifacts under snapshot swap. Authenticated exclusively via `Authorization: Bearer <token>` header (or `X-Reload-Token`) using constant-time `secrets.compare_digest` (query parameters and JSON body tokens are strictly rejected). Returns HTTP 401 for a missing or wrong token when configured; HTTP 503 if unconfigured (endpoint closed); HTTP 200 on success; HTTP 500 on missing or unreadable artifact (returning generic error detail without host paths or filenames while keeping the active in-memory booster intact).
+- **`POST /reload`**: Reloads model and interval artifacts under snapshot swap. Authenticated exclusively via `Authorization: Bearer <token>` header (or `X-Reload-Token`) using constant-time `secrets.compare_digest` (query parameters and JSON body tokens are strictly rejected). Returns HTTP 401 for a missing or wrong token when configured; HTTP 503 if unconfigured (endpoint closed); HTTP 200 on success; HTTP 422 if reloaded booster features do not match `FEATURE_COLUMNS` or interval quantiles violate 96-horizon `q10 <= 0.0 <= q90` invariants; HTTP 500 on missing or unreadable artifact (returning generic error detail without host paths or filenames while keeping the active in-memory booster intact).
 
 **Prediction Intervals**:
 Prediction intervals are calibrated using per-horizon empirical residual quantiles from the **validation split only** (`2026-06-05` to `2026-08-30`, 87 daily issue dates, 8,352 points), written to `data/models/interval_v2.json`. Bounds are defined by `lower = pred + q10(h)` and `upper = pred + q90(h)`. Empirical coverage on the validation split is **79.31%**. 87 summer samples per horizon understate winter volatility; calibration is descriptive, not a guarantee. Long-horizon lower bounds can legitimately be negative after refreeze; `lower >= 0` is not clamped. Interval width does not strictly increase with horizon (measured on the pinned fixture: 38 of 95 steps are non-monotonic, far/near mean ratio is 1.27x; direction recorded, magnitude not asserted). `data/eval` is never used for calibration to prevent leakage.
@@ -302,44 +312,108 @@ Prediction intervals are calibrated using per-horizon empirical residual quantil
 **Source Gap Policy**:
 The request path shares the canonical builder `build_example_frame`. If any required feature contains null values due to an upstream source gap, the service refuses the request with named structured error `FeatureSourceGapError` (HTTP 503), reporting the corrupted features and timestamp without exposing internal directory paths. No silent NaNs reach the model.
 
-**Operational Characteristics & Serving Contract (ADR-025, ADR-026)**:
-- Today's issue becomes buildable only after the nightly ingest lands (~09:00Z) because `actual_recent_3h` requires the previous day's 21:00 actual.
+**Operational Characteristics & Serving Contract (ADR-025, ADR-026, ADR-028, ADR-029)**:
+- Today's issue becomes buildable only after the nightly ingest lands (~08:50-09:36 UTC, ahead of the `11:00 UTC` publish deadline) because `actual_recent_3h` requires the previous day's 21:00 actual.
 - Prior to that, the service serves the newest buildable issue and labels it with `is_current_issue: false`, `fallback_reason`, and `retrospective_horizons`.
 - Horizons earlier than publication time are retrospective (`target_time < generated_at`).
 - Anchors are strictly fixed at 00:00 Europe/London; non-00:00 Europe/London timestamps return HTTP 422 at the serving boundary. Arbitrary anchors would require a v3 model trained across a spread of anchor hours, with its own fixture - not a serving-time change.
 - Refusing to build with a null feature is deliberate: imputing missing actuals would be fabrication.
 - State reload mechanism: one immutable snapshot reference (`ModelSnapshot`), read once per request; the writer lock serialises reload writers across the whole reload (artifact load, generation increment, and snapshot swap) across the read-modify-write so generations are strictly increasing and unique, while readers remain lock-free, observing an internally consistent snapshot without reader locks.
 
+### Container Usage and CI Gate (Phase P5)
+
+Phase P5 packages `gridcast` as a multi-stage, non-root production Docker image (`Dockerfile`, built via `make docker`) and enforces accuracy and container gates in `.github/workflows/ci.yml`:
+
+- **Base Image & Lockfile**: Both builder and runtime stages pin `python:3.10-slim` by SHA-256 digest (`sha256:6ff506466f8b1e981719b468cc0023b8ef000b983cdec0eafe119d01f379e31d`). Runtime dependencies are hash-verified (`pip install --require-hashes --no-deps -r requirements.lock`, 30 Linux packages; `httpx2` used by Starlette `TestClient` is isolated to `[project.optional-dependencies].dev` in `pyproject.toml`). The runtime stage installs `libgomp1` for LightGBM, runs as non-root user `gridcast` (`UID/GID 10001`), exposes port `8000` with a `/health` `HEALTHCHECK`, and is verified `< 400 MB` in CI.
+- **Startup Integrity (`data/models/runtime.json`)**: `runtime.json` pins `lightgbm_version` (`4.7.0`), `model_sha256` (`1cd13471...`), and `interval_sha256` (`ab94aa71...`). `verify_startup_environment()` runs at Docker image build time and service startup, refusing to boot if `runtime.json` is missing/invalid or if the installed `lightgbm` version or artifact SHA-256 digests mismatch.
+- **Read-Only Data Mounts & Single-Worker Topology**: `.dockerignore` excludes `data/curated/`, `data/mix/`, `data/scoreboard/`, `data/weather/`, `data/audit/`, `data/cache/`, `tests/`, and `docs/` from the image. Mount `data/curated`, `data/mix`, and `data/scoreboard` read-only (`:ro`) at runtime; serving paths perform zero filesystem writes. Always run with a single worker / replica (`--workers 1` / `replicas: 1`) because `ModelSnapshot` reload state and the Prometheus metrics registry are held in-process.
+- **Reload Authentication (`GRIDCAST_RELOAD_TOKEN`)**: Pass `-e GRIDCAST_RELOAD_TOKEN="<secret>"` to arm `POST /reload` (via `Authorization: Bearer <secret>` or `X-Reload-Token` header). When unset, `POST /reload` remains closed (HTTP 503).
+
+Run the containerised service with read-only operational mounts:
+
+```bash
+make docker
+docker run --rm -p 8000:8000 \
+  -e GRIDCAST_RELOAD_TOKEN="replace-with-secret-token" \
+  -v "$PWD/data/curated:/app/data/curated:ro" \
+  -v "$PWD/data/mix:/app/data/mix:ro" \
+  -v "$PWD/data/scoreboard:/app/data/scoreboard:ro" \
+  gridcast:latest
+```
+
+Run the cross-platform serve-path determinism gate inside the container:
+
+```bash
+docker run --rm \
+  -v "$PWD/data/curated:/app/data/curated:ro" \
+  -v "$PWD/data/mix:/app/data/mix:ro" \
+  gridcast:latest python -m gridcast.cli eval-serve
+```
+
+- **CI Pipeline (`.github/workflows/ci.yml`)**:
+  - `gate` job runs `make check` (`lint`, `typecheck`, `test`, `data-check`), `make eval` (asserting `GATE VERDICT: PASS` and pinned fixture SHA-256), `make gate-negative` (asserting rejection), `make eval-serve` (asserting `SERVE GATE VERDICT: PASS`, `0.00000000` delta, pinned model and prediction SHA-256s), and `git diff --exit-code`. `make eval-reproduce` is kept manual/platform-scoped per ADR-031.
+  - `docker` job runs `make docker`, checks image size `< 400 MB`, verifies `id -u == 10001`, runs in-container `eval-serve` with `:ro` mounts, and smoke-tests `/health`, `/ready`, `/model`, `/metrics`, `/forecast?hours=48`, and `/reload` (`401` unauthenticated, `200` with `GRIDCAST_RELOAD_TOKEN`).
+
 ## Layout
 
 ```
 gridcast/
+|-- .dockerignore         # Excludes data stores, tests, docs, and caches from Docker build context
+|-- .gitattributes        # Binary/LF attributes for Parquet and pinned model artifacts
+|-- .github/
+|   `-- workflows/
+|       |-- ci.yml        # CI gate (check, eval, gate-negative, eval-serve) and docker jobs
+|       `-- nightly.yml   # Scheduled ingest and live scoreboard update workflow
+|-- Dockerfile            # Multi-stage, non-root (UID 10001) production container (< 400 MB)
+|-- LICENSE               # MIT License
 |-- Makefile              # Automation recipes restricted to cmd/sh common subset
-|-- pyproject.toml        # PEP 621 package metadata and tool configurations
+|-- MODEL_CARD.md         # Model lineage, serving contracts, and pinned evaluation metrics
+|-- pyproject.toml        # PEP 621 package metadata, dependencies, and tool configurations
 |-- README.md             # Project overview, status tracking, and module guide
+|-- requirements.lock     # Hash-pinned Linux runtime lockfile (30 packages) for Docker builds
 |-- docs/
-|   `-- decisions.md      # Architecture Decision Records (ADRs)
+|   |-- ablations/        # Ablation study records
+|   |-- decisions.md      # Architecture Decision Records (ADRs)
+|   `-- scoreboard.md     # Live forecast-vs-actual scoreboard report
 |-- src/
 |   `-- gridcast/
 |       |-- py.typed      # PEP 561 marker for inline type annotations
 |       |-- __init__.py   # Package version resolution from metadata
+|       |-- __main__.py   # Module entry point (`python -m gridcast`)
 |       |-- _phase.py     # Loud exit helper for unimplemented phase milestones
-|       |-- cli.py        # CLI entry point routing subcommands to modules or phase gates
+|       |-- cli.py        # CLI entry point routing subcommands and evaluation gates
 |       |-- ingest.py     # Half-hourly API data ingest to Parquet partitions (P1)
-|       |-- features.py   # Feature engineering and temporal leakage prevention tests (P2)
-|       |-- models.py     # Machine learning forecast models and baseline comparison (P3)
-|       |-- backtest.py   # Backtesting engine and historical evaluation (P3)
-|       `-- serve.py      # FastAPI service and prediction endpoints (P4)
+|       |-- holidays.py   # Static UK bank holiday register (2024-2027)
+|       |-- features.py   # Feature engineering and temporal/operational leakage guards (P2)
+|       |-- models.py     # LightGBM model, baselines, and pinned artifact hashes (P3/P5)
+|       |-- backtest.py   # Backtesting engine, fixture gate, and eval-serve verifier (P3/P5)
+|       |-- scoreboard.py # Live forecast generation and settled-target scoring (P4/P7)
+|       `-- serve.py      # FastAPI service, startup verification, and API endpoints (P4/P5)
 |-- tests/
-|   |-- fixtures/         # Static API payload response fixtures
-|   |-- test_smoke.py     # Smoke tests verifying package metadata, CLI routing, and gating
-|   |-- test_ingest.py    # Unit and integration tests for ingest pipeline and schema
-|   `-- test_data_integrity.py # Invariant assertions for committed curated partitions
+|   |-- fixtures/         # Static API payload and platform determinism fixtures
+|   |-- conftest.py       # Shared pytest configuration
+|   |-- helpers.py        # Test helpers
+|   |-- test_ablation_weather.py      # Pre-registered weather ablation tests
+|   |-- test_backtest.py              # Backtest engine and per-platform determinism tests
+|   |-- test_data_integrity.py        # Completeness, schema, and audit invariants (`make data-check`)
+|   |-- test_eval_fixture.py          # Frozen fixture integrity and `eval-serve` tests
+|   |-- test_features.py              # Feature correctness and leakage invariance tests
+|   |-- test_gate.py                  # Accuracy gate threshold and negative control tests
+|   |-- test_ingest.py                # Unit and integration tests for ingest pipeline and schema
+|   |-- test_model_card_consistency.py # Cross-doc figure and fixture hash consistency tests
+|   |-- test_models.py                # Model training and provenance tests
+|   |-- test_scoreboard.py            # Live scoreboard generation and scoring tests
+|   |-- test_serve_api.py             # FastAPI endpoint, reload, and startup integrity tests
+|   |-- test_serve_servability.py     # Serving feature parity and servability checks
+|   `-- test_smoke.py                 # Package metadata, CLI routing, and gating smoke tests
 `-- data/
     |-- audit/            # Audited anomalies: gaps.csv, source-gaps.csv, conflicts.csv (created lazily)
     |-- cache/
     |   `-- http/         # Raw gzipped HTTP cache replay buffer (gitignored, 90-day retention)
-    |-- curated/          # Committed append-only daily Parquet partitions (pure Parquet dataset)
+    |-- curated/          # Committed append-only daily carbon intensity Parquet partitions
+    |-- eval/             # Frozen evaluation fixtures (`frozen_split_v1/v2`, `gate_threshold.json`, `negative_control.parquet`)
     |-- mix/              # Committed daily generation mix Parquet partitions
+    |-- models/           # Pinned production artifacts (`lgbm_model.txt`, `interval_v2.json`, `runtime.json`)
+    |-- scoreboard/       # Live scoreboard forecasts (`forecasts.parquet`) and scores (`scores.csv`)
     `-- weather/          # Committed daily weather forecast Parquet partitions
 ```

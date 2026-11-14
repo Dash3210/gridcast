@@ -27,7 +27,7 @@ from gridcast.backtest import (
     evaluate_gate,
     load_and_verify_gate_threshold,
 )
-from gridcast.cli import run_gate_negative_cli
+from gridcast.cli import run_eval_cli, run_gate_negative_cli
 
 NEGATIVE_CONTROL_PARQUET = Path("data/eval/negative_control.parquet")
 
@@ -203,6 +203,33 @@ def test_run_gate_negative_cli_fails_if_gate_weakened(
     assert rc == 1
     captured = capsys.readouterr()
     assert "Gate negative control failed: expected verdict 'FAIL', got 'PASS'" in captured.err
+
+
+def test_run_eval_cli_exits_nonzero_on_gate_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """make eval / run_eval_cli must exit non-zero (1) whenever verdict != 'PASS'."""
+    neg_sha = hashlib.sha256(NEGATIVE_CONTROL_PARQUET.read_bytes()).hexdigest()
+    rc_neg = run_eval_cli(
+        fixture_path=NEGATIVE_CONTROL_PARQUET,
+        sidecar_path=None,
+        verbose=True,
+        pinned_sha256=neg_sha,
+    )
+    assert rc_neg == 1
+    captured_neg = capsys.readouterr()
+    assert "GATE VERDICT: FAIL" in captured_neg.out
+    assert "Accuracy gate failed: expected verdict 'PASS', got 'FAIL'" in captured_neg.err
+
+    monkeypatch.setattr(
+        "gridcast.backtest.evaluate_gate",
+        lambda *args, **kwargs: "FAIL",
+    )
+    rc_monkey = run_eval_cli(verbose=False)
+    assert rc_monkey == 1
+    captured_monkey = capsys.readouterr()
+    assert "Accuracy gate failed: expected verdict 'PASS', got 'FAIL'" in captured_monkey.err
 
 
 def test_hermetic_data_check_offline_and_no_writes(monkeypatch: pytest.MonkeyPatch) -> None:

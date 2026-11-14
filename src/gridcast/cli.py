@@ -97,6 +97,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="Window size in days for --reconcile-recent (default: 3).",
     )
+    ingest_parser.add_argument(
+        "--catch-up",
+        action="store_true",
+        default=False,
+        help="Automatically catch up from the latest local partition to today (minimum 2 days).",
+    )
 
     features_parser = subparsers.add_parser(
         "features",
@@ -324,7 +330,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     eval_reproduce_parser = subparsers.add_parser(
         "eval-reproduce",
-        help="Retrain 15 folds and verify candidate predictions against fixture (slow, manual).",
+        help=(
+            "Train-path check: retrain 15 folds and verify against fixture "
+            "(slow, manual; platform-specific)."
+        ),
     )
     eval_reproduce_parser.add_argument(
         "--fixture",
@@ -362,6 +371,57 @@ def build_parser() -> argparse.ArgumentParser:
         dest="verbose",
         action="store_false",
         help="Suppress progress and table output.",
+    )
+
+    eval_serve_parser = subparsers.add_parser(
+        "eval-serve",
+        help=(
+            "Serve-path check: verify pinned model/interval hashes and deterministic "
+            "predictions across platforms."
+        ),
+    )
+    eval_serve_parser.add_argument(
+        "--model-path",
+        type=str,
+        default="data/models/lgbm_model.txt",
+        help="Path to pinned LightGBM model artifact (default: data/models/lgbm_model.txt).",
+    )
+    eval_serve_parser.add_argument(
+        "--interval-path",
+        type=str,
+        default="data/models/interval_v2.json",
+        help="Path to pinned interval artifact (default: data/models/interval_v2.json).",
+    )
+    eval_serve_parser.add_argument(
+        "--issue-date",
+        type=str,
+        default="2026-11-01",
+        help="Settled issue date to score deterministically (default: 2026-11-01).",
+    )
+    eval_serve_parser.add_argument(
+        "--curated-dir",
+        type=str,
+        default="data/curated",
+        help="Path to curated archive directory (default: data/curated).",
+    )
+    eval_serve_parser.add_argument(
+        "--mix-dir",
+        type=str,
+        default="data/mix",
+        help="Path to generation mix directory (default: data/mix).",
+    )
+    eval_serve_parser.add_argument(
+        "--no-verbose",
+        dest="verbose",
+        action="store_false",
+        default=True,
+        help="Disable detailed output.",
+    )
+    eval_serve_parser.add_argument(
+        "--quiet",
+        dest="verbose",
+        action="store_false",
+        help="Suppress detailed output.",
     )
 
     ablation_weather_parser = subparsers.add_parser(
@@ -587,7 +647,7 @@ def run_backtest_cli(
 
 def run_eval_cli(
     fixture_path: Path | str = "data/eval/frozen_split_v2.parquet",
-    sidecar_path: Path | str = "data/eval/frozen_split_v2.json",
+    sidecar_path: Path | str | None = "data/eval/frozen_split_v2.json",
     verbose: bool = True,
     pinned_sha256: str | None = None,
 ) -> int:
@@ -597,12 +657,18 @@ def run_eval_cli(
     resolved_pin = PINNED_EVAL_FIXTURE_SHA256 if pinned_sha256 is None else pinned_sha256
 
     try:
-        evaluate_from_fixture(
+        results = evaluate_from_fixture(
             parquet_path=fixture_path,
             sidecar_path=sidecar_path,
             verbose=verbose,
             pinned_sha256=resolved_pin,
         )
+        if results.verdict != "PASS":
+            print(
+                f"Accuracy gate failed: expected verdict 'PASS', got '{results.verdict}'",
+                file=sys.stderr,
+            )
+            return 1
         return 0
     except ValueError as e:
         print(f"Evaluation refused: {e}", file=sys.stderr)
@@ -659,6 +725,32 @@ def run_eval_reproduce_cli(
         return 0
     except Exception as e:
         print(f"Reproduction check failed: {e}", file=sys.stderr)
+        return 1
+
+
+def run_eval_serve_cli(
+    model_path: Path | str = "data/models/lgbm_model.txt",
+    interval_path: Path | str = "data/models/interval_v2.json",
+    issue_date: str = "2026-11-01",
+    curated_dir: Path | str = "data/curated",
+    mix_dir: Path | str = "data/mix",
+    verbose: bool = True,
+) -> int:
+    """Verify pinned serving artifacts and deterministic prediction digest."""
+    from gridcast.backtest import verify_serve_artifact
+
+    try:
+        verify_serve_artifact(
+            model_path=model_path,
+            interval_path=interval_path,
+            issue_date=issue_date,
+            curated_dir=curated_dir,
+            mix_dir=mix_dir,
+            verbose=verbose,
+        )
+        return 0
+    except Exception as e:
+        print(f"Serve evaluation refused: {e}", file=sys.stderr)
         return 1
 
 
@@ -722,6 +814,29 @@ def run_ablation_weather_cli(
         return 1
 
 
+def compute_catch_up_days(store_dir: Path, today: date | None = None) -> int:
+    """Compute ingest --days window needed to catch up from the latest partition to today."""
+    today_date = today if today is not None else datetime.now(ZoneInfo("Europe/London")).date()
+    if not store_dir.exists():
+        return 2
+
+    dates: list[date] = []
+    for path in store_dir.glob("date=*.parquet"):
+        stem = path.stem
+        if not stem.startswith("date="):
+            continue
+        try:
+            dates.append(date.fromisoformat(stem[5:]))
+        except ValueError:
+            continue
+
+    if not dates:
+        return 2
+
+    latest_date = max(dates)
+    return max(2, (today_date - latest_date).days + 2)
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point for gridcast."""
     parser = build_parser()
@@ -732,8 +847,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.subcommand == "train":
-        from pathlib import Path
-
         return run_train_cli(
             output_path=Path(args.output),
             num_boost_round=args.num_boost_round,
@@ -772,6 +885,16 @@ def main(argv: list[str] | None = None) -> int:
             verbose=args.verbose,
         )
 
+    if args.subcommand == "eval-serve":
+        return run_eval_serve_cli(
+            model_path=args.model_path,
+            interval_path=args.interval_path,
+            issue_date=args.issue_date,
+            curated_dir=args.curated_dir,
+            mix_dir=args.mix_dir,
+            verbose=args.verbose,
+        )
+
     if args.subcommand == "eval-refresh":
         return run_eval_refresh_cli(
             version=args.version,
@@ -799,10 +922,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Pruned {len(pruned)} cache file(s) older than 90 days.")
             return 0
 
+        if args.catch_up and (
+            args.days is not None
+            or args.recent is not None
+            or args.start is not None
+            or args.end is not None
+        ):
+            print(
+                "gridcast: --catch-up cannot be combined with "
+                "--days, --recent, --start, or --end.",
+                file=sys.stderr,
+            )
+            return 2
+
         today = datetime.now(ZoneInfo("Europe/London")).date()
 
         if (
             args.reconcile_recent
+            and not args.catch_up
             and args.days is None
             and args.recent is None
             and args.start is None
@@ -832,11 +969,19 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
         else:
-            days = (
-                args.recent
-                if args.recent is not None
-                else (args.days if args.days is not None else 2)
-            )
+            if args.catch_up:
+                target_store = (
+                    Path("data/weather")
+                    if args.weather
+                    else (Path("data/mix") if args.mix else Path("data/curated"))
+                )
+                days = compute_catch_up_days(target_store, today=today)
+            else:
+                days = (
+                    args.recent
+                    if args.recent is not None
+                    else (args.days if args.days is not None else 2)
+                )
             if days < 1:
                 print("gridcast: --days/--recent must be at least 1.", file=sys.stderr)
                 return 2
@@ -909,8 +1054,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.subcommand == "forecast":
-        from pathlib import Path
-
         from gridcast.scoreboard import run_forecast_cli
 
         return run_forecast_cli(
@@ -921,8 +1064,6 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.subcommand == "score":
-        from pathlib import Path
-
         from gridcast.scoreboard import run_score_cli
 
         return run_score_cli(

@@ -441,16 +441,15 @@ def math_isclose(a: float, b: float, tol: float = 1e-9) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Requirement 4: Golden-file Test on Frozen Window
+# Requirement 4: Backtest-Engine Determinism Regression on Frozen 30-Day Window
 # ---------------------------------------------------------------------------
 
 
-def test_golden_backtest_metrics_stability() -> None:
-    """Requirement 4: Golden-file test on a frozen 30-day window.
+def test_golden_backtest_provenance_is_per_platform() -> None:
+    """Each platform golden must carry its own library provenance versions.
 
-    Asserts byte-stable metrics within a platform, with fixed seed, so evaluation drift shows as a
-    diff. Each platform records its own golden: the compiled LightGBM wheel for Linux and the one
-    for Windows produce different numbers on this window even with identical library versions.
+    Storing one global provenance block lets a library upgrade on one OS change
+    that platform's golden while the shared block still describes another OS.
     """
     fixture_path = Path("tests/fixtures/golden_backtest_metrics.json")
     assert fixture_path.exists(), f"Missing golden fixture: {fixture_path}"
@@ -458,9 +457,42 @@ def test_golden_backtest_metrics_stability() -> None:
     with open(fixture_path, encoding="utf-8") as f:
         data = json.load(f)
 
-    # The golden is per platform. The Linux and Windows LightGBM wheels disagree by ~6% on this
-    # window with identical library versions and num_threads=1, because the compiled histogram code
-    # differs. One number would pass only where it was recorded.
+    assert "provenance" not in data, (
+        "Library provenance versions must live inside each platform entry, not in a global block."
+    )
+    platforms = data.get("platforms", {})
+    assert {"win32-x86_64", "linux-x86_64"}.issubset(platforms.keys())
+
+    for plat_key, entry in platforms.items():
+        prov = entry.get("provenance")
+        assert isinstance(prov, dict), f"Platform {plat_key!r} missing 'provenance' dict"
+        for pkg in ("python", "lightgbm", "pandas", "numpy"):
+            assert pkg in prov and prov[pkg], (
+                f"Platform {plat_key!r} provenance missing '{pkg}'"
+            )
+
+
+def test_backtest_engine_determinism_per_platform() -> None:
+    """Backtest-engine determinism regression on a frozen 30-day window (NOT model validity).
+
+    Note on scope: this test trains with ``include_weather=True`` on the 29-feature v1 list
+    and 30 boosting rounds, whereas production serves 26 features (``lgbm-v2``, weather dropped
+    per ADR-018). It tests that the backtest engine stays deterministic within a platform.
+
+    Observed cross-platform divergence: Linux and Windows LightGBM wheels disagree by ~6.5% on
+    this window (28.8701 vs 30.7505) and by 0.93 gCO2/kWh on 15-fold v2 retraining (30/30 trees
+    diverge structurally) even with identical library versions, deterministic=True,
+    force_col_wise=True, and num_threads=1. Non-LightGBM baselines (operator 9.5234, persistence
+    68.7214, seasonal-naive 44.3984) match identically across platforms.
+    """
+    from gridcast.backtest import check_sidecar_library_versions
+
+    fixture_path = Path("tests/fixtures/golden_backtest_metrics.json")
+    assert fixture_path.exists(), f"Missing golden fixture: {fixture_path}"
+
+    with open(fixture_path, encoding="utf-8") as f:
+        data = json.load(f)
+
     machine = platform.machine().lower()
     if machine in ("amd64", "x86_64"):
         machine = "x86_64"
@@ -469,6 +501,8 @@ def test_golden_backtest_metrics_stability() -> None:
         f"No golden recorded for platform {key!r}. Record one deliberately, do not widen the rest."
     )
     golden = data["platforms"][key]
+    mismatches = check_sidecar_library_versions({"versions": golden["provenance"]})
+    assert mismatches == [], f"Platform {key!r} library provenance mismatch: {mismatches}"
 
     intensity_df, weather_df, mix_df = load_feature_sources()
     schedule = default_issue_schedule("2024-11-08", "2025-07-15")

@@ -8,7 +8,7 @@ PYTHON ?= python3
 PY ?= .venv/bin/python
 endif
 
-.PHONY: help install test data-check clean ingest features train eval gate-negative eval-refresh eval-reproduce ablation-weather serve docker lint typecheck check metrics-fixture
+.PHONY: help install test data-check clean ingest features train eval eval-serve gate-negative eval-refresh eval-reproduce ablation-weather serve docker lint typecheck check metrics-fixture
 .DEFAULT_GOAL := help
 
 help:
@@ -21,13 +21,14 @@ help:
 	@echo   features        - Build and inspect the example feature frame
 	@echo   train           - Run model training CLI
 	@echo   eval            - Run model evaluation benchmark from frozen fixture
+	@echo   eval-serve      - Verify pinned serve artifacts and deterministic predictions
 	@echo   gate-negative   - Run gate on negative control fixture and assert rejection
 	@echo   eval-refresh    - Rebuild and refresh frozen evaluation fixture (slow, manual)
 	@echo   eval-reproduce  - Retrain 15 folds and verify candidate predictions against fixture (slow, manual)
 	@echo   ablation-weather - Run pre-registered weather removal ablation against fixture
 	@echo   metrics-fixture - Regenerate frozen split metrics fixture from eval run
-	@echo   serve           - Run service API (arrives in P4)
-	@echo   docker          - Build Docker image (arrives in P5)
+	@echo   serve           - Run service API
+	@echo   docker          - Build production Docker image
 	@echo   lint            - Run ruff linter
 	@echo   typecheck       - Run mypy type checker
 
@@ -46,10 +47,10 @@ clean:
 	"$(PYTHON)" -c "import glob, os, shutil; [shutil.rmtree(p, ignore_errors=True) for p in ['.venv', '.pytest_cache', '.mypy_cache', '.ruff_cache', 'build', 'dist', *glob.glob('src/*.egg-info'), *glob.glob('*.egg-info')]]; [os.remove(f) for f in glob.glob('**/*.pyc', recursive=True)]; [shutil.rmtree(d, ignore_errors=True) for d in glob.glob('**/__pycache__', recursive=True)]; os.remove('.coverage') if os.path.exists('.coverage') else None"
 
 ingest:
-	"$(PY)" -m gridcast ingest --days 2
+	"$(PY)" -m gridcast ingest --catch-up
 	"$(PY)" -m gridcast ingest --reconcile-recent
-	"$(PY)" -m gridcast ingest --weather --days 2
-	"$(PY)" -m gridcast ingest --mix --days 2
+	"$(PY)" -m gridcast ingest --weather --catch-up
+	"$(PY)" -m gridcast ingest --mix --catch-up
 
 features:
 	"$(PY)" -m gridcast.cli features
@@ -59,6 +60,9 @@ train:
 
 eval:
 	"$(PY)" -m gridcast.cli eval
+
+eval-serve:
+	"$(PY)" -m gridcast.cli eval-serve
 
 gate-negative:
 	"$(PY)" -m gridcast.cli gate-negative
@@ -80,7 +84,7 @@ serve:
 	"$(PY)" -m gridcast.cli serve --run
 
 docker:
-	"$(PY)" -c "from gridcast._phase import todo; todo('P5', 'Dockerfile')"
+	docker build -t gridcast:latest .
 
 lint:
 	"$(PY)" -m ruff check src tests

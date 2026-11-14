@@ -843,7 +843,7 @@ def test_serve_additional_coverage(client: TestClient, tmp_path: Path) -> None:
     token = "coverage-token"
     bad_interval = tmp_path / "bad_interval.json"
     bad_interval.write_text(json.dumps({"no_quantiles": True}), encoding="utf-8")
-    cov_app = create_app(interval_path=bad_interval)
+    cov_app = create_app(interval_path=bad_interval, verify_startup=False)
     with TestClient(cov_app, raise_server_exceptions=False) as cov_c:
         import os
         os.environ["GRIDCAST_RELOAD_TOKEN"] = token
@@ -1213,7 +1213,11 @@ def test_concurrent_forecast_and_reload_atomic_consistency(
     i_file = tmp_path / "interval.json"
     i_file.write_text(interval_text_1, encoding="utf-8")
 
-    app_instance = create_app(model_path=m_file, interval_path=i_file)
+    app_instance = create_app(
+        model_path=m_file,
+        interval_path=i_file,
+        verify_startup=False,
+    )
     init_snap = app_instance.state.service.snapshot
     hash_v1 = (init_snap.content_sha256, init_snap.interval_sha256)
 
@@ -1478,44 +1482,43 @@ def test_forecast_generation_and_hashes_belong_to_snapshot_and_change_on_reload(
     shutil.copy(DEFAULT_INTERVAL_PATH, ipath)
 
     app_instance = create_app(model_path=mpath, interval_path=ipath)
-    client = TestClient(app_instance)
+    with TestClient(app_instance) as client:
+        # 1. Snapshot 1
+        r1 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+        assert r1.status_code == 200
+        d1 = r1.json()
+        gen1 = d1["generation"]
+        mh1 = d1["model_hash"]
+        ih1 = d1["interval_hash"]
+        assert gen1 == 1
+        assert mh1 == d1["content_sha256"]
+        assert ih1 == d1["interval_sha256"]
 
-    # 1. Snapshot 1
-    r1 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
-    assert r1.status_code == 200
-    d1 = r1.json()
-    gen1 = d1["generation"]
-    mh1 = d1["model_hash"]
-    ih1 = d1["interval_hash"]
-    assert gen1 == 1
-    assert mh1 == d1["content_sha256"]
-    assert ih1 == d1["interval_sha256"]
+        # 2. Modify both model and interval artifacts
+        text = mpath.read_text(encoding="utf-8").replace("version=v4", "version=v4_updated")
+        mpath.write_text(text, encoding="utf-8")
+        idata = json.loads(ipath.read_text(encoding="utf-8"))
+        idata["quantiles"]["1"]["q10"] = float(idata["quantiles"]["1"]["q10"]) - 0.5
+        ipath.write_text(json.dumps(idata), encoding="utf-8")
 
-    # 2. Modify both model and interval artifacts
-    text = mpath.read_text(encoding="utf-8").replace("version=v4", "version=v4_updated")
-    mpath.write_text(text, encoding="utf-8")
-    idata = json.loads(ipath.read_text(encoding="utf-8"))
-    idata["quantiles"]["1"]["q10"] = float(idata["quantiles"]["1"]["q10"]) - 0.5
-    ipath.write_text(json.dumps(idata), encoding="utf-8")
+        # 3. Reload
+        r_reload = client.post("/reload", headers={"Authorization": f"Bearer {token}"})
+        assert r_reload.status_code == 200
+        assert r_reload.json()["generation"] == gen1 + 1
 
-    # 3. Reload
-    r_reload = client.post("/reload", headers={"Authorization": f"Bearer {token}"})
-    assert r_reload.status_code == 200
-    assert r_reload.json()["generation"] == gen1 + 1
+        # 4. Snapshot 2: verify all three changed together
+        r2 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+        assert r2.status_code == 200
+        d2 = r2.json()
+        gen2 = d2["generation"]
+        mh2 = d2["model_hash"]
+        ih2 = d2["interval_hash"]
 
-    # 4. Snapshot 2: verify all three changed together
-    r2 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
-    assert r2.status_code == 200
-    d2 = r2.json()
-    gen2 = d2["generation"]
-    mh2 = d2["model_hash"]
-    ih2 = d2["interval_hash"]
-
-    assert gen2 == gen1 + 1
-    assert mh2 != mh1
-    assert ih2 != ih1
-    assert mh2 == d2["content_sha256"]
-    assert ih2 == d2["interval_sha256"]
+        assert gen2 == gen1 + 1
+        assert mh2 != mh1
+        assert ih2 != ih1
+        assert mh2 == d2["content_sha256"]
+        assert ih2 == d2["interval_sha256"]
 
 
 def test_forecast_explicit_date_bounded_cache_and_clear_on_reload(
@@ -1543,96 +1546,95 @@ def test_forecast_explicit_date_bounded_cache_and_clear_on_reload(
         interval_path=ipath,
         curated_dir=cpath,
     )
-    client = TestClient(app_instance)
+    with TestClient(app_instance) as client:
+        # Warm up app status
+        client.get("/health")
 
-    # Warm up app status
-    client.get("/health")
+        st = app_instance.state.service
+        orig_build = serve_module.build_example_frame
+        builder_calls: list[Any] = []
 
-    st = app_instance.state.service
-    orig_build = serve_module.build_example_frame
-    builder_calls: list[Any] = []
+        def counting_build(*args: Any, **kwargs: Any) -> pd.DataFrame:
+            issue_times = kwargs.get("issue_times") or (args[3] if len(args) > 3 else None)
+            builder_calls.append(issue_times)
+            return orig_build(*args, **kwargs)
 
-    def counting_build(*args: Any, **kwargs: Any) -> pd.DataFrame:
-        issue_times = kwargs.get("issue_times") or (args[3] if len(args) > 3 else None)
-        builder_calls.append(issue_times)
-        return orig_build(*args, **kwargs)
+        with patch.object(serve_module, "build_example_frame", side_effect=counting_build):
+            # 1. First request for date=2026-11-01: cache miss, builds frame
+            r1 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+            assert r1.status_code == 200
+            initial_builds = len(builder_calls)
+            assert initial_builds >= 1
+            assert st.cache_hits == 0
+            assert st.cache_misses == 1
+            orig_sha = r1.json()["content_sha256"]
 
-    with patch.object(serve_module, "build_example_frame", side_effect=counting_build):
-        # 1. First request for date=2026-11-01: cache miss, builds frame
-        r1 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
-        assert r1.status_code == 200
-        initial_builds = len(builder_calls)
-        assert initial_builds >= 1
-        assert st.cache_hits == 0
-        assert st.cache_misses == 1
-        orig_sha = r1.json()["content_sha256"]
+            # 2. Second request within TTL: cache hit, must NOT call builder again
+            r2 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+            assert r2.status_code == 200
+            assert len(builder_calls) == initial_builds, (
+                f"Builder was called again within TTL: {len(builder_calls)} > {initial_builds}"
+            )
+            assert st.cache_hits == 1
+            assert st.cache_misses == 1
+            assert r2.json()["content_sha256"] == orig_sha
 
-        # 2. Second request within TTL: cache hit, must NOT call builder again
-        r2 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
-        assert r2.status_code == 200
-        assert len(builder_calls) == initial_builds, (
-            f"Builder was called again within TTL: {len(builder_calls)} > {initial_builds}"
-        )
-        assert st.cache_hits == 1
-        assert st.cache_misses == 1
-        assert r2.json()["content_sha256"] == orig_sha
+            # 3. Third request within TTL: another cache hit
+            r3 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+            assert r3.status_code == 200
+            assert len(builder_calls) == initial_builds
+            assert st.cache_hits == 2
+            assert st.cache_misses == 1
 
-        # 3. Third request within TTL: another cache hit
-        r3 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
-        assert r3.status_code == 200
-        assert len(builder_calls) == initial_builds
-        assert st.cache_hits == 2
-        assert st.cache_misses == 1
+            # 4. Modify model file on disk
+            text = mpath.read_text(encoding="utf-8").replace("version=v4", "version=v4_updated")
+            mpath.write_text(text, encoding="utf-8")
+            expected_new_sha = get_model_artifact_hash(mpath)
+            assert expected_new_sha != orig_sha
 
-        # 4. Modify model file on disk
-        text = mpath.read_text(encoding="utf-8").replace("version=v4", "version=v4_updated")
-        mpath.write_text(text, encoding="utf-8")
-        expected_new_sha = get_model_artifact_hash(mpath)
-        assert expected_new_sha != orig_sha
+            # 5. POST /reload clears cache and loads new model
+            r_rel = client.post("/reload", headers={"Authorization": f"Bearer {token}"})
+            assert r_rel.status_code == 200
+            assert r_rel.json()["status"] == "reloaded"
 
-        # 5. POST /reload clears cache and loads new model
-        r_rel = client.post("/reload", headers={"Authorization": f"Bearer {token}"})
-        assert r_rel.status_code == 200
-        assert r_rel.json()["status"] == "reloaded"
+            # 6. Request inside TTL window: cache miss, rebuilds frame with new content_sha256
+            r4 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+            assert r4.status_code == 200
+            assert len(builder_calls) > initial_builds, (
+                "Builder was not called after reload cache clear"
+            )
+            assert st.cache_hits == 2
+            assert st.cache_misses == 2
+            assert r4.json()["content_sha256"] == expected_new_sha
 
-        # 6. Request inside TTL window: cache miss, rebuilds frame and carries new content_sha256
-        r4 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
-        assert r4.status_code == 200
-        assert len(builder_calls) > initial_builds, (
-            "Builder was not called after reload cache clear"
-        )
-        assert st.cache_hits == 2
-        assert st.cache_misses == 2
-        assert r4.json()["content_sha256"] == expected_new_sha
+            # 7. Request again with same new model: cache hit inside TTL
+            builds_after_reload = len(builder_calls)
+            r5 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+            assert r5.status_code == 200
+            assert len(builder_calls) == builds_after_reload
+            assert st.cache_hits == 3
+            assert st.cache_misses == 2
 
-        # 7. Request again with same new model: cache hit inside TTL
-        builds_after_reload = len(builder_calls)
-        r5 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
-        assert r5.status_code == 200
-        assert len(builder_calls) == builds_after_reload
-        assert st.cache_hits == 3
-        assert st.cache_misses == 2
+            # 8. Curated store freshness change: touch/modify partition so freshness key changes
+            # Freshness is (newest_period, mtime). Updating mtime inside TTL must invalidate cache!
+            partitions = sorted(cpath.glob("date=*.parquet"))
+            assert len(partitions) > 0
+            latest_partition = partitions[-1]
+            import time as time_mod
+            # Touch partition to update mtime
+            new_mtime = latest_partition.stat().st_mtime + 10.0
+            time_mod.sleep(0.01)
+            import os
+            os.utime(latest_partition, (new_mtime, new_mtime))
 
-        # 8. Curated store freshness change: touch/modify partition so freshness key changes
-        # Freshness is (newest_period, mtime). Updating mtime inside TTL must invalidate cache!
-        partitions = sorted(cpath.glob("date=*.parquet"))
-        assert len(partitions) > 0
-        latest_partition = partitions[-1]
-        import time as time_mod
-        # Touch partition to update mtime
-        new_mtime = latest_partition.stat().st_mtime + 10.0
-        time_mod.sleep(0.01)
-        import os
-        os.utime(latest_partition, (new_mtime, new_mtime))
-
-        # 9. Request inside TTL window after freshness change: cache miss, rebuilds frame
-        r6 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
-        assert r6.status_code == 200
-        assert len(builder_calls) > builds_after_reload, (
-            "Builder was not called after curated freshness changed"
-        )
-        assert st.cache_hits == 3
-        assert st.cache_misses == 3
+            # 9. Request inside TTL window after freshness change: cache miss, rebuilds frame
+            r6 = client.get(f"/forecast?hours=48&date={SAMPLE_ISSUE_DATE}")
+            assert r6.status_code == 200
+            assert len(builder_calls) > builds_after_reload, (
+                "Builder was not called after curated freshness changed"
+            )
+            assert st.cache_hits == 3
+            assert st.cache_misses == 3
 
 
 def test_forecast_hours_point_counts_and_contains_future_points(client: TestClient) -> None:
@@ -1647,6 +1649,310 @@ def test_forecast_hours_point_counts_and_contains_future_points(client: TestClie
         )
         assert "contains_future_points" in data
         assert isinstance(data["contains_future_points"], bool)
+
+
+def test_ready_endpoint_single_publish_deadline_field(client: TestClient) -> None:
+    """GET /ready returns publish_deadline_utc and does not return duplicate deadline field."""
+    from gridcast.serve import PUBLISH_DEADLINE_UTC
+
+    resp = client.get("/ready")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "publish_deadline_utc" in data
+    assert data["publish_deadline_utc"] == PUBLISH_DEADLINE_UTC
+    assert "deadline" not in data, "Duplicate 'deadline' field must be removed from /ready response"
+
+
+def test_startup_verification_success_and_logging(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Startup verification succeeds on valid artifacts and logs the live model provenance."""
+    import lightgbm as lgb
+
+    from gridcast.backtest import PINNED_EVAL_FIXTURE_SHA256
+    from gridcast.models import (
+        EXPECTED_INTERVAL_SHA256,
+        EXPECTED_MODEL_SHA256,
+        MODEL_VERSION,
+    )
+    from gridcast.serve import GATE_VALUE, verify_startup_environment
+
+    version, m_sha, i_sha, gate_val, fix_sha = verify_startup_environment()
+    assert version == MODEL_VERSION
+    assert m_sha == EXPECTED_MODEL_SHA256
+    assert i_sha == EXPECTED_INTERVAL_SHA256
+    assert gate_val == GATE_VALUE
+    assert fix_sha == PINNED_EVAL_FIXTURE_SHA256
+
+    captured = capsys.readouterr()
+    log_output = captured.out + captured.err
+    assert "Live model:" in log_output
+    assert f"version={MODEL_VERSION}" in log_output
+    assert f"lightgbm={lgb.__version__}" in log_output
+    assert f"model_sha256={EXPECTED_MODEL_SHA256}" in log_output
+    assert f"interval_sha256={EXPECTED_INTERVAL_SHA256}" in log_output
+    assert f"gate_value={GATE_VALUE:.3f}" in log_output
+    assert f"fixture_sha256={PINNED_EVAL_FIXTURE_SHA256}" in log_output
+
+
+def test_startup_refusal_when_lightgbm_version_mismatches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """App refuses to start when installed LightGBM version differs from build record."""
+    import lightgbm as lgb
+
+    from gridcast.serve import verify_startup_environment
+
+    real_version = lgb.__version__
+    tampered_version = "99.0.0"
+    assert tampered_version != real_version, "Precondition: tampered version must differ"
+
+    # 1. Monkeypatch lgb.__version__ and ensure env override cannot bypass it
+    monkeypatch.setattr(lgb, "__version__", tampered_version)
+    monkeypatch.setenv("GRIDCAST_LIGHTGBM_VERSION_OVERRIDE", real_version)
+    with pytest.raises(RuntimeError, match=r"installed LightGBM version.*does not match"):
+        verify_startup_environment()
+
+    monkeypatch.delenv("GRIDCAST_LIGHTGBM_VERSION_OVERRIDE", raising=False)
+    monkeypatch.setattr(lgb, "__version__", real_version)
+
+    # 2. Test via tampered runtime.json
+    fake_runtime = tmp_path / "runtime.json"
+    fake_runtime.write_text(json.dumps({"lightgbm_version": "0.1.0"}), encoding="utf-8")
+    assert json.loads(fake_runtime.read_text())["lightgbm_version"] != real_version, (
+        "Precondition: fake runtime version must differ"
+    )
+
+    with pytest.raises(RuntimeError, match=r"installed LightGBM version.*does not match"):
+        verify_startup_environment(runtime_path=fake_runtime)
+
+
+def test_startup_refusal_when_runtime_json_missing_or_invalid(tmp_path: Path) -> None:
+    """App refuses to start if runtime.json is missing, unparseable, or lacks lightgbm_version."""
+    import lightgbm as lgb
+
+    from gridcast.models import EXPECTED_INTERVAL_SHA256, EXPECTED_MODEL_SHA256
+    from gridcast.serve import verify_startup_environment
+
+    missing_runtime = tmp_path / "does_not_exist.json"
+    with pytest.raises(RuntimeError, match=r"runtime metadata.*not found"):
+        verify_startup_environment(runtime_path=missing_runtime)
+
+    corrupt_runtime = tmp_path / "corrupt_runtime.json"
+    corrupt_runtime.write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(RuntimeError, match=r"Failed to read runtime artifact"):
+        verify_startup_environment(runtime_path=corrupt_runtime)
+
+    no_ver_runtime = tmp_path / "no_ver_runtime.json"
+    no_ver_runtime.write_text(
+        json.dumps({
+            "model_sha256": EXPECTED_MODEL_SHA256,
+            "interval_sha256": EXPECTED_INTERVAL_SHA256,
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match=r"missing 'lightgbm_version'"):
+        verify_startup_environment(runtime_path=no_ver_runtime)
+
+    # Verify runtime.json artifact hashes are enforced even when expected_*_sha256=None
+    bad_hash_runtime = tmp_path / "bad_hash_runtime.json"
+    bad_hash_runtime.write_text(
+        json.dumps({
+            "lightgbm_version": lgb.__version__,
+            "model_sha256": "0" * 64,
+            "interval_sha256": EXPECTED_INTERVAL_SHA256,
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match=r"does not match runtime record"):
+        verify_startup_environment(
+            runtime_path=bad_hash_runtime,
+            expected_model_sha256=None,
+            expected_interval_sha256=None,
+        )
+
+
+def test_startup_refusal_when_model_hash_altered(tmp_path: Path) -> None:
+    """App refuses to start when model artifact SHA-256 does not match EXPECTED_MODEL_SHA256."""
+    from gridcast.models import EXPECTED_MODEL_SHA256, get_model_artifact_hash
+    from gridcast.serve import create_app, verify_startup_environment
+
+    tampered_model = tmp_path / "tampered_model.txt"
+    tampered_model.write_text("tampered model content\n", encoding="utf-8")
+    tampered_hash = get_model_artifact_hash(tampered_model)
+
+    assert tampered_hash != EXPECTED_MODEL_SHA256, (
+        "Precondition: tampered model hash must differ from expected"
+    )
+
+    with pytest.raises(RuntimeError, match=r"model artifact SHA-256.*does not match expected"):
+        verify_startup_environment(model_path=tampered_model)
+
+    with pytest.raises(RuntimeError, match=r"model artifact SHA-256.*does not match expected"):
+        create_app(model_path=tampered_model)
+
+
+def test_startup_refusal_when_interval_hash_altered(tmp_path: Path) -> None:
+    """App refuses to start when interval SHA-256 does not match EXPECTED_INTERVAL_SHA256."""
+    from gridcast.models import EXPECTED_INTERVAL_SHA256
+    from gridcast.serve import _file_sha256, create_app, verify_startup_environment
+
+    tampered_interval = tmp_path / "tampered_interval.json"
+    tampered_interval.write_text(json.dumps({"tampered": True}), encoding="utf-8")
+    tampered_hash = _file_sha256(tampered_interval)
+
+    assert tampered_hash != EXPECTED_INTERVAL_SHA256, (
+        "Precondition: tampered interval hash must differ from expected"
+    )
+
+    with pytest.raises(RuntimeError, match=r"interval artifact SHA-256.*does not match expected"):
+        verify_startup_environment(interval_path=tampered_interval)
+
+    with pytest.raises(RuntimeError, match=r"interval artifact SHA-256.*does not match expected"):
+        create_app(interval_path=tampered_interval)
+
+
+def test_startup_refusal_when_runtime_json_hashes_tampered(tmp_path: Path) -> None:
+    """App refuses to start when runtime.json model or interval hash mismatches artifacts."""
+    import lightgbm as lgb
+
+    from gridcast.models import EXPECTED_INTERVAL_SHA256, EXPECTED_MODEL_SHA256
+    from gridcast.serve import verify_startup_environment
+
+    bad_model_runtime = tmp_path / "runtime_bad_model.json"
+    bad_model_runtime.write_text(
+        json.dumps({
+            "lightgbm_version": lgb.__version__,
+            "model_sha256": "0" * 64,
+            "interval_sha256": EXPECTED_INTERVAL_SHA256,
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match=r"does not match runtime record"):
+        verify_startup_environment(runtime_path=bad_model_runtime)
+
+    bad_interval_runtime = tmp_path / "runtime_bad_interval.json"
+    bad_interval_runtime.write_text(
+        json.dumps({
+            "lightgbm_version": lgb.__version__,
+            "model_sha256": EXPECTED_MODEL_SHA256,
+            "interval_sha256": "f" * 64,
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match=r"does not match runtime record"):
+        verify_startup_environment(runtime_path=bad_interval_runtime)
+
+
+def test_reload_rejects_invalid_features_and_invalid_intervals_with_422(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """POST /reload returns 422 and keeps active snapshot on wrong features or bad intervals."""
+    import shutil
+
+    import lightgbm as lgb
+
+    token = "reload-validation-token"
+    monkeypatch.setenv("GRIDCAST_RELOAD_TOKEN", token)
+
+    mpath = tmp_path / "model.txt"
+    ipath = tmp_path / "interval.json"
+    shutil.copy(DEFAULT_MODEL_PATH, mpath)
+    shutil.copy(DEFAULT_INTERVAL_PATH, ipath)
+    valid_model_text = mpath.read_text(encoding="utf-8")
+    valid_interval_text = ipath.read_text(encoding="utf-8")
+
+    app_instance = create_app(model_path=mpath, interval_path=ipath)
+    with TestClient(app_instance) as c:
+        init_model = c.get("/model").json()
+        init_sha = init_model["content_sha256"]
+        init_isha = init_model["interval_sha256"]
+        init_gen = init_model["generation"]
+
+        # 1. Wrong booster features -> 422, snapshot unchanged
+        X_bad = pd.DataFrame({"horizon": [1.0, 2.0], "hour_of_day": [0.0, 1.0]})
+        y_bad = np.array([100.0, 120.0])
+        ds_bad = lgb.Dataset(X_bad, label=y_bad)
+        bad_booster = lgb.train(
+            {
+                "objective": "regression_l1",
+                "verbose": -1,
+                "min_data_in_bin": 1,
+                "min_data_in_leaf": 1,
+            },
+            ds_bad,
+            num_boost_round=1,
+        )
+        bad_booster.save_model(str(mpath))
+
+        r_wrong_feat = c.post("/reload", headers={"Authorization": f"Bearer {token}"})
+        assert r_wrong_feat.status_code == 422
+        assert c.get("/model").json()["content_sha256"] == init_sha
+        assert c.get("/model").json()["generation"] == init_gen
+
+        # Restore valid model
+        mpath.write_text(valid_model_text, encoding="utf-8")
+
+        # 2. Inverted interval quantiles (q10 > 0 > q90) -> 422, snapshot unchanged
+        inverted = json.loads(valid_interval_text)
+        inverted["quantiles"]["1"] = {"q10": 50.0, "q90": -50.0}
+        ipath.write_text(json.dumps(inverted), encoding="utf-8")
+
+        r_inverted = c.post("/reload", headers={"Authorization": f"Bearer {token}"})
+        assert r_inverted.status_code == 422
+        assert c.get("/model").json()["interval_sha256"] == init_isha
+        assert c.get("/model").json()["generation"] == init_gen
+
+        fc_resp = c.get(f"/forecast?hours=1&date={SAMPLE_ISSUE_DATE}")
+        assert fc_resp.status_code == 200
+        for pt in fc_resp.json()["points"]:
+            assert pt["lower"] <= pt["value"] <= pt["upper"]
+
+        # 3. Incomplete horizons (missing "96") -> 422
+        incomplete = json.loads(valid_interval_text)
+        del incomplete["quantiles"]["96"]
+        ipath.write_text(json.dumps(incomplete), encoding="utf-8")
+        r_incomplete = c.post("/reload", headers={"Authorization": f"Bearer {token}"})
+        assert r_incomplete.status_code == 422
+        assert c.get("/model").json()["generation"] == init_gen
+
+        # 4. Positive q10 violating q10 <= 0.0 <= q90 -> 422
+        positive_q10 = json.loads(valid_interval_text)
+        positive_q10["quantiles"]["1"] = {"q10": 1.0, "q90": 10.0}
+        ipath.write_text(json.dumps(positive_q10), encoding="utf-8")
+        r_pos_q10 = c.post("/reload", headers={"Authorization": f"Bearer {token}"})
+        assert r_pos_q10.status_code == 422
+        assert c.get("/model").json()["generation"] == init_gen
+
+
+def test_import_gridcast_serve_outside_repo_and_deferred_lifespan(tmp_path: Path) -> None:
+    """import gridcast.serve works from any CWD; deferred startup enforces checks on lifespan."""
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "-c", "import gridcast.serve; assert gridcast.serve.__all__ == []"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr: {proc.stderr}\nstdout: {proc.stdout}"
+
+    deferred_app = create_app(
+        model_path=tmp_path / "missing_model.txt",
+        interval_path=tmp_path / "missing_interval.json",
+        runtime_path=tmp_path / "missing_runtime.json",
+        defer_startup=True,
+    )
+    with (
+        pytest.raises(RuntimeError, match=r"runtime metadata.*not found"),
+        TestClient(deferred_app),
+    ):
+        pass
+
 
 
 

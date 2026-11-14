@@ -24,6 +24,9 @@ from gridcast.features import (
 
 __all__: list[str] = [
     "DEFAULT_LGBM_PARAMS",
+    "EXPECTED_INTERVAL_SHA256",
+    "EXPECTED_LIGHTGBM_VERSION",
+    "EXPECTED_MODEL_SHA256",
     "MODEL_VERSION",
     "assert_baseline_provenance",
     "get_model_artifact_hash",
@@ -289,6 +292,13 @@ def model_artifact_hash(booster: lgb.Booster) -> str:
 
 
 MODEL_VERSION: Final[str] = "lgbm-v2"
+EXPECTED_MODEL_SHA256: Final[str] = (
+    "1cd13471d793735748f81d17fb195e34f6f784e8f642ac60a16f016280c45310"
+)
+EXPECTED_INTERVAL_SHA256: Final[str] = (
+    "ab94aa7135bc797e4c81993a65c96702088dc02d845d0c4262aaf133e46b8965"
+)
+EXPECTED_LIGHTGBM_VERSION: Final[str] = "4.7.0"
 
 
 def get_model_version() -> str:

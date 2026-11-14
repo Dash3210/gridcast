@@ -2813,6 +2813,98 @@ def test_weather_coverage_is_complete() -> None:
         assert len(weather_gaps) == 0, f"Found recorded weather gaps: {weather_gaps}"
 
 
+def test_compute_catch_up_days_handles_lagging_current_and_empty_stores(tmp_path: Path) -> None:
+    """compute_catch_up_days computes max(2, (today - latest).days + 2) with safe fallbacks."""
+    from gridcast.cli import compute_catch_up_days
+
+    today = date(2026, 11, 14)
+    missing_dir = tmp_path / "missing_store"
+    assert compute_catch_up_days(missing_dir, today=today) == 2
+
+    store = tmp_path / "curated"
+    store.mkdir()
+    # Empty directory -> default 2
+    assert compute_catch_up_days(store, today=today) == 2
+
+    # Unrelated / malformed file names are ignored cleanly -> default 2
+    (store / "date=not-a-date.parquet").write_bytes(b"")
+    assert compute_catch_up_days(store, today=today) == 2
+
+    # 6 days behind (2026-11-08 vs 2026-11-14) -> (14 - 8) + 2 = 8 days
+    (store / "date=2026-11-08.parquet").write_bytes(b"")
+    assert compute_catch_up_days(store, today=today) == 8
+
+    # Up-to-date (2026-11-14 vs 2026-11-14) -> max(2, 0 + 2) = 2 days
+    (store / "date=2026-11-14.parquet").write_bytes(b"")
+    assert compute_catch_up_days(store, today=today) == 2
+
+
+def test_cli_ingest_catch_up_routing_and_conflict_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI ingest --catch-up resolves target store lag and rejects conflicting flags."""
+    from gridcast import cli
+
+    monkeypatch.chdir(tmp_path)
+    today = datetime.now(ZoneInfo("Europe/London")).date()
+    six_days_ago = today - timedelta(days=6)
+
+    for store_name in ("curated", "weather", "mix"):
+        d = tmp_path / "data" / store_name
+        d.mkdir(parents=True)
+        (d / f"date={six_days_ago.isoformat()}.parquet").write_bytes(b"")
+
+    calls: list[tuple[str, date, date]] = []
+
+    def fake_ingest_range(start: date, end: date, **kwargs: object) -> object:
+        calls.append(("curated", start, end))
+        return MagicMock(failures=0)
+
+    def fake_weather_range(start: date, end: date, **kwargs: object) -> object:
+        calls.append(("weather", start, end))
+        return MagicMock(failures=0)
+
+    def fake_mix_range(start: date, end: date, **kwargs: object) -> object:
+        calls.append(("mix", start, end))
+        return MagicMock(failures=0)
+
+    monkeypatch.setattr("gridcast.cli.ingest_range", fake_ingest_range)
+    monkeypatch.setattr("gridcast.cli.ingest_weather_range", fake_weather_range)
+    monkeypatch.setattr("gridcast.cli.ingest_mix_range", fake_mix_range)
+
+    # 6 days behind -> days = 8 -> start = today - 7 days, end = today
+    expected_start_6d = today - timedelta(days=7)
+    assert cli.main(["ingest", "--catch-up"]) == 0
+    assert cli.main(["ingest", "--weather", "--catch-up"]) == 0
+    assert cli.main(["ingest", "--mix", "--catch-up"]) == 0
+    assert calls == [
+        ("curated", expected_start_6d, today),
+        ("weather", expected_start_6d, today),
+        ("mix", expected_start_6d, today),
+    ]
+
+    # Up-to-date store -> falls back to days = 2 -> start = today - 1 day
+    calls.clear()
+    (tmp_path / "data" / "curated" / f"date={today.isoformat()}.parquet").write_bytes(b"")
+    assert cli.main(["ingest", "--catch-up"]) == 0
+    assert calls == [("curated", today - timedelta(days=1), today)]
+
+    # Empty store -> falls back to days = 2
+    calls.clear()
+    (tmp_path / "data" / "curated" / f"date={six_days_ago.isoformat()}.parquet").unlink()
+    (tmp_path / "data" / "curated" / f"date={today.isoformat()}.parquet").unlink()
+    assert cli.main(["ingest", "--catch-up"]) == 0
+    assert calls == [("curated", today - timedelta(days=1), today)]
+
+    # Conflicting flags with --catch-up must exit with code 2
+    assert cli.main(["ingest", "--catch-up", "--days", "3"]) == 2
+    assert "--catch-up cannot be combined" in capsys.readouterr().err
+    assert cli.main(["ingest", "--catch-up", "--start", "2026-11-01", "--end", "2026-11-02"]) == 2
+    assert "--catch-up cannot be combined" in capsys.readouterr().err
+
+
 
 
 

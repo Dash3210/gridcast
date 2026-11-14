@@ -25,7 +25,12 @@ import pytest
 from gridcast.backtest import (
     DEFAULT_EVAL_FIXTURE_PARQUET,
     DEFAULT_EVAL_FIXTURE_SIDECAR,
+    DEFAULT_INTERVAL_PATH,
+    DEFAULT_MODEL_PATH,
     PINNED_EVAL_FIXTURE_SHA256,
+    PINNED_SERVE_INTERVAL_SHA256,
+    PINNED_SERVE_MODEL_SHA256,
+    PINNED_SERVE_PRED_SHA256,
     REQUIRED_FIXTURE_COLUMNS,
     BacktestResults,
     assert_refresh_window_eligibility,
@@ -34,8 +39,15 @@ from gridcast.backtest import (
     refresh_eval_fixture,
     reproduce_eval_fixture,
     verify_fixture_integrity,
+    verify_serve_artifact,
 )
-from gridcast.cli import main, run_eval_cli, run_eval_refresh_cli, run_eval_reproduce_cli
+from gridcast.cli import (
+    main,
+    run_eval_cli,
+    run_eval_refresh_cli,
+    run_eval_reproduce_cli,
+    run_eval_serve_cli,
+)
 
 
 def test_frozen_fixture_structure_and_schema() -> None:
@@ -689,5 +701,121 @@ def test_v2_fixture_retains_v1_and_shares_truth_columns() -> None:
     # Evaluate v2
     res = evaluate_from_fixture(parquet_path=v2_parquet, sidecar_path=v2_sidecar, verbose=False)
     assert math.isclose(res.gate_value, 39.118459, abs_tol=1e-5)
+
+
+def test_verify_serve_artifact_passes_and_is_bitwise_deterministic(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Serve-path gate: pinned model + interval score deterministically with zero delta."""
+    res = verify_serve_artifact(verbose=True)
+    captured = capsys.readouterr().out
+
+    assert res["verdict"] == "PASS"
+    assert res["model_sha256"] == PINNED_SERVE_MODEL_SHA256
+    assert res["interval_sha256"] == PINNED_SERVE_INTERVAL_SHA256
+    assert res["pred_sha256"] == PINNED_SERVE_PRED_SHA256
+    assert res["feature_count"] == 26
+    assert res["row_count"] == 96
+    assert res["pin_match_delta"] == 0.0
+    assert res["repeat_delta"] == 0.0
+
+    assert "SERVE GATE VERDICT: PASS" in captured
+    assert "Pin match delta:             0.00000000" in captured
+    assert "In-process repeat delta:     0.00000000" in captured
+    assert PINNED_SERVE_MODEL_SHA256 in captured
+    assert PINNED_SERVE_PRED_SHA256 in captured
+    assert "26.487" not in captured
+
+
+def test_verify_serve_artifact_refuses_missing_or_corrupted_model(tmp_path: Path) -> None:
+    """P5 R2 attack: missing or corrupted model artifact must fail the serve gate."""
+    missing_model = tmp_path / "missing_lgbm_model.txt"
+    with pytest.raises(FileNotFoundError, match="Model artifact not found"):
+        verify_serve_artifact(model_path=missing_model, verbose=False)
+
+    corrupted_model = tmp_path / "corrupted_lgbm_model.txt"
+    original_text = DEFAULT_MODEL_PATH.read_text(encoding="utf-8")
+    corrupted_text = original_text + "\n# tampered\n"
+    corrupted_model.write_text(corrupted_text, encoding="utf-8")
+    corrupted_sha = hashlib.sha256(corrupted_text.encode("utf-8")).hexdigest()
+    assert corrupted_sha != PINNED_SERVE_MODEL_SHA256, "Precondition failed: hash must differ"
+
+    with pytest.raises(ValueError) as exc_info:
+        verify_serve_artifact(model_path=corrupted_model, verbose=False)
+    msg = str(exc_info.value)
+    assert PINNED_SERVE_MODEL_SHA256 in msg
+    assert corrupted_sha in msg
+
+
+def test_verify_serve_artifact_refuses_missing_or_corrupted_interval(tmp_path: Path) -> None:
+    """P5 R2 attack: missing or corrupted interval artifact must fail the serve gate."""
+    missing_interval = tmp_path / "missing_interval.json"
+    with pytest.raises(FileNotFoundError, match="Interval artifact not found"):
+        verify_serve_artifact(interval_path=missing_interval, verbose=False)
+
+    corrupted_interval = tmp_path / "corrupted_interval.json"
+    original_text = DEFAULT_INTERVAL_PATH.read_text(encoding="utf-8")
+    corrupted_text = original_text.replace(
+        '"empirical_coverage_validation": 0.7931',
+        '"empirical_coverage_validation": 0.5',
+    )
+    corrupted_interval.write_text(corrupted_text, encoding="utf-8")
+    corrupted_sha = hashlib.sha256(corrupted_text.encode("utf-8")).hexdigest()
+    assert corrupted_sha != PINNED_SERVE_INTERVAL_SHA256, "Precondition failed: hash must differ"
+
+    with pytest.raises(ValueError) as exc_info:
+        verify_serve_artifact(interval_path=corrupted_interval, verbose=False)
+    msg = str(exc_info.value)
+    assert PINNED_SERVE_INTERVAL_SHA256 in msg
+    assert corrupted_sha in msg
+
+
+def test_verify_serve_artifact_refuses_prediction_hash_mismatch() -> None:
+    """Serve gate must fail loudly if prediction digest differs from pinned SHA-256."""
+    wrong_pin = "0" * 64
+    assert wrong_pin != PINNED_SERVE_PRED_SHA256, "Precondition failed: pin must differ"
+
+    with pytest.raises(ValueError) as exc_info:
+        verify_serve_artifact(pinned_pred_sha256=wrong_pin, verbose=False)
+    msg = str(exc_info.value)
+    assert wrong_pin in msg
+    assert PINNED_SERVE_PRED_SHA256 in msg
+
+
+def test_verify_serve_artifact_refuses_invalid_interval_bounds(tmp_path: Path) -> None:
+    """Serve gate must refuse if interval quantiles violate lower <= pred <= upper."""
+    interval_data = json.loads(DEFAULT_INTERVAL_PATH.read_text(encoding="utf-8"))
+    interval_data["quantiles"]["1"]["q10"] = 10.0
+    interval_data["quantiles"]["1"]["q90"] = -10.0
+    bad_interval = tmp_path / "bad_interval.json"
+    bad_interval.write_text(json.dumps(interval_data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Interval"):
+        verify_serve_artifact(
+            interval_path=bad_interval,
+            pinned_interval_sha256=None,
+            pinned_pred_sha256=None,
+            verbose=False,
+        )
+
+
+def test_cli_eval_serve_subcommand(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI eval-serve subcommand passes cleanly and exits non-zero on missing artifact."""
+    rc = run_eval_serve_cli(verbose=True)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "SERVE GATE VERDICT: PASS" in out
+
+    rc_main = main(["eval-serve", "--quiet"])
+    assert rc_main == 0
+
+    rc_fail = main(["eval-serve", "--model-path", str(tmp_path / "missing.txt")])
+    assert rc_fail != 0
+    err = capsys.readouterr().err
+    assert "Serve evaluation refused" in err
+
 
 

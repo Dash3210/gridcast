@@ -715,7 +715,7 @@
   4. Numbers consistency across documentation:
      Extended `tests/test_model_card_consistency.py` to parse published figures from `README.md`, `MODEL_CARD.md`, and `docs/decisions.md` and assert candidate `39.118`, operator `11.666`, persistence `53.741`, and seasonal `51.495` match the fixture at published precision. Tests verify that altering any single figure in any of the three files causes an assertion failure.
   5. Hermetic CI workflow (`.github/workflows/ci.yml`):
-     Runs on push and pull request. CI steps execute `make check`, `make eval` (asserting `GATE VERDICT: PASS` and fixture SHA-256), `make gate-negative` (asserting `GATE VERDICT: FAIL`), `make eval-reproduce` (asserting zero delta `0.00000000`), and `git diff --exit-code`.
+     Runs on push and pull request. Originally planned in P5-a to execute `make eval-reproduce` in CI, and updated in Phase P5-b (`ADR-031`) to split cross-platform serve-path determinism (`make eval-serve`) from platform-scoped training reproduction (`make eval-reproduce`). CI `gate` job steps execute `make check`, `make eval` (asserting `GATE VERDICT: PASS` and fixture SHA-256), `make gate-negative` (asserting `GATE VERDICT: FAIL`), `make eval-serve` (asserting `SERVE GATE VERDICT: PASS`, `0.00000000` delta, pinned model SHA-256, and pinned prediction SHA-256), and `git diff --exit-code`, alongside the `docker` job (`ADR-032`).
      No job may read `data/scoreboard/scores.csv`: the gate is strictly a function of the model and the pinned fixture. All checks run offline with zero network calls and zero file modifications under `data/`.
 - Consequences:
   The accuracy gate is fully wired, verified for negative control rejection, mathematically safeguarded against arithmetic drift, and hermetically validated in CI.
@@ -723,3 +723,45 @@
   - Storing the threshold only as a Python constant (rejected: vulnerable to untracked parameter drift).
   - Creating a synthetic mock for the negative control comparison (rejected: must exercise the identical production evaluation gate).
   - Re-evaluating against the live scoreboard during CI (rejected: scoreboard mutates as late actuals arrive; CI gate must depend strictly on pinned fixture).
+
+## ADR-031 — Cross-platform serve-path determinism gate vs. platform-scoped training reproduction
+- Status: accepted
+- Date: 2026-11-14
+- Context:
+  When wiring Phase P5-b CI on `ubuntu-latest`, cross-platform testing established that Linux (`linux-x86_64`) and Windows (`win32-x86_64`) LightGBM `4.7.0` wheels diverge structurally across 30/30 boosting trees during 15-fold retraining (`40.0496` vs `39.1185 gCO2/kWh` on the 15-origin split, and `28.8701` vs `30.7505 gCO2/kWh` on the 30-day golden window in `tests/test_backtest.py`), even when `python` minor version, `lightgbm==4.7.0`, `pandas==2.3.3`, `numpy==2.2.6`, `seed=42`, `deterministic=True`, `force_col_wise=True`, and `num_threads=1` are identical. Because `data/eval/frozen_split_v2.parquet` was authored on Windows, running `make eval-reproduce` on `ubuntu-latest` fails due to OS-level tree-training divergence rather than a model regression.
+  Contrastive evaluation (`clm_decide`) selected `option_b_split_serve_vs_train` (confidence `1.0`): separate platform-independent serve-path inference verification in CI from platform-scoped training-engine determinism.
+- Decision:
+  1. **Platform-independent CI serve gate (`make eval-serve`)**:
+     Add `gridcast eval-serve` (`verify_serve_artifact` in `src/gridcast/backtest.py`), executed in both the CI `gate` job and inside the `docker` job. It loads `data/models/lgbm_model.txt` and `data/models/interval_v2.json`, verifies their LF-normalized SHA-256 digests (`1cd13471d793735748f81d17fb195e34f6f784e8f642ac60a16f016280c45310` and `ab94aa7135bc797e4c81993a65c96702088dc02d845d0c4262aaf133e46b8965`), resolves the 26 canonical features for settled issue `2026-11-01` (96 horizons), asserts finite non-negative predictions and interval bracketing (`lower <= pred <= upper`, `upper > lower`), verifies zero in-process repeat delta (`0.00000000`), and asserts exact little-endian float64 (`<f8`) prediction SHA-256 (`1688bc3f46e4a8e3ae0e4768bf3d800a2771e6b4c96f4039bc919469586c6acf`), which matches bitwise across Windows and Linux.
+  2. **Platform-scoped training reproduction (`make eval-reproduce` & `test_backtest.py`)**:
+     Keep `make eval-reproduce` (`reproduce_eval_fixture`) as a manual, platform-scoped train-path verification command rather than a Linux CI step. In `tests/test_backtest.py`, `test_backtest_engine_determinism_per_platform` pins platform-specific engine determinism separately under `win32-x86_64` and `linux-x86_64` in `tests/fixtures/golden_backtest_metrics.json`.
+  3. **Gate CLI exit-code enforcement (`make eval`)**:
+     `run_eval_cli` (`src/gridcast/cli.py`) returns exit code `1` whenever `verdict != "PASS"` (as well as on fixture SHA-256 or sidecar integrity errors), ensuring `GATE VERDICT: FAIL` never exits `0`. `make gate-negative` continues exiting `0` only when `negative_control.parquet` produces `GATE VERDICT: FAIL`.
+- Consequences:
+  CI verifies both accuracy against the pinned fixture (`make eval`, `make gate-negative`) and bitwise cross-platform inference determinism (`make eval-serve`) hermetically on `ubuntu-latest`, without masking or waiving LightGBM cross-OS training divergence.
+- Alternatives rejected:
+  - Running `make eval-reproduce` in Linux CI with a relaxed tolerance (rejected: masks real regressions behind loose numerical tolerances and confuses training-wheel divergence with serving parity).
+  - Refreezing `frozen_split_v2.parquet` on Linux (rejected: breaks Windows developer reproduction and creates churn without fixing cross-OS training divergence).
+
+## ADR-032 — Production containerisation, dependency lock, startup integrity, and dataset completeness guard
+- Status: accepted
+- Date: 2026-11-14
+- Context:
+  Phase P5-b packages `gridcast` into a production Docker image (`Dockerfile`) and verifies it in a dedicated CI `docker` job. The container must be small (`< 400 MB`), non-root, reproducible across Linux builds, decoupled from daily operational data updates, resistant to tampered model/interval artifacts or mismatched LightGBM versions, and honest about dataset completeness checks.
+- Decision:
+  1. **Multi-stage digest-pinned image and least-privilege user**:
+     `Dockerfile` builds from `python:3.10-slim@sha256:6ff506466f8b1e981719b468cc0023b8ef000b983cdec0eafe119d01f379e31d` in both `builder` and `runtime` stages, installs `libgomp1` for LightGBM in the runtime stage, strips `pip`/`setuptools`/`__pycache__` from `/opt/venv`, runs as non-root `gridcast` (`UID/GID 10001`), configures a `/health` `HEALTHCHECK`, and is gated in CI to `< 400 MB` (`419,430,400` bytes).
+  2. **Hashed Linux `requirements.lock` and `httpx2` dev split**:
+     Runtime dependencies are locked with SHA-256 hashes in `requirements.lock` (30 Linux packages generated via `uv pip compile pyproject.toml --generate-hashes --python-version 3.10 --python-platform linux -o requirements.lock`) and installed with `pip install --require-hashes --no-deps -r requirements.lock`. Because `starlette==1.7.0` imports `httpx2` rather than `httpx` in `starlette.testclient` while `src/gridcast` imports neither, `httpx2>=2.14,<3` is declared in `[project.optional-dependencies].dev` in `pyproject.toml` and omitted from the production runtime lockfile.
+  3. **Read-only operational mounts and single-replica topology**:
+     `.dockerignore` excludes `data/curated/`, `data/mix/`, `data/scoreboard/`, `data/weather/`, `data/audit/`, `data/cache/`, `tests/`, and `docs/` from the image. At runtime, `data/curated`, `data/mix`, and `data/scoreboard` are bind-mounted read-only (`:ro`), and `serve.py`/`features.py` perform zero filesystem writes. The container runs with `--workers 1` (`replicas: 1`) because `ModelSnapshot` reload state and the Prometheus metrics registry live in-process.
+  4. **Mandatory `runtime.json` startup integrity and reload hardening**:
+     `data/models/runtime.json` pins `lightgbm_version` (`4.7.0`), `model_sha256`, and `interval_sha256`. `verify_startup_environment()` (`src/gridcast/serve.py`) runs at Docker build time and service startup (via eager `create_app()` or FastAPI `lifespan` for module-level `app = create_app(defer_startup=True)` so `import gridcast.serve` succeeds from any working directory), requires `runtime.json` to exist and parse cleanly with a non-empty `lightgbm_version`, verifies installed `lightgbm.__version__` directly (with no environment-variable override backdoor), cross-checks disk artifact SHA-256 digests against both `models.py` constants and `runtime.json`, and refuses startup on any mismatch. `POST /reload` validates that reloaded boosters declare exact `FEATURE_COLUMNS` and that reloaded interval quantiles cover all horizons `"1"`..`"96"` with finite `q10 <= 0.0 <= q90`, returning HTTP `422` without mutating the active snapshot on invalid artifacts.
+  5. **Retaining the `eval_today` dataset completeness guard (`clm_verify`: `REJECTED`, p=0.4221) and smart `--catch-up` ingest (`clm_decide`: `option_a_smart_catchup_ingest`, confidence `0.9999`)**:
+     A proposal to relax `verify_curated_dataset_integrity` (`tests/test_data_integrity.py`) so `make data-check` would only check partitions up to a fixed cutoff rather than `eval_today` (`Europe/London`) was evaluated with `clm_verify` and **REJECTED** (`p=0.4221`). The `eval_today` completeness invariant is preserved so missing or stale daily partitions fail loudly. To resolve cold-clone or missed-nightly staleness without weakening the guard, `clm_decide` selected `option_a_smart_catchup_ingest` (confidence `0.9999`): `gridcast ingest --catch-up` inspects the latest `date=YYYY-MM-DD.parquet` partition in the target store and computes `days = max(2, (today_london - latest_date).days + 2)` (defaulting to `2` if empty), and `make ingest` replaces hardcoded `--days 2` with `--catch-up` across curated, `--weather`, and `--mix` so `make ingest && make check` succeeds on any clone regardless of age.
+- Consequences:
+  Production deployments run an immutable, hash-verified, non-root image decoupled from daily data partitions, while startup/reload validation and dataset integrity checks fail loudly on drift or tampering.
+- Alternatives rejected:
+  - Baking `data/curated`, `data/mix`, or `data/scoreboard` into the Docker image (rejected: couples immutable code/model releases to daily data ingests and bloats image size).
+  - Running multiple uvicorn workers (`--workers > 1`) without external state (rejected: splits in-memory `ModelSnapshot` reload state and Prometheus counters across worker processes).
+  - Relaxing `eval_today` completeness in `tests/test_data_integrity.py` (rejected per `clm_verify`, `p=0.4221`: weakens integrity detection for missed nightly ingests).

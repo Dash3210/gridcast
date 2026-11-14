@@ -18,12 +18,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -42,15 +44,24 @@ from prometheus_client import (
     generate_latest,
 )
 
+from gridcast.backtest import PINNED_EVAL_FIXTURE_SHA256
 from gridcast.features import (
     CURATED_DIR_DEFAULT,
+    FEATURE_COLUMNS,
     LONDON_TZ,
     MIX_DIR_DEFAULT,
     build_example_frame,
     issue_time_for_date,
     select_model_inputs,
 )
-from gridcast.models import get_model_artifact_hash, load_model_booster, predict_lgbm
+from gridcast.models import (
+    EXPECTED_INTERVAL_SHA256,
+    EXPECTED_LIGHTGBM_VERSION,
+    EXPECTED_MODEL_SHA256,
+    get_model_artifact_hash,
+    load_model_booster,
+    predict_lgbm,
+)
 
 __all__: list[str] = []
 
@@ -58,8 +69,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_PATH: Path = Path("data/models/lgbm_model.txt")
 DEFAULT_INTERVAL_PATH: Path = Path("data/models/interval_v2.json")
+DEFAULT_RUNTIME_PATH: Path = Path("data/models/runtime.json")
 DEFAULT_SCORES_PATH: Path = Path("data/scoreboard/scores.csv")
 MODEL_VERSION: str = "lgbm-v2"
+GATE_VALUE: float = 39.118
 TRAINING_WINDOW: str = "2024-11-08 to 2026-11-07"
 TRAINING_DATE: str = "2026-11-07"
 
@@ -791,40 +804,170 @@ def _parse_and_validate_anchor(
     return parsed_ts
 
 
+def verify_startup_environment(
+    model_path: Path | str = DEFAULT_MODEL_PATH,
+    interval_path: Path | str = DEFAULT_INTERVAL_PATH,
+    runtime_path: Path | str = DEFAULT_RUNTIME_PATH,
+    expected_model_sha256: str | None = EXPECTED_MODEL_SHA256,
+    expected_interval_sha256: str | None = EXPECTED_INTERVAL_SHA256,
+    expected_lightgbm_version: str | None = None,
+) -> tuple[str, str, str, float, str]:
+    """Verify runtime environment, library versions, and model artifact integrity.
+
+    Refuses to start if:
+    - runtime.json is missing, unparseable, or omits 'lightgbm_version'.
+    - Installed LightGBM version does not match runtime.json or EXPECTED_LIGHTGBM_VERSION.
+    - Model artifact SHA-256 does not match EXPECTED_MODEL_SHA256 or runtime.json.
+    - Interval artifact SHA-256 does not match EXPECTED_INTERVAL_SHA256 or runtime.json.
+
+    Logs live model provenance once on startup.
+
+    Returns:
+        tuple of (model_version, model_sha256, interval_sha256, gate_value, fixture_sha256)
+    """
+    installed_lgb = lgb.__version__
+    r_path = Path(runtime_path)
+    if not r_path.exists():
+        raise RuntimeError(
+            f"Startup verification failed: runtime metadata '{r_path}' not found."
+        )
+
+    try:
+        loaded = json.loads(r_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("runtime metadata must be a JSON object")
+        r_data: dict[str, Any] = loaded
+    except Exception as e:
+        raise RuntimeError(f"Failed to read runtime artifact '{r_path}': {e}") from e
+
+    raw_lgb = r_data.get("lightgbm_version")
+    if not isinstance(raw_lgb, str) or not raw_lgb.strip():
+        raise RuntimeError(
+            f"Startup verification failed: runtime metadata '{r_path}' missing 'lightgbm_version'."
+        )
+    runtime_lgb = raw_lgb.strip()
+
+    if installed_lgb != runtime_lgb:
+        raise RuntimeError(
+            f"Startup verification failed: installed LightGBM version '{installed_lgb}' "
+            f"does not match expected version '{runtime_lgb}'."
+        )
+
+    target_lgb = (
+        expected_lightgbm_version
+        if expected_lightgbm_version is not None
+        else EXPECTED_LIGHTGBM_VERSION
+    )
+    if installed_lgb != target_lgb:
+        raise RuntimeError(
+            f"Startup verification failed: installed LightGBM version '{installed_lgb}' "
+            f"does not match expected version '{target_lgb}'."
+        )
+
+    m_sha = get_model_artifact_hash(model_path)
+    if expected_model_sha256 is not None and m_sha != expected_model_sha256:
+        raise RuntimeError(
+            f"Startup verification failed: model artifact SHA-256 '{m_sha}' "
+            f"does not match expected hash '{expected_model_sha256}'."
+        )
+    runtime_model_sha = r_data.get("model_sha256")
+    if runtime_model_sha is not None:
+        if m_sha != str(runtime_model_sha):
+            raise RuntimeError(
+                f"Startup verification failed: model artifact SHA-256 '{m_sha}' "
+                f"does not match runtime record '{runtime_model_sha}'."
+            )
+        if expected_model_sha256 is not None and str(runtime_model_sha) != expected_model_sha256:
+            raise RuntimeError(
+                f"Startup verification failed: runtime model SHA-256 '{runtime_model_sha}' "
+                f"does not match expected hash '{expected_model_sha256}'."
+            )
+
+    i_sha = _file_sha256(interval_path)
+    if expected_interval_sha256 is not None and i_sha != expected_interval_sha256:
+        raise RuntimeError(
+            f"Startup verification failed: interval artifact SHA-256 '{i_sha}' "
+            f"does not match expected hash '{expected_interval_sha256}'."
+        )
+    runtime_interval_sha = r_data.get("interval_sha256")
+    if runtime_interval_sha is not None:
+        if i_sha != str(runtime_interval_sha):
+            raise RuntimeError(
+                f"Startup verification failed: interval artifact SHA-256 '{i_sha}' "
+                f"does not match runtime record '{runtime_interval_sha}'."
+            )
+        if (
+            expected_interval_sha256 is not None
+            and str(runtime_interval_sha) != expected_interval_sha256
+        ):
+            raise RuntimeError(
+                f"Startup verification failed: runtime interval SHA-256 '{runtime_interval_sha}' "
+                f"does not match expected hash '{expected_interval_sha256}'."
+            )
+
+    log_line = (
+        f"Live model: version={MODEL_VERSION}, lightgbm={installed_lgb}, "
+        f"model_sha256={m_sha}, interval_sha256={i_sha}, "
+        f"gate_value={GATE_VALUE:.3f}, fixture_sha256={PINNED_EVAL_FIXTURE_SHA256}"
+    )
+    logger.info(log_line)
+    print(log_line, flush=True)
+    return (MODEL_VERSION, m_sha, i_sha, GATE_VALUE, PINNED_EVAL_FIXTURE_SHA256)
+
+
 def create_app(
     model_path: Path | str = DEFAULT_MODEL_PATH,
     interval_path: Path | str = DEFAULT_INTERVAL_PATH,
     curated_dir: Path | str = CURATED_DIR_DEFAULT,
     scores_path: Path | str = DEFAULT_SCORES_PATH,
+    runtime_path: Path | str = DEFAULT_RUNTIME_PATH,
+    verify_startup: bool = True,
+    expected_model_sha256: str | None = EXPECTED_MODEL_SHA256,
+    expected_interval_sha256: str | None = EXPECTED_INTERVAL_SHA256,
+    expected_lightgbm_version: str | None = None,
+    defer_startup: bool = False,
 ) -> FastAPI:
     """Factory creating and configuring the gridcast FastAPI forecasting application."""
-    m_p = Path(model_path)
-    i_p = Path(interval_path)
-    c_p = Path(curated_dir)
-    s_p = Path(scores_path)
+    init_lock = threading.Lock()
 
-    # Initialise booster and intervals
-    booster = load_model_booster(m_p)
-    interval_data: dict[str, Any] = {}
-    if i_p.exists():
-        interval_data = json.loads(i_p.read_text(encoding="utf-8"))
-    content_sha256 = get_model_artifact_hash(m_p)
-    interval_sha256 = _file_sha256(i_p) if i_p.exists() else ""
+    def _build_service_state() -> ServiceState:
+        if verify_startup:
+            verify_startup_environment(
+                model_path=model_path,
+                interval_path=interval_path,
+                runtime_path=runtime_path,
+                expected_model_sha256=expected_model_sha256,
+                expected_interval_sha256=expected_interval_sha256,
+                expected_lightgbm_version=expected_lightgbm_version,
+            )
 
-    init_snapshot = ModelSnapshot(
-        booster=booster,
-        interval_data=interval_data,
-        content_sha256=content_sha256,
-        interval_sha256=interval_sha256,
-        state_version=1,
-    )
-    service_state = ServiceState(
-        snapshot=init_snapshot,
-        model_path=m_p,
-        interval_path=i_p,
-        curated_dir=c_p,
-        scores_path=s_p,
-    )
+        m_p = Path(model_path)
+        i_p = Path(interval_path)
+        c_p = Path(curated_dir)
+        s_p = Path(scores_path)
+
+        # Initialise booster and intervals
+        booster = load_model_booster(m_p)
+        interval_data: dict[str, Any] = {}
+        if i_p.exists():
+            interval_data = json.loads(i_p.read_text(encoding="utf-8"))
+        content_sha256 = get_model_artifact_hash(m_p)
+        interval_sha256 = _file_sha256(i_p) if i_p.exists() else ""
+
+        init_snapshot = ModelSnapshot(
+            booster=booster,
+            interval_data=interval_data,
+            content_sha256=content_sha256,
+            interval_sha256=interval_sha256,
+            state_version=1,
+        )
+        return ServiceState(
+            snapshot=init_snapshot,
+            model_path=m_p,
+            interval_path=i_p,
+            curated_dir=c_p,
+            scores_path=s_p,
+        )
 
     registry = CollectorRegistry()
     requests_total = Counter(
@@ -862,12 +1005,28 @@ def create_app(
         registry=registry,
     )
 
+    def _get_service_state() -> ServiceState:
+        st: ServiceState | None = getattr(application.state, "service", None)
+        if st is None:
+            with init_lock:
+                st = getattr(application.state, "service", None)
+                if st is None:
+                    st = _build_service_state()
+                    application.state.service = st
+        return st
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        _get_service_state()
+        yield
+
     application = FastAPI(
         title="gridcast",
         description="Forecasting service for Great Britain's half-hourly grid carbon intensity.",
         version="0.1.0",
+        lifespan=_lifespan,
     )
-    application.state.service = service_state
+    application.state.service = None if defer_startup else _build_service_state()
     application.state.registry = registry
     application.state.requests_total = requests_total
     application.state.request_duration = request_duration
@@ -920,7 +1079,7 @@ def create_app(
         )
 
     def _sync_served_issue_age() -> float:
-        st = application.state.service
+        st = _get_service_state()
         snap = st.snapshot
         served_ts, _, _, _ = get_served_issue_status(st, snap)
         now_utc = datetime.now(timezone.utc)
@@ -953,7 +1112,7 @@ def create_app(
         return lateness, status
 
     def _sync_publish_lateness() -> tuple[float, str]:
-        st = application.state.service
+        st = _get_service_state()
         snap = st.snapshot
         _, is_current, _, _ = get_served_issue_status(st, snap)
         now_utc = datetime.now(timezone.utc)
@@ -963,7 +1122,7 @@ def create_app(
 
     def _sync_mae_metrics() -> None:
         """Sync last measured MAE metrics and sample counts from scores.csv."""
-        sp = application.state.service.scores_path
+        sp = _get_service_state().scores_path
         if not sp.exists():
             return
         try:
@@ -1092,7 +1251,7 @@ def create_app(
 
     @application.get("/health")
     def get_health() -> JSONResponse:
-        st = application.state.service
+        st = _get_service_state()
         snap = st.snapshot
         try:
             freshness_dt = get_data_freshness_at(st.curated_dir)
@@ -1123,7 +1282,7 @@ def create_app(
 
     @application.get("/ready")
     def get_ready() -> JSONResponse:
-        st = application.state.service
+        st = _get_service_state()
         snap = st.snapshot
         served_ts, is_current, fallback_reason, feature_df = get_served_issue_status(st, snap)
         age_seconds = _sync_served_issue_age()
@@ -1139,7 +1298,6 @@ def create_app(
             "served_issue_age_seconds": age_seconds,
             "is_current_issue": is_current,
             "publish_deadline_utc": PUBLISH_DEADLINE_UTC,
-            "deadline": PUBLISH_DEADLINE_UTC,
             "generation": snap.generation,
         }
         if not is_servable:
@@ -1172,7 +1330,7 @@ def create_app(
 
         anchor_ts = _parse_and_validate_anchor(date, issue_time)
 
-        st = application.state.service
+        st = _get_service_state()
         snap = st.snapshot
         today_date = datetime.now(LONDON_TZ).date()
         today_anchor = issue_time_for_date(today_date)
@@ -1283,7 +1441,7 @@ def create_app(
 
     @application.get("/model")
     def get_model() -> dict[str, Any]:
-        snap = application.state.service.snapshot
+        snap = _get_service_state().snapshot
         return {
             "version": snap.version,
             "model_version": snap.version,
@@ -1324,8 +1482,8 @@ def create_app(
                 detail="Unauthorized: Missing or invalid reload token.",
             )
 
-        st = application.state.service
-        # Hold reload writer lock across load, generation increment and swap
+        st = _get_service_state()
+        # Hold reload writer lock across load, validation, generation increment and swap
         with st._reload_lock:
             try:
                 new_booster = load_model_booster(st.model_path)
@@ -1347,6 +1505,76 @@ def create_app(
                     status_code=500,
                     detail="Internal Server Error: Failed to reload model artifact.",
                 ) from e
+
+            expected_features = list(FEATURE_COLUMNS)
+            if new_booster.feature_name() != expected_features:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "ValidationError",
+                        "message": "Reloaded booster features do not match FEATURE_COLUMNS.",
+                    },
+                )
+
+            quantiles_obj = new_interval_data.get("quantiles")
+            if not isinstance(quantiles_obj, dict):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "ValidationError",
+                        "message": "Reloaded interval quantiles must be a JSON object.",
+                    },
+                )
+            for h in range(1, 97):
+                h_key = str(h)
+                q_entry = quantiles_obj.get(h_key)
+                if not isinstance(q_entry, dict):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "ValidationError",
+                            "message": f"Reloaded interval quantiles missing horizon '{h_key}'.",
+                        },
+                    )
+                q10_raw = q_entry.get("q10")
+                q90_raw = q_entry.get("q90")
+                if (
+                    isinstance(q10_raw, bool)
+                    or isinstance(q90_raw, bool)
+                    or not isinstance(q10_raw, (int, float))
+                    or not isinstance(q90_raw, (int, float))
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "ValidationError",
+                            "message": (
+                                f"Reloaded interval horizon '{h_key}' quantiles must be numeric."
+                            ),
+                        },
+                    )
+                q10_val = float(q10_raw)
+                q90_val = float(q90_raw)
+                if not (math.isfinite(q10_val) and math.isfinite(q90_val)):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "ValidationError",
+                            "message": (
+                                f"Reloaded interval horizon '{h_key}' quantiles must be finite."
+                            ),
+                        },
+                    )
+                if not (q10_val <= 0.0 <= q90_val):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "ValidationError",
+                            "message": (
+                                f"Reloaded interval horizon '{h_key}' violates q10 <= 0.0 <= q90."
+                            ),
+                        },
+                    )
 
             # Atomic state swap under lock with strictly increasing generation
             curr_snap = st.snapshot
@@ -1372,7 +1600,7 @@ def create_app(
     return application
 
 
-app: FastAPI = create_app()
+app: FastAPI = create_app(defer_startup=True)
 
 
 def run_serve_cli(
@@ -1382,6 +1610,7 @@ def run_serve_cli(
     interval_path: Path | str = DEFAULT_INTERVAL_PATH,
     curated_dir: Path | str = CURATED_DIR_DEFAULT,
     scores_path: Path | str = DEFAULT_SCORES_PATH,
+    runtime_path: Path | str = DEFAULT_RUNTIME_PATH,
 ) -> int:
     """Run forecast API service with uvicorn."""
     import uvicorn
@@ -1391,6 +1620,8 @@ def run_serve_cli(
         interval_path=interval_path,
         curated_dir=curated_dir,
         scores_path=scores_path,
+        runtime_path=runtime_path,
+        verify_startup=True,
     )
     uvicorn.run(server_app, host=host, port=port)
     return 0
