@@ -43,8 +43,14 @@ jobs:
       # No job may read data/scoreboard/scores.csv: the gate is a function of the model and the pinned fixture, nothing else.
       - name: Run evaluation gate and assert PASS with fixture SHA-256
         run: |
-          EVAL_OUTPUT=$(make eval)
+          set +e
+          EVAL_OUTPUT=$(make eval 2>&1)
+          RC=$?
+          set -e
           echo "$EVAL_OUTPUT"
+          if [ "$RC" -ne 0 ]; then
+            exit "$RC"
+          fi
           echo "$EVAL_OUTPUT" | grep -F "GATE VERDICT: PASS"
           echo "$EVAL_OUTPUT" | grep -F "87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51"
 

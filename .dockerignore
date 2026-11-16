@@ -19,7 +19,4 @@ tests/
 docs/
 data/audit/
 data/cache/
-data/curated/
-data/mix/
-data/scoreboard/
 data/weather/

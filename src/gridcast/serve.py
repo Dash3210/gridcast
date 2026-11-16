@@ -1091,6 +1091,7 @@ def create_app(
     def _compute_publish_lateness(
         now_utc: datetime,
         is_current: bool,
+        served_ts: pd.Timestamp | None = None,
     ) -> tuple[float, str]:
         """Compute publish lateness in seconds and status ('on_time' | 'late')."""
         deadline_h, deadline_m = parse_publish_deadline(PUBLISH_DEADLINE_UTC)
@@ -1107,21 +1108,41 @@ def create_app(
             lateness = (now_utc - next_deadline).total_seconds()
             status = "on_time"
         else:
-            lateness = (now_utc - today_deadline).total_seconds()
+            effective_deadline = today_deadline
+            if served_ts is not None:
+                served_london_date = served_ts.tz_convert(LONDON_TZ).date()
+                expected_next_date = served_london_date + timedelta(days=1)
+                expected_deadline = datetime(
+                    expected_next_date.year,
+                    expected_next_date.month,
+                    expected_next_date.day,
+                    deadline_h,
+                    deadline_m,
+                    tzinfo=timezone.utc,
+                )
+                if expected_deadline < effective_deadline:
+                    effective_deadline = expected_deadline
+            lateness = (now_utc - effective_deadline).total_seconds()
             status = "late" if lateness > 0 else "on_time"
         return lateness, status
 
     def _sync_publish_lateness() -> tuple[float, str]:
         st = _get_service_state()
         snap = st.snapshot
-        _, is_current, _, _ = get_served_issue_status(st, snap)
+        served_ts, is_current, _, feature_df = get_served_issue_status(st, snap)
         now_utc = datetime.now(timezone.utc)
-        lateness_sec, pub_status = _compute_publish_lateness(now_utc, is_current)
+        lateness_sec, pub_status = _compute_publish_lateness(
+            now_utc,
+            is_current,
+            served_ts=served_ts if feature_df is not None else None,
+        )
         publish_lateness_seconds.set(lateness_sec)
         return lateness_sec, pub_status
 
     def _sync_mae_metrics() -> None:
         """Sync last measured MAE metrics and sample counts from scores.csv."""
+        last_measured_mae.clear()
+        last_measured_mae_samples.clear()
         sp = _get_service_state().scores_path
         if not sp.exists():
             return
@@ -1130,124 +1151,121 @@ def create_app(
             if scores_df.empty:
                 return
 
-            def _get_horizons_label(sub_df: pd.DataFrame, default: str = "settled") -> str:
+            def _get_horizons_label(
+                sub_df: pd.DataFrame,
+                default: str = "settled",
+                *,
+                allow_settled_label: bool = True,
+            ) -> str:
                 if "horizon" in sub_df.columns and not sub_df.empty:
                     h_vals = pd.to_numeric(sub_df["horizon"], errors="coerce").dropna()
                     if not h_vals.empty:
                         min_h = int(h_vals.min())
                         max_h = int(h_vals.max())
-                        if min_h == 1 and max_h >= 49:
+                        if allow_settled_label and min_h == 1 and max_h >= 49:
                             return "settled"
                         return f"{min_h}-{max_h}"
                 return default
 
-            # Persistence series
-            if "model_version" in scores_df.columns and "abs_error" in scores_df.columns:
-                pers_mask = scores_df["model_version"].str.startswith("persistence")
-                pers_sub = scores_df.loc[pers_mask].dropna(subset=["abs_error"]).copy()
-                pers_sub = pers_sub[pers_sub["abs_error"] != ""]
-                pers_h_label = _get_horizons_label(pers_sub, default="settled")
-                if not pers_sub.empty:
-                    pers_sub["abs_error"] = pers_sub["abs_error"].astype(float)
-                    if "horizon" in pers_sub.columns:
-                        p_val = float(pers_sub.groupby("horizon")["abs_error"].mean().mean())
+            def _record_series_mae(
+                sub_df: pd.DataFrame,
+                *,
+                series_name: str,
+                error_col: str,
+                present_status: str,
+                present_default_horizons: str,
+                absent_horizons: str,
+            ) -> None:
+                numeric_err = pd.to_numeric(sub_df[error_col], errors="coerce")
+                clean_sub = sub_df.loc[numeric_err.notna()].copy()
+                if not clean_sub.empty:
+                    clean_sub[error_col] = numeric_err.loc[clean_sub.index].astype(float)
+                    h_label = _get_horizons_label(
+                        clean_sub,
+                        default=present_default_horizons,
+                        allow_settled_label=(present_status == "settled"),
+                    )
+                    if "horizon" in clean_sub.columns:
+                        val = float(clean_sub.groupby("horizon")[error_col].mean().mean())
                     else:
-                        p_val = float(pers_sub["abs_error"].mean())
+                        val = float(clean_sub[error_col].mean())
                     last_measured_mae.labels(
-                        series="persistence",
-                        status="settled",
+                        series=series_name,
+                        status=present_status,
                         plane="live_scoreboard",
-                        horizons=pers_h_label,
-                    ).set(p_val)
+                        horizons=h_label,
+                    ).set(val)
                     last_measured_mae_samples.labels(
-                        series="persistence",
+                        series=series_name,
                         plane="live_scoreboard",
-                    ).set(float(len(pers_sub)))
+                    ).set(float(len(clean_sub)))
                 else:
                     last_measured_mae.labels(
-                        series="persistence",
+                        series=series_name,
                         status="absent",
                         plane="live_scoreboard",
-                        horizons="settled",
+                        horizons=absent_horizons,
                     ).set(float("nan"))
                     last_measured_mae_samples.labels(
-                        series="persistence",
+                        series=series_name,
                         plane="live_scoreboard",
                     ).set(0.0)
 
-            # Operator series
-            if "neso_abs_error" in scores_df.columns:
-                oper_mask = (
-                    scores_df["neso_abs_error"].notna()
-                    & (scores_df["neso_abs_error"] != "")
+            if "model_version" in scores_df.columns and "abs_error" in scores_df.columns:
+                mv_series = scores_df["model_version"].fillna("").astype(str)
+                _record_series_mae(
+                    scores_df.loc[mv_series.str.startswith("persistence")],
+                    series_name="persistence",
+                    error_col="abs_error",
+                    present_status="settled",
+                    present_default_horizons="settled",
+                    absent_horizons="settled",
                 )
-                oper_sub = scores_df.loc[oper_mask].copy()
-                oper_h_label = _get_horizons_label(oper_sub, default="1-33")
-                if not oper_sub.empty:
-                    oper_sub["neso_abs_error"] = oper_sub["neso_abs_error"].astype(float)
-                    if "horizon" in oper_sub.columns:
-                        o_val = float(oper_sub.groupby("horizon")["neso_abs_error"].mean().mean())
-                    else:
-                        o_val = float(oper_sub["neso_abs_error"].mean())
-                    # Do not call operator settled; label partial with its horizon range
-                    last_measured_mae.labels(
-                        series="operator",
-                        status="partial",
-                        plane="live_scoreboard",
-                        horizons=oper_h_label,
-                    ).set(o_val)
-                    last_measured_mae_samples.labels(
-                        series="operator",
-                        plane="live_scoreboard",
-                    ).set(float(len(oper_sub)))
-                else:
-                    last_measured_mae.labels(
-                        series="operator",
-                        status="absent",
-                        plane="live_scoreboard",
-                        horizons="partial",
-                    ).set(float("nan"))
-                    last_measured_mae_samples.labels(
-                        series="operator",
-                        plane="live_scoreboard",
-                    ).set(0.0)
 
-            # Candidate series (lgbm-v2)
-            if "model_version" in scores_df.columns and "abs_error" in scores_df.columns:
-                cand_mask = scores_df["model_version"] == "lgbm-v2"
-                cand_sub = scores_df.loc[cand_mask].dropna(subset=["abs_error"]).copy()
-                cand_sub = cand_sub[cand_sub["abs_error"] != ""]
-                cand_h_label = _get_horizons_label(cand_sub, default="settled")
-                if not cand_sub.empty:
-                    cand_sub["abs_error"] = cand_sub["abs_error"].astype(float)
-                    if "horizon" in cand_sub.columns:
-                        c_val = float(cand_sub.groupby("horizon")["abs_error"].mean().mean())
+            if "neso_abs_error" in scores_df.columns:
+                oper_numeric = pd.to_numeric(scores_df["neso_abs_error"], errors="coerce")
+                oper_frame = scores_df.loc[oper_numeric.notna()]
+                if "neso_source" in oper_frame.columns:
+                    src_series = oper_frame["neso_source"].fillna("").astype(str).str.strip()
+                    snap_oper = oper_frame.loc[src_series == "snapshot_at_issue"]
+                    if not snap_oper.empty:
+                        oper_frame = snap_oper
                     else:
-                        c_val = float(cand_sub["abs_error"].mean())
-                    last_measured_mae.labels(
-                        series="candidate",
-                        status="settled",
-                        plane="live_scoreboard",
-                        horizons=cand_h_label,
-                    ).set(c_val)
-                    last_measured_mae_samples.labels(
-                        series="candidate",
-                        plane="live_scoreboard",
-                    ).set(float(len(cand_sub)))
-                else:
-                    # Expose absent series with label and NaN, no plausible constant
-                    last_measured_mae.labels(
-                        series="candidate",
-                        status="absent",
-                        plane="live_scoreboard",
-                        horizons="settled",
-                    ).set(float("nan"))
-                    last_measured_mae_samples.labels(
-                        series="candidate",
-                        plane="live_scoreboard",
-                    ).set(0.0)
+                        arch_oper = oper_frame.loc[src_series == "archive_at_scoring"]
+                        oper_frame = arch_oper if not arch_oper.empty else oper_frame.iloc[0:0]
+                if "issue_time" in oper_frame.columns and "horizon" in oper_frame.columns:
+                    parsed_issue_utc = pd.to_datetime(
+                        oper_frame["issue_time"], utc=True, format="mixed", errors="coerce"
+                    )
+                    dedup_issue_key = parsed_issue_utc.astype(object).where(
+                        parsed_issue_utc.notna(),
+                        oper_frame["issue_time"].astype(str),
+                    )
+                    oper_frame = oper_frame.assign(
+                        _issue_time_utc=dedup_issue_key
+                    ).drop_duplicates(subset=["_issue_time_utc", "horizon"])
+                _record_series_mae(
+                    oper_frame,
+                    series_name="operator",
+                    error_col="neso_abs_error",
+                    present_status="partial",
+                    present_default_horizons="1-33",
+                    absent_horizons="partial",
+                )
+
+            if "model_version" in scores_df.columns and "abs_error" in scores_df.columns:
+                mv_series = scores_df["model_version"].fillna("").astype(str)
+                _record_series_mae(
+                    scores_df.loc[mv_series == "lgbm-v2"],
+                    series_name="candidate",
+                    error_col="abs_error",
+                    present_status="settled",
+                    present_default_horizons="settled",
+                    absent_horizons="settled",
+                )
         except Exception:
-            pass
+            last_measured_mae.clear()
+            last_measured_mae_samples.clear()
 
     @application.get("/health")
     def get_health() -> JSONResponse:

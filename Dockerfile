@@ -1,10 +1,12 @@
 # Multi-stage, non-root production image for gridcast (< 400 MB target).
 # Base image pinned by multi-arch manifest list SHA-256 digest (python:3.10-slim).
 #
-# Runtime data policy (read-only mounts, single replica):
-# - data/curated, data/mix, and data/scoreboard are NOT baked into the image.
-#   Mount them read-only at runtime so daily partition updates and scoreboard
-#   rows stay decoupled from the immutable container image:
+# Runtime data policy (baked operational snapshot + optional read-only mount overlay, single replica):
+# - Committed data/curated, data/mix, and data/scoreboard snapshot files are copied into the
+#   image so stateless deployments (such as Render free tier) boot and serve HTTP 200 on
+#   /health, /ready, and /forecast immediately without external API dependency.
+# - In container orchestration or CI with live/updated stores, mount them read-only at runtime
+#   to cleanly overlay the baked snapshot:
 #     docker run --rm -p 8000:8000 \
 #       -v "$(pwd)/data/curated:/app/data/curated:ro" \
 #       -v "$(pwd)/data/mix:/app/data/mix:ro" \
@@ -58,9 +60,11 @@ ENV PATH="/opt/venv/bin:$PATH" \
 COPY --chown=gridcast:gridcast data/models ./data/models
 COPY --chown=gridcast:gridcast data/eval ./data/eval
 
-# Create mount points for read-only operational stores (curated, mix, scoreboard).
-RUN mkdir -p /app/data/curated /app/data/mix /app/data/scoreboard \
-    && chown -R gridcast:gridcast /app/data
+# Copy committed operational snapshot (curated, mix, scoreboard) so stateless
+# deployments (e.g. Render free tier) serve immediately; runtime :ro mounts overlay these.
+COPY --chown=gridcast:gridcast data/curated ./data/curated
+COPY --chown=gridcast:gridcast data/mix ./data/mix
+COPY --chown=gridcast:gridcast data/scoreboard ./data/scoreboard
 
 # Build-time runtime integrity check: enforce LightGBM version and artifact hashes.
 RUN python -c "import json, lightgbm as lgb; from pathlib import Path; r = json.loads(Path('data/models/runtime.json').read_text(encoding='utf-8')); assert lgb.__version__ == r['lightgbm_version'], f'LightGBM {lgb.__version__} != {r[\"lightgbm_version\"]}'; from gridcast.serve import verify_startup_environment; verify_startup_environment()"
@@ -70,6 +74,6 @@ USER gridcast
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD ["python", "-c", "import sys, urllib.request; resp = urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); sys.exit(0 if resp.status == 200 else 1)"]
+    CMD ["python", "-c", "import os, sys, urllib.request; port = os.environ.get('PORT', '8000'); resp = urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3); sys.exit(0 if resp.status == 200 else 1)"]
 
-CMD ["uvicorn", "gridcast.serve:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["sh", "-c", "exec uvicorn gridcast.serve:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]

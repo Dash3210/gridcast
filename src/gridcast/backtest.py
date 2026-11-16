@@ -47,6 +47,7 @@ from gridcast.models import (
 )
 
 __all__: list[str] = [
+    "DEFAULT_CANDIDATE_FIXTURE_PARQUET",
     "DEFAULT_EVAL_FIXTURE_PARQUET",
     "DEFAULT_EVAL_FIXTURE_SIDECAR",
     "DEFAULT_GATE_THRESHOLD_PATH",
@@ -75,6 +76,7 @@ __all__: list[str] = [
     "compute_skill_score",
     "derive_test_split_origins",
     "emit_weather_ablation_table",
+    "evaluate_candidate_against_fixture",
     "evaluate_from_fixture",
     "evaluate_gap_gate",
     "evaluate_gate",
@@ -90,6 +92,7 @@ __all__: list[str] = [
 
 DEFAULT_EVAL_FIXTURE_PARQUET: Final[Path] = Path("data/eval/frozen_split_v2.parquet")
 DEFAULT_EVAL_FIXTURE_SIDECAR: Final[Path] = Path("data/eval/frozen_split_v2.json")
+DEFAULT_CANDIDATE_FIXTURE_PARQUET: Final[Path] = Path("data/eval/candidate_split.parquet")
 DEFAULT_GATE_THRESHOLD_PATH: Final[Path] = Path("data/eval/gate_threshold.json")
 DEFAULT_MODEL_PATH: Final[Path] = Path("data/models/lgbm_model.txt")
 DEFAULT_INTERVAL_PATH: Final[Path] = Path("data/models/interval_v2.json")
@@ -120,6 +123,15 @@ REQUIRED_FIXTURE_COLUMNS: Final[list[str]] = [
     "seasonal_naive_pred",
     "candidate_pred",
 ]
+TRUTH_FIXTURE_COLUMNS: Final[tuple[str, ...]] = (
+    "issue_time",
+    "horizon",
+    "target_time",
+    "actual",
+    "neso_forecast",
+    "persistence_pred",
+    "seasonal_naive_pred",
+)
 
 EMBARGO_START_DATE: Final[str] = "2026-08-31"
 EMBARGO_END_DATE: Final[str] = "2026-09-04"
@@ -838,34 +850,36 @@ def verify_fixture_integrity(
     return meta
 
 
-def evaluate_from_fixture(
-    parquet_path: Path | str = DEFAULT_EVAL_FIXTURE_PARQUET,
-    sidecar_path: Path | str | None = DEFAULT_EVAL_FIXTURE_SIDECAR,
-    verbose: bool = True,
-    pinned_sha256: str | None = PINNED_EVAL_FIXTURE_SHA256,
-    threshold_path: Path | str = DEFAULT_GATE_THRESHOLD_PATH,
+def _series_byte_hash(series: pd.Series) -> str:
+    """Compute SHA-256 digest of a Series values for strict truth-column comparison."""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        raw = series.astype("int64").to_numpy().tobytes()
+    else:
+        raw = series.to_numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _score_fixture_dataframe(
+    df: pd.DataFrame,
+    *,
+    source_label: Path | str,
+    actual_sha: str,
+    archive_commit: str,
+    threshold_path: Path | str,
+    verbose: bool,
+    candidate_label: str | None = None,
 ) -> BacktestResults:
-    """Read frozen evaluation fixture and compute all benchmark metrics without curated data.
-
-    Verifies sha256 against sidecar and pin, computing GATE_VALUE and baselines directly.
-    """
-    meta = verify_fixture_integrity(
-        parquet_path=parquet_path,
-        sidecar_path=sidecar_path,
-        pinned_sha256=pinned_sha256,
-    )
-    with open(parquet_path, "rb") as f:
-        actual_sha = hashlib.sha256(f.read()).hexdigest()
-    archive_commit = str(meta.get("archive_commit", "3617143"))
-
-    df = pd.read_parquet(parquet_path)
-
+    """Compute per-horizon table, gate scalar, and verdict from an evaluation DataFrame."""
     missing_cols = [c for c in REQUIRED_FIXTURE_COLUMNS if c not in df.columns]
     if missing_cols:
-        raise ValueError(f"Fixture {parquet_path} missing required columns: {missing_cols}")
+        raise ValueError(f"Fixture {source_label} missing required columns: {missing_cols}")
 
     if len(df) != 1440:
         raise ValueError(f"Expected fixture to have 1440 rows, got {len(df)}")
+
+    cand_arr = df["candidate_pred"].to_numpy(dtype=float)
+    if not np.isfinite(cand_arr).all():
+        raise ValueError(f"Fixture {source_label} candidate_pred contains non-finite values")
 
     # Compute per-horizon metrics table
     records: list[dict[str, object]] = []
@@ -994,6 +1008,8 @@ def evaluate_from_fixture(
             sk_str = f"{r['skill_vs_operator']:+.2%}" if pd.notna(r["skill_vs_operator"]) else "N/A"
             print(f"{h_int:<8}{cnt:<10}{m_str:<14}{o_str:<16}{p_str:<14}{s_str:<16}{sk_str:<14}")
         print("=" * 94)
+        if candidate_label is not None:
+            print(f"Candidate Fixture:           {candidate_label}")
 
     verdict = evaluate_gate(
         results,
@@ -1027,6 +1043,96 @@ def evaluate_from_fixture(
         fixture_sha256=actual_sha,
         archive_commit=archive_commit,
         verdict=verdict,
+    )
+
+
+def evaluate_from_fixture(
+    parquet_path: Path | str = DEFAULT_EVAL_FIXTURE_PARQUET,
+    sidecar_path: Path | str | None = DEFAULT_EVAL_FIXTURE_SIDECAR,
+    verbose: bool = True,
+    pinned_sha256: str | None = PINNED_EVAL_FIXTURE_SHA256,
+    threshold_path: Path | str = DEFAULT_GATE_THRESHOLD_PATH,
+) -> BacktestResults:
+    """Read frozen evaluation fixture and compute all benchmark metrics without curated data.
+
+    Verifies sha256 against sidecar and pin, computing GATE_VALUE and baselines directly.
+    """
+    meta = verify_fixture_integrity(
+        parquet_path=parquet_path,
+        sidecar_path=sidecar_path,
+        pinned_sha256=pinned_sha256,
+    )
+    with open(parquet_path, "rb") as f:
+        actual_sha = hashlib.sha256(f.read()).hexdigest()
+    archive_commit = str(meta.get("archive_commit", "3617143"))
+
+    df = pd.read_parquet(parquet_path)
+    return _score_fixture_dataframe(
+        df,
+        source_label=parquet_path,
+        actual_sha=actual_sha,
+        archive_commit=archive_commit,
+        threshold_path=threshold_path,
+        verbose=verbose,
+    )
+
+
+def evaluate_candidate_against_fixture(
+    candidate_path: Path | str = DEFAULT_CANDIDATE_FIXTURE_PARQUET,
+    ref_parquet_path: Path | str = DEFAULT_EVAL_FIXTURE_PARQUET,
+    ref_sidecar_path: Path | str | None = DEFAULT_EVAL_FIXTURE_SIDECAR,
+    pinned_sha256: str | None = PINNED_EVAL_FIXTURE_SHA256,
+    threshold_path: Path | str = DEFAULT_GATE_THRESHOLD_PATH,
+    verbose: bool = True,
+) -> BacktestResults:
+    """Evaluate a candidate prediction overlay against the pinned frozen reference fixture.
+
+    Verifies the reference fixture SHA-256 against its sidecar and pin, enforces
+    byte-for-byte equality across all truth and baseline columns, and scores
+    ``candidate_pred`` against the accuracy gate threshold.
+    """
+    cand_p = Path(candidate_path)
+    if not cand_p.exists():
+        raise FileNotFoundError(f"Candidate fixture not found at {cand_p}")
+
+    ref_meta = verify_fixture_integrity(
+        parquet_path=ref_parquet_path,
+        sidecar_path=ref_sidecar_path,
+        pinned_sha256=pinned_sha256,
+    )
+    ref_sha = hashlib.sha256(Path(ref_parquet_path).read_bytes()).hexdigest()
+    archive_commit = str(ref_meta.get("archive_commit", "3617143"))
+
+    ref_df = pd.read_parquet(ref_parquet_path)
+    cand_df = pd.read_parquet(cand_p)
+
+    missing_cols = [c for c in REQUIRED_FIXTURE_COLUMNS if c not in cand_df.columns]
+    if missing_cols:
+        raise ValueError(f"Candidate fixture {cand_p} missing required columns: {missing_cols}")
+
+    if len(cand_df) != 1440 or len(ref_df) != 1440:
+        raise ValueError(
+            f"Expected candidate and reference fixtures to have 1440 rows, "
+            f"got {len(cand_df)} and {len(ref_df)}"
+        )
+
+    for col in TRUTH_FIXTURE_COLUMNS:
+        if not cand_df[col].equals(ref_df[col]) or (
+            _series_byte_hash(cand_df[col]) != _series_byte_hash(ref_df[col])
+        ):
+            raise ValueError(
+                f"Candidate fixture {cand_p} truth/baseline column '{col}' "
+                "does not match pinned reference fixture."
+            )
+
+    return _score_fixture_dataframe(
+        cand_df,
+        source_label=cand_p,
+        actual_sha=ref_sha,
+        archive_commit=archive_commit,
+        threshold_path=threshold_path,
+        verbose=verbose,
+        candidate_label=str(cand_p),
     )
 
 

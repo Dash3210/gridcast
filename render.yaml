@@ -1,0 +1,17 @@
+# Render Blueprint for gridcast stateless Docker web service (free tier).
+# Dockerfile bakes the committed data/curated, data/mix, and data/scoreboard snapshot
+# (~11.7 MB) so /health, /ready, and /forecast serve HTTP 200 without persistent disks.
+services:
+  - type: web
+    name: gridcast
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    numInstances: 1
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: GRIDCAST_RELOAD_TOKEN
+        sync: false

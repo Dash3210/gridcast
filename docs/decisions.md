@@ -765,3 +765,41 @@
   - Baking `data/curated`, `data/mix`, or `data/scoreboard` into the Docker image (rejected: couples immutable code/model releases to daily data ingests and bloats image size).
   - Running multiple uvicorn workers (`--workers > 1`) without external state (rejected: splits in-memory `ModelSnapshot` reload state and Prometheus counters across worker processes).
   - Relaxing `eval_today` completeness in `tests/test_data_integrity.py` (rejected per `clm_verify`, `p=0.4221`: weakens integrity detection for missed nightly ingests).
+
+## ADR-033 — Phase P6 failing-gate candidate overlay and Phase P7 multi-model scoreboard & GitHub Pages
+- Status: accepted
+- Date: 2026-11-14
+- Context:
+  Two post-P5 milestones require architectural choices without weakening `main`'s invariants:
+  1. **Phase P6 (Deliberately Failing Accuracy Gate PR)**: Demonstrate a red CI build on a real PR that passes `make check` (`lint`, `typecheck`, `tests`, `data-check`) and fails specifically on `make eval` (`GATE VERDICT: FAIL`, exit `1`) with the full baseline comparison table visible in CI logs. Mutating `data/eval/frozen_split_v2.parquet` or `data/models/lgbm_model.txt` directly causes `tests/test_model_card_consistency.py`, `tests/test_eval_fixture.py`, and `tests/test_serve_api.py` inside `make check` to fail before `make eval` ever executes.
+  2. **Phase P7 (Public Scoreboard, GitHub Pages, and Production Hosting)**: `docs/scoreboard.md` previously reported only 33 points (`2026-11-02` `h=1..33`, `neso_source == "archive_at_scoring"`) and omitted `1,103` settled `neso_source == "none"` rows, while `.github/workflows/nightly.yml` issued only `persistence-v0` (`0` `lgbm-v2` rows in `forecasts.parquet`). Phase P7 requires publishing live `lgbm-v2` alongside `persistence-v0`, rendering a deterministic zero-framework static GitHub Pages site (`docs/index.html`), and providing Render free-tier deployment config (`render.yaml`).
+- Decision:
+  1. **P6 candidate fixture overlay (`clm_decide`: `option_1_candidate_fixture_overlay`, confidence `0.9778`)**:
+     - Keep `data/eval/frozen_split_v2.parquet` (`87d32223...`) immutable on `main`.
+     - Extend `run_eval_cli` (`src/gridcast/cli.py` / `src/gridcast/backtest.py`) so when optional `data/eval/candidate_split.parquet` is present, `make eval` first verifies `frozen_split_v2.parquet` against `PINNED_EVAL_FIXTURE_SHA256`, asserts `candidate_split.parquet` matches `frozen_split_v2.parquet` byte-for-byte on all 7 truth/baseline columns (`issue_time`, `horizon`, `target_time`, `actual`, `neso_forecast`, `persistence_pred`, `seasonal_naive_pred`) and row count (`1,440`), and evaluates `candidate_split["candidate_pred"]` against `data/eval/gate_threshold.json` (`43.3379 gCO2/kWh`), returning exit `1` on `FAIL`. When `candidate_split.parquet` is absent (`main`), `make eval` evaluates `frozen_split_v2.parquet` (`PASS`, `39.118`) identically to P5.
+     - Update `.github/workflows/ci.yml` so `make eval` streams stdout to CI logs even when exiting non-zero.
+  2. **P7 dual-model scoreboard & deterministic static GitHub Pages (`clm_decide`: `option_a_docs_index_both_models`, confidence `0.9988`)**:
+     - Issue **both** `persistence-v0` (preserving continuity of the `2026-11-02` live baseline) and `lgbm-v2` (via `resolve_features_for_issue()` + `predict_lgbm()`) daily in `gridcast forecast` (`src/gridcast/scoreboard.py`).
+     - Update `generate_scoreboard_markdown()` to report all scored rows (including `neso_source == "none"`) grouped per `model_version` with `0–12h`, `12–24h`, `24–36h`, `36–48h` horizon buckets, while strictly maintaining `ADR-022` non-aggregation between `snapshot_at_issue` and `archive_at_scoring` rows.
+     - Generate `docs/index.html` deterministically inside `score_forecasts(...)` (`generate_scoreboard_html(...)`) as self-contained HTML + CSS + inline `<svg>` charts (zero external JS/CDNs) covering live scoreboard tables per `model_version`, the frozen 15-origin benchmark (`frozen_split_v2.parquet`) with empirical error decomposition (wind droughts, interconnector ramps, calendar), and the latest issued forecast curve (`forecasts.parquet`), and commit `docs/index.html` alongside `docs/scoreboard.md` in `.github/workflows/nightly.yml`.
+     - Add `render.yaml` for Render free-tier single-instance Docker hosting (`numInstances: 1`, `healthCheckPath: /health`, `GRIDCAST_RELOAD_TOKEN` `sync: false`).
+- Consequences:
+  Phase P6 failing-gate PRs fail strictly on the accuracy gate with full baseline diagnostics and zero `make check` false failures, and Phase P7 publishes an honest, deterministic, multi-model scoreboard to GitHub Pages without losing `persistence-v0` history.
+- Alternatives rejected:
+  - Live retraining inside CI for P6 (`option_2_live_candidate_backtest`): rejected (`clm_decide`) due to CI runtime cost and Linux/Windows LightGBM tree divergence risk.
+  - Replacing `persistence-v0` with `lgbm-v2` only or adopting a client-side JS framework for GitHub Pages: rejected (`clm_decide`) to preserve baseline continuity and keep `docs/index.html` zero-dependency and deterministic.
+
+## ADR-034 — Stateless container data snapshot for Render deployment
+- Status: accepted
+- Date: 2026-11-16
+- Context:
+  Render's free tier (`render.yaml`, `runtime: docker`, `autoDeploy: true`) runs stateless container builds without persistent disks or external volume mounts. Under ADR-032's `.dockerignore` exclusions (`data/curated/`, `data/mix/`, `data/scoreboard/`), deploying `Dockerfile` directly to Render left `/app/data/curated`, `/app/data/mix`, and `/app/data/scoreboard` empty, causing `/ready` and `/forecast` to return HTTP `503` while only `/health` returned `200`. Measuring the committed operational stores showed a small total footprint of `11.67 MB` (`data/curated` `5.56 MB`, `data/mix` `5.98 MB`, `data/scoreboard` `0.13 MB`).
+  Contrastive evaluation (`clm_decide`) selected `option_b_bake_snapshot_in_image` (confidence `0.6689`) over boot-time upstream API fetching or external object storage.
+- Decision:
+  1. Un-ignore `data/curated/`, `data/mix/`, and `data/scoreboard/` in `.dockerignore` (keeping `data/cache/`, `data/weather/`, `data/audit/`, `tests/`, and `docs/` excluded) and `COPY --chown=gridcast:gridcast` those three directories into the runtime stage of `Dockerfile`.
+  2. Retain `:ro` runtime bind-mount documentation and compatibility (`-v ...:/app/data/{curated,mix,scoreboard}:ro`): bind mounts cleanly overlay the baked snapshot when running with host-updated partitions, while stateless platforms such as Render (`render.yaml`, `autoDeploy: true`) serve HTTP `200` on `/health`, `/ready`, `/forecast`, `/model`, and `/metrics` immediately on boot with zero external API dependency.
+- Consequences:
+  Render free-tier deployments are immediately servable out of the box on each push to `main` (staying well within the `< 400 MB` image size budget), while local/cron Docker deployments can still mount fresher `:ro` partitions over `/app/data/*`.
+- Alternatives rejected:
+  - Boot-time API ingest inside container entrypoint (rejected: introduces startup latency, external API failure risk, and writable-filesystem requirements incompatible with `:ro` runtime mounts).
+  - External object storage / paid Render persistent disk (rejected: violates free-tier zero-cost constraint and adds operational complexity for `11.67 MB` of Parquet/CSV data).

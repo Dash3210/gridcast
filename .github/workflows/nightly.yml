@@ -42,7 +42,7 @@ jobs:
       - name: Ingest recent data
         run: make ingest
 
-      - name: Issue baseline forecast
+      - name: Issue daily forecasts (persistence-v0 and lgbm-v2)
         # The issue date is derived inside gridcast from the archive and the Europe/London
         # calendar, never from the run timestamp, so a delayed or re-run job cannot stamp a
         # forecast for the wrong day.
@@ -56,7 +56,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/curated data/weather data/mix data/scoreboard docs/scoreboard.md
+          git add data/curated data/weather data/mix data/scoreboard docs/scoreboard.md docs/index.html
           if git diff --staged --quiet; then
             echo "Nothing to commit: no new data and no new scores."
             exit 0

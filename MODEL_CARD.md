@@ -1,19 +1,16 @@
 # Model card
 
-**Status: Phase P3 candidate trained and evaluated (no gate verdict; ADR-020).** Phase P3 closes with neither a pass nor a fail. LightGBM regressor (`lgb.train`) trained natively on 26 features from the canonical production frame (weather features dropped per ADR-018), evaluated against three baselines (issue-anchored persistence, seasonal-naive, and published NESO forecast) across 15 fixed rolling origins (`2026-09-04 23:00 UTC` to `2026-10-31 00:00 UTC`, covering local issue dates `2026-09-05` to `2026-10-31`).
+**Status: Phase P7 production-ready (`lgbm-v2` serving via FastAPI container, accuracy gate PASS, dual-model live scoreboard active).** LightGBM regressor (`lgb.train`) trained natively on 26 features from the canonical production frame (weather features dropped per ADR-018; Phase P3 initial scoring closed with no verdict per ADR-020 before external gap-closure gating passed in Phase P5 per ADR-030), evaluated against three baselines (issue-anchored persistence, seasonal-naive, and published NESO forecast) across 15 fixed rolling origins (`2026-09-04 23:00 UTC` to `2026-10-31 00:00 UTC`, covering local issue dates `2026-09-05` to `2026-10-31`).
 
 ## What is serving today
 
-`persistence-v0`. Every issued point is the most recent actual intensity available at the issue instant,
-held flat across the 48-hour horizon:
+`lgbm-v2` is the live prediction model served by the containerised FastAPI service (`gridcast.serve:app`, exposing `/forecast`, `/health`, `/ready`, `/model`, `/metrics`, and `/reload`). In the nightly public scoreboard (`.github/workflows/nightly.yml`), `gridcast forecast` issues **both** `lgbm-v2` and the flat `persistence-v0` baseline (`persistence-v0` has run continuously since `2026-11-02`):
 
 ```
-forecast(issue, h) = actual at (issue_time - ACTUAL_AVAILABILITY_LAG)     for h in 1..96
+forecast_persistence(issue, h) = actual at (issue_time - ACTUAL_AVAILABILITY_LAG)     for h in 1..96
 ```
 
-It is deliberately weak. It exists so the public record starts accumulating before a trained model is
-ready, and every score row records `model_version`, so a better model appends rather than rewrites.
-Phase P4 packages the LightGBM candidate into the prediction service.
+`persistence-v0` is deliberately weak and exists so the public record carries a continuous baseline from day one; every score row records `model_version`, so `lgbm-v2` appends alongside it rather than rewriting history.
 
 ## Inputs
 
@@ -70,7 +67,7 @@ The model has no native interval. Prediction intervals are generated using per-h
 | `/forecast` | `GET` | Parameter `hours` is anchor-relative, counted strictly from the anchor (`target_time = issue_time + horizon * 30min`), validated to `1..48` integer (invalid values return HTTP 422 with accepted range `[1, 48]`). Anchors (`date` or `issue_time`) are strictly enforced at the boundary to 00:00 Europe/London across timezones/offsets; non-midnight anchors, naive timestamps, or invalid dates return HTTP 422 with structured errors without reflecting inputs or host paths. Any `issue_time` without an explicit UTC offset (including date-only) is rejected with HTTP 422, requiring an explicit offset and pointing to `date=YYYY-MM-DD` as the supported form for date-only queries. A literal `+` arrives as a space and is read as an offset sign; percent-encode it as `%2B`. Returns response wrapper with `issue_time`, `generated_at`, `is_current_issue`, `contains_future_points`, `retrospective_horizons`, `hours`, `model_version`, `content_sha256`, `interval_sha256`, `model_hash`, `interval_hash`, `generation`, `state_version`, and `points`. When `is_current_issue` is false, includes `fallback_reason` naming the null feature and date. For `hours` in 1..48, `len(points) == hours * 2` with timestamps strictly increasing by 30 minutes; each point contains `horizon`, `timestamp`, `target_time`, `value`, `lower`, and `upper` where `lower <= value <= upper` and `value >= 0`. Features are cached in a bounded cache keyed by `(issue_time, model_sha256, curated_freshness)`. |
 | `/metrics` | `GET` | Exposes Prometheus text exposition including request counter (`gridcast_requests_total`), latency histogram (`gridcast_request_duration_seconds`), served issue age (`gridcast_served_issue_age_seconds`), publish lateness (`gridcast_publish_lateness_seconds`), last measured MAE macro mean (`gridcast_last_measured_mae` with `plane="live_scoreboard"` and `horizons` labels) computed as the unweighted mean of per-horizon MAEs matching project scalar evaluation, and companion sample size gauge (`gridcast_last_measured_mae_samples{series,plane}`). The operator series is labeled `status="partial"`, `horizons="1-33"` (n=33), never "settled". Unsettled series (candidate) are exposed as absent with status label and NaN. Exact endpoint label set is `{"/forecast", "/health", "/metrics", "/model", "/ready", "/reload", "unmatched"}`, strictly bounded to the registered application routes plus `unmatched`. |
 | `/model` | `GET` | Returns JSON matching model card metadata: `version`, `content_sha256`, `training_window`, `feature_count`, `interval_sha256`, and monotonic `generation`. |
-| `/reload` | `POST` | Reloads model and interval artifacts. Authenticated exclusively via `Authorization: Bearer <token>` header (or `X-Reload-Token`) using constant-time `secrets.compare_digest`. Status codes: 401 for a missing or wrong token when configured, 503 when `GRIDCAST_RELOAD_TOKEN` is unset, 200 on success, 500 when artifact cannot be loaded (returning generic error detail without host paths or filenames while keeping active in-memory snapshot intact). |
+| `/reload` | `POST` | Reloads model and interval artifacts. Authenticated exclusively via `Authorization: Bearer <token>` header (or `X-Reload-Token`) using constant-time `secrets.compare_digest`. Status codes: 401 for a missing or wrong token when configured, 503 when `GRIDCAST_RELOAD_TOKEN` is unset, 200 on success, 422 when reloaded booster features do not match `FEATURE_COLUMNS` or interval quantiles violate 96-horizon `q10 <= 0.0 <= q90` invariants (without mutating the active snapshot), 500 when artifact is missing or unreadable (returning generic error detail without host paths or filenames while keeping active in-memory snapshot intact). |
 
 ### Feature Path & Source Gap Handling
 
@@ -83,7 +80,8 @@ The model has no native interval. Prediction intervals are generated using per-h
 - **Explicit fallback labeling**: Before the nightly ingest lands, the service serves the newest buildable issue and says so via `issue_time` and `is_current_issue` (with `fallback_reason` naming the null feature and date when `is_current_issue` is false). Refusing to build with a null feature is deliberate: imputing the missing actual would be fabrication.
 - **Retrospective horizons**: Horizons earlier than the publication time are retrospective (`retrospective_horizons`), because the 00:00 issue is published when the nightly ingest makes it buildable.
 - **Fixed 00:00 Europe/London anchor**: Anchors are fixed at 00:00 Europe/London. Non-00:00 Europe/London timestamps return HTTP 422 at the serving boundary. Arbitrary anchors would require a v3 model trained across a spread of anchor hours, with its own fixture - not a serving-time change.
-- **Reload status codes**: 401 for a missing or wrong token when a token is configured (header only), 503 when `GRIDCAST_RELOAD_TOKEN` is unset (no auth configured, so the endpoint is closed), 200 on success, 500 when the artifact cannot be loaded and the old booster is kept.
+- **Reload status codes**: 401 for a missing or wrong token when a token is configured (header only), 503 when `GRIDCAST_RELOAD_TOKEN` is unset (no auth configured, so the endpoint is closed), 200 on success, 422 when reloaded booster features do not match `FEATURE_COLUMNS` or interval quantiles fail 96-horizon `q10 <= 0.0 <= q90` validation (old snapshot retained), 500 when the artifact cannot be loaded and the old booster is kept.
+- **Startup integrity and deferred import**: `verify_startup_environment()` requires `data/models/runtime.json` (`lightgbm_version == "4.7.0"`, `model_sha256`, `interval_sha256`), validates `lightgbm.__version__` directly without env-var overrides, and cross-checks artifact SHA-256 digests against `models.py` and `runtime.json`. Module-level `app = create_app(defer_startup=True)` defers verification and artifact loading to FastAPI `lifespan` so `import gridcast.serve` succeeds from any working directory while `uvicorn` startup enforces integrity.
 - **Snapshot Reload Mechanism**: One immutable snapshot reference (`ModelSnapshot`), read once per request; a mutex serialises reload writers across the whole reload (artifact loading, generation increment, and swap) across the read-modify-write so generations are strictly increasing and unique, while readers remain lock-free, observing an internally consistent snapshot without reader locks.
 
 ### Lineage and Historical Artifacts
@@ -175,21 +173,21 @@ Derived from split:          validation (2026-06-05 to 2026-08-30, 15 origins)
   Operator MAE (val):        9.649 gCO2/kWh
 Fixture SHA-256:             87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51
 Archive commit:              3617143
-Evaluated origin window:     2026-09-05 00:00 UTC to 2026-11-01 00:00 UTC
+Evaluated origin window:     2026-09-04 23:00 UTC to 2026-10-31 00:00 UTC
 Origins evaluated (15):
-  2026-09-05 00:00 UTC
-  2026-09-09 00:00 UTC
-  2026-09-13 00:00 UTC
-  2026-09-17 00:00 UTC
-  2026-09-21 00:00 UTC
-  2026-09-25 00:00 UTC
-  2026-09-29 00:00 UTC
-  2026-10-03 00:00 UTC
-  2026-10-07 00:00 UTC
-  2026-10-11 00:00 UTC
-  2026-10-15 00:00 UTC
-  2026-10-19 00:00 UTC
-  2026-10-23 00:00 UTC
+  2026-09-04 23:00 UTC
+  2026-09-08 23:00 UTC
+  2026-09-12 23:00 UTC
+  2026-09-16 23:00 UTC
+  2026-09-20 23:00 UTC
+  2026-09-24 23:00 UTC
+  2026-09-28 23:00 UTC
+  2026-10-02 23:00 UTC
+  2026-10-06 23:00 UTC
+  2026-10-10 23:00 UTC
+  2026-10-14 23:00 UTC
+  2026-10-18 23:00 UTC
+  2026-10-22 23:00 UTC
   2026-10-27 00:00 UTC
   2026-10-31 00:00 UTC
 Contributing horizons:       96 / 96
@@ -282,13 +280,13 @@ Card lines for both planes:
 Persistence is the same definition in both planes: the project scalar macro mean (unweighted mean of per-horizon MAEs). On the live window, persistence macro mean is 29.308 gCO2/kWh (row mean is 28.625 gCO2/kWh, n=464). The live record is also not short-horizon weighted: 464 rows across horizons 1-96, median horizon 44. The difference is the sample - six days were far more persistence-friendly (24h band 22.4 live vs 55.6 frozen) and calmer (mean 30-min change 4.00 vs 5.50, std 42.56 vs 51.51).
 The operator series on the live scoreboard is partial: 33 rows from one issue across horizons 1-33 (n=33, MAE 9.152), compared to 15 origins x 96 (n=1440, MAE 11.666) in the frozen backtest. It is never labeled "settled". When it settles across all horizons, the sample size will expand and the score will reflect longer horizons.
 
-## Known failure modes (to be quantified in P3)
+## Known failure modes (When This Model Is Wrong)
 
-- **Wind droughts**: multi-day low-wind periods where intensity stays high and persistence is poor.
-- **Public holidays**: demand and generation patterns break the weekly rhythm; the UK bank holiday table
-  covers 2024–2027.
-- **Interconnector trips**: sudden imports or exports that move intensity by tens of gCO2/kWh within a
-  settlement period, invisible to every input in this table.
+Measured on the pinned evaluation split (`data/eval/frozen_split_v2.parquet`, `n=1,440` points across 15 origins, `2026-09-05` to `2026-11-01`), joining `target_time` against `data/mix/` and the UK bank holiday register:
+
+- **Wind droughts (`mix.wind < 15%`, n=239, mean actual `181.6` gCO2/kWh)**: Model MAE **`58.12`** gCO2/kWh vs Persistence **`57.60`** vs NESO **`12.22`** (compare high-wind `>= 30%`, n=833, mean actual `89.5`: Model **`31.07`**, Persistence **`53.09`**, NESO **`10.97`**; mid-wind `15–30%`, n=368, mean actual `142.4`: Model **`45.00`**, Persistence **`52.71`**, NESO **`12.89`**). During multi-day low-wind periods where intensity stays high, the model loses its edge over persistence.
+- **Interconnector trips / ramps (`|Δimports_30m| >= 2.0 pp`, n=154)**: Model MAE **`41.40`** gCO2/kWh vs `38.85` calm (Persistence `54.55` vs `53.64`; NESO `12.83` vs `11.53`). For rapid 30-minute intensity jumps (`|Δactual_30m| >= 15` gCO2/kWh, n=89), Model MAE is **`35.71`** vs `39.34` calm, while NESO degrades to **`24.00`** vs `10.85`. Sudden interconnector swings after issue time remain invisible to issue-time inputs.
+- **Public holidays (`n=0` in frozen evaluation window)**: `n=0` UK bank holidays occurred inside `frozen_split_v2.parquet` (`2026-09-05` to `2026-11-01`; Summer Bank Holiday `2026-08-31` fell inside the 4-day embargo), so holiday accuracy is unmeasured in this split; the UK bank holiday register covers 2024–2027.
 
 ## The public record
 

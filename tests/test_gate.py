@@ -232,6 +232,85 @@ def test_run_eval_cli_exits_nonzero_on_gate_fail(
     assert "Accuracy gate failed: expected verdict 'PASS', got 'FAIL'" in captured_monkey.err
 
 
+def test_run_eval_cli_uses_reference_when_candidate_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When candidate_split.parquet is absent, make eval scores frozen_split_v2.parquet -> PASS."""
+    absent_candidate = tmp_path / "candidate_split.parquet"
+    monkeypatch.setattr("gridcast.backtest.DEFAULT_CANDIDATE_FIXTURE_PARQUET", absent_candidate)
+    rc = run_eval_cli(verbose=True)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Candidate GATE_VALUE:        39.118 gCO2/kWh" in out
+    assert "GATE VERDICT: PASS" in out
+
+
+def test_candidate_fixture_overlay_fails_on_degraded_predictions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Degraded candidate_split.parquet prints comparison table + GATE VERDICT: FAIL and exits 1."""
+    import pandas as pd
+
+    from gridcast.backtest import evaluate_candidate_against_fixture
+
+    ref_df = pd.read_parquet(DEFAULT_EVAL_FIXTURE_PARQUET)
+    degraded_df = ref_df.copy()
+    # Replace candidate_pred with persistence_pred (53.741 > 43.3379) while keeping truth intact
+    degraded_df["candidate_pred"] = ref_df["persistence_pred"]
+    cand_path = tmp_path / "candidate_split.parquet"
+    degraded_df.to_parquet(cand_path, index=False)
+
+    monkeypatch.setattr("gridcast.backtest.DEFAULT_CANDIDATE_FIXTURE_PARQUET", cand_path)
+    rc = run_eval_cli(verbose=True)
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert f"Candidate Fixture:           {cand_path}" in captured.out
+    assert "Candidate GATE_VALUE:        53.741 gCO2/kWh" in captured.out
+    assert "Operator GATE_VALUE (NESO):  11.666 gCO2/kWh" in captured.out
+    assert "Persistence GATE_VALUE:      53.741 gCO2/kWh" in captured.out
+    assert "Seasonal-Naive GATE_VALUE:   51.495 gCO2/kWh" in captured.out
+    assert "GATE VERDICT: FAIL" in captured.out
+    assert "Accuracy gate failed: expected verdict 'PASS', got 'FAIL'" in captured.err
+
+    res = evaluate_candidate_against_fixture(candidate_path=cand_path, verbose=False)
+    assert res.verdict == "FAIL"
+    assert round(res.gate_value, 3) == 53.741
+
+
+def test_candidate_fixture_overlay_rejects_tampered_truth_or_baseline(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Tampering with truth/baseline columns or row count in candidate fixture raises ValueError."""
+    import pandas as pd
+
+    from gridcast.backtest import evaluate_candidate_against_fixture
+
+    ref_df = pd.read_parquet(DEFAULT_EVAL_FIXTURE_PARQUET)
+
+    for col in ("actual", "neso_forecast", "persistence_pred"):
+        tampered_df = ref_df.copy()
+        tampered_df.loc[0, col] = float(tampered_df.loc[0, col]) + 1.0
+        tampered_path = tmp_path / f"tampered_{col}.parquet"
+        tampered_df.to_parquet(tampered_path, index=False)
+
+        with pytest.raises(ValueError, match=f"truth/baseline column '{col}'"):
+            evaluate_candidate_against_fixture(candidate_path=tampered_path, verbose=False)
+
+        rc = run_eval_cli(candidate_path=tampered_path, verbose=False)
+        assert rc == 1
+        assert "Evaluation refused:" in capsys.readouterr().err
+
+    truncated_path = tmp_path / "truncated.parquet"
+    ref_df.iloc[:100].to_parquet(truncated_path, index=False)
+    with pytest.raises(ValueError, match="1440 rows"):
+        evaluate_candidate_against_fixture(candidate_path=truncated_path, verbose=False)
+
+
 def test_hermetic_data_check_offline_and_no_writes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Requirement 6: Test suite makes no network calls and writes nothing under data/."""
     data_dir = Path("data")

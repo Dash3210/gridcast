@@ -304,8 +304,18 @@ def test_evaluate_from_fixture_invalid_row_count(tmp_path: Path) -> None:
         evaluate_from_fixture(p_path, s_path, pinned_sha256=None)
 
 
-def test_cli_eval_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_eval_subcommand(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """CLI eval entry point executes cleanly and prints verdict."""
+    # Isolate from any P6 PR candidate_split.parquet overlay so unit tests verify the
+    # pinned reference fixture even on failing-candidate PR branches (P7 R2 #1).
+    monkeypatch.setattr(
+        "gridcast.backtest.DEFAULT_CANDIDATE_FIXTURE_PARQUET",
+        tmp_path / "absent_candidate_split.parquet",
+    )
     rc = run_eval_cli(verbose=True)
     assert rc == 0
     captured = capsys.readouterr().out

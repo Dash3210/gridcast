@@ -250,6 +250,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to fixture sidecar metadata JSON (default: data/eval/frozen_split_v2.json).",
     )
     eval_parser.add_argument(
+        "--candidate",
+        type=str,
+        default=None,
+        help=(
+            "Optional candidate fixture parquet overlay "
+            "(auto-detects data/eval/candidate_split.parquet if present)."
+        ),
+    )
+    eval_parser.add_argument(
         "--no-verbose",
         dest="verbose",
         action="store_false",
@@ -650,19 +659,42 @@ def run_eval_cli(
     sidecar_path: Path | str | None = "data/eval/frozen_split_v2.json",
     verbose: bool = True,
     pinned_sha256: str | None = None,
+    candidate_path: Path | str | None = None,
 ) -> int:
-    """Run model evaluation benchmark reading only the frozen fixture."""
-    from gridcast.backtest import PINNED_EVAL_FIXTURE_SHA256, evaluate_from_fixture
+    """Run model evaluation benchmark against the pinned frozen fixture (or candidate overlay)."""
+    from gridcast.backtest import (
+        DEFAULT_CANDIDATE_FIXTURE_PARQUET,
+        DEFAULT_EVAL_FIXTURE_PARQUET,
+        PINNED_EVAL_FIXTURE_SHA256,
+        evaluate_candidate_against_fixture,
+        evaluate_from_fixture,
+    )
 
     resolved_pin = PINNED_EVAL_FIXTURE_SHA256 if pinned_sha256 is None else pinned_sha256
+    active_candidate: Path | str | None = candidate_path
+    if (
+        active_candidate is None
+        and Path(fixture_path) == DEFAULT_EVAL_FIXTURE_PARQUET
+        and DEFAULT_CANDIDATE_FIXTURE_PARQUET.exists()
+    ):
+        active_candidate = DEFAULT_CANDIDATE_FIXTURE_PARQUET
 
     try:
-        results = evaluate_from_fixture(
-            parquet_path=fixture_path,
-            sidecar_path=sidecar_path,
-            verbose=verbose,
-            pinned_sha256=resolved_pin,
-        )
+        if active_candidate is not None:
+            results = evaluate_candidate_against_fixture(
+                candidate_path=active_candidate,
+                ref_parquet_path=fixture_path,
+                ref_sidecar_path=sidecar_path,
+                pinned_sha256=resolved_pin,
+                verbose=verbose,
+            )
+        else:
+            results = evaluate_from_fixture(
+                parquet_path=fixture_path,
+                sidecar_path=sidecar_path,
+                verbose=verbose,
+                pinned_sha256=resolved_pin,
+            )
         if results.verdict != "PASS":
             print(
                 f"Accuracy gate failed: expected verdict 'PASS', got '{results.verdict}'",
@@ -670,7 +702,7 @@ def run_eval_cli(
             )
             return 1
         return 0
-    except ValueError as e:
+    except (ValueError, FileNotFoundError) as e:
         print(f"Evaluation refused: {e}", file=sys.stderr)
         return 1
 
@@ -867,6 +899,7 @@ def main(argv: list[str] | None = None) -> int:
             fixture_path=args.fixture,
             sidecar_path=args.sidecar,
             verbose=args.verbose,
+            candidate_path=args.candidate,
         )
 
     if args.subcommand == "gate-negative":

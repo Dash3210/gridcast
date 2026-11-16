@@ -1954,5 +1954,260 @@ def test_import_gridcast_serve_outside_repo_and_deferred_lifespan(tmp_path: Path
         pass
 
 
+def test_0300_stale_archive_all_endpoints_and_empty_store_503(tmp_path: Path) -> None:
+    """At 03:00 UTC with archive >48h stale or empty, endpoints never crash and stay honest."""
+    import shutil
+    from unittest.mock import patch
+
+    stale_curated = tmp_path / "stale_curated"
+    stale_curated.mkdir()
+    for p in sorted(Path(CURATED_DIR_DEFAULT).glob("date=2026-10-*.parquet")):
+        shutil.copy2(p, stale_curated / p.name)
+    nov01 = Path(CURATED_DIR_DEFAULT) / "date=2026-11-01.parquet"
+    shutil.copy2(nov01, stale_curated / nov01.name)
+
+    expected_freshness = pd.to_datetime(
+        pd.read_parquet(nov01)["period_start_utc"], utc=True
+    ).max()
+
+    class Clock0300(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> Clock0300:
+            moment = datetime(2026, 11, 14, 3, 0, 0, tzinfo=timezone.utc)
+            target = moment.astimezone(tz) if tz is not None else moment
+            return cls(
+                target.year,
+                target.month,
+                target.day,
+                target.hour,
+                target.minute,
+                target.second,
+                target.microsecond,
+                tzinfo=target.tzinfo,
+            )
+
+    stale_app = create_app(curated_dir=stale_curated)
+    with (
+        patch("gridcast.serve.datetime", Clock0300),
+        TestClient(stale_app) as c,
+    ):
+        r_health = c.get("/health")
+        assert r_health.status_code == 200
+        h_data = r_health.json()
+        assert h_data["status"] == "healthy"
+        assert h_data["is_current_issue"] is False
+        assert pd.Timestamp(h_data["data_freshness_at"]) == expected_freshness
+
+        r_ready = c.get("/ready")
+        assert r_ready.status_code == 200
+        r_data = r_ready.json()
+        assert r_data["status"] == "ready"
+        assert r_data["is_current_issue"] is False
+        assert r_data["publish_status"] == "late"
+        assert r_data["publish_lateness_seconds"] > 0.0
+        assert r_data["served_issue_age_seconds"] > 48 * 3600
+
+        r_fc = c.get("/forecast?hours=48")
+        assert r_fc.status_code == 200
+        fc_data = r_fc.json()
+        assert fc_data["is_current_issue"] is False
+        assert fc_data["issue_time"].startswith("2026-11-01")
+        assert "fallback_reason" in fc_data
+        assert len(fc_data["points"]) == 96
+        for pt in fc_data["points"]:
+            assert pt["lower"] <= pt["value"] <= pt["upper"]
+
+        r_metrics = c.get("/metrics")
+        assert r_metrics.status_code == 200
+        families = list(text_string_to_metric_families(r_metrics.text))
+        age_fam = next(f for f in families if f.name == "gridcast_served_issue_age_seconds")
+        late_fam = next(f for f in families if f.name == "gridcast_publish_lateness_seconds")
+        assert age_fam.samples[0].value > 48 * 3600
+        assert late_fam.samples[0].value > 0.0
+
+        r_model = c.get("/model")
+        assert r_model.status_code == 200
+        assert r_model.json()["version"] == "lgbm-v2"
+
+    # Empty curated archive: nothing servable -> /ready and /forecast return 503, others 200
+    empty_curated = tmp_path / "empty_curated"
+    empty_curated.mkdir()
+    empty_app = create_app(curated_dir=empty_curated)
+    with (
+        patch("gridcast.serve.datetime", Clock0300),
+        TestClient(empty_app) as c_empty,
+    ):
+        r_eh = c_empty.get("/health")
+        assert r_eh.status_code == 200
+        assert r_eh.json()["data_freshness_at"] == "unavailable"
+        assert r_eh.json()["is_current_issue"] is False
+
+        r_er = c_empty.get("/ready")
+        assert r_er.status_code == 503
+        assert r_er.json()["status"] == "not_ready"
+
+        r_ef = c_empty.get("/forecast?hours=48")
+        assert r_ef.status_code == 503
+
+        assert c_empty.get("/metrics").status_code == 200
+        assert c_empty.get("/model").status_code == 200
+
+
+def test_metrics_multimodel_scores_csv_deduplicates_operator_and_updates_candidate(
+    tmp_path: Path,
+) -> None:
+    """/metrics cleanly exposes persistence, operator (deduped), and lgbm-v2 from scores.csv."""
+    scores_file = tmp_path / "scores.csv"
+    header = (
+        "issue_time,horizon,target_time,model_version,forecast,actual,"
+        "neso_forecast,abs_error,neso_abs_error,neso_source\n"
+    )
+    pers_only_rows = [
+        (
+            "2026-11-10 00:00:00+00:00,1,2026-11-10 00:30:00+00:00,"
+            "persistence-v0,150,120,125,30.0,5.0,archive_at_scoring"
+        ),
+        (
+            "2026-11-10 00:00:00+00:00,33,2026-11-10 16:30:00+00:00,"
+            "persistence-v0,150,130,115,20.0,15.0,archive_at_scoring"
+        ),
+        (
+            "2026-11-10 00:00:00+00:00,48,2026-11-10 23:30:00+00:00,"
+            "persistence-v0,150,110,,40.0,,none"
+        ),
+    ]
+    scores_file.write_text(header + "\n".join(pers_only_rows) + "\n", encoding="utf-8")
+
+    app_instance = create_app(scores_path=scores_file)
+    with TestClient(app_instance) as c:
+        r1 = c.get("/metrics")
+        assert r1.status_code == 200
+        fam1 = list(text_string_to_metric_families(r1.text))
+        mae1 = next(f for f in fam1 if f.name == "gridcast_last_measured_mae")
+        cand1 = [s for s in mae1.samples if s.labels.get("series") == "candidate"]
+        assert len(cand1) == 1
+        assert cand1[0].labels.get("status") == "absent"
+        assert math.isnan(cand1[0].value)
+
+        # Append lgbm-v2 rows for the same issue_time/horizons (with same neso_abs_error)
+        lgbm_rows = [
+            (
+                "2026-11-10 00:00:00+00:00,1,2026-11-10 00:30:00+00:00,"
+                "lgbm-v2,126,120,125,6.0,5.0,archive_at_scoring"
+            ),
+            (
+                "2026-11-10 00:00:00+00:00,33,2026-11-10 16:30:00+00:00,"
+                "lgbm-v2,122,130,115,8.0,15.0,archive_at_scoring"
+            ),
+            (
+                "2026-11-10 00:00:00+00:00,48,2026-11-10 23:30:00+00:00,"
+                "lgbm-v2,120,110,,10.0,,none"
+            ),
+        ]
+        scores_file.write_text(
+            header + "\n".join(pers_only_rows + lgbm_rows) + "\n",
+            encoding="utf-8",
+        )
+
+        r2 = c.get("/metrics")
+        assert r2.status_code == 200
+        fam2 = list(text_string_to_metric_families(r2.text))
+        mae2 = next(f for f in fam2 if f.name == "gridcast_last_measured_mae")
+        cnt2 = next(f for f in fam2 if f.name == "gridcast_last_measured_mae_samples")
+
+        pers_samples = [s for s in mae2.samples if s.labels.get("series") == "persistence"]
+        oper_samples = [s for s in mae2.samples if s.labels.get("series") == "operator"]
+        cand_samples = [s for s in mae2.samples if s.labels.get("series") == "candidate"]
+
+        assert len(pers_samples) == 1
+        assert math.isclose(pers_samples[0].value, 30.0)
+        assert pers_samples[0].labels.get("horizons") == "1-48"
+
+        assert len(oper_samples) == 1
+        assert math.isclose(oper_samples[0].value, 10.0)
+        assert oper_samples[0].labels.get("horizons") == "1-33"
+        oper_cnt = next(s for s in cnt2.samples if s.labels.get("series") == "operator")
+        assert oper_cnt.value == 2.0  # deduplicated across persistence-v0 and lgbm-v2
+
+        # Old status="absent" ghost label is cleared; only status="settled" remains
+        assert len(cand_samples) == 1
+        assert cand_samples[0].labels.get("status") == "settled"
+        assert cand_samples[0].labels.get("horizons") == "1-48"
+        assert math.isclose(cand_samples[0].value, 8.0)
+        cand_cnt = next(s for s in cnt2.samples if s.labels.get("series") == "candidate")
+        assert cand_cnt.value == 3.0
+
+
+def test_metrics_operator_separates_sources_never_labels_partial_settled_and_clears_when_empty(
+    tmp_path: Path,
+) -> None:
+    """Operator avoids mixing vintage sources, never emits partial+settled, and clears gauges."""
+    scores_file = tmp_path / "scores.csv"
+    header = (
+        "issue_time,horizon,target_time,model_version,forecast,actual,"
+        "neso_forecast,abs_error,neso_abs_error,neso_source\n"
+    )
+    # Mix snapshot_at_issue (h=1,60, err=12.0 & 18.0 -> mean 15.0) with archive_at_scoring
+    # (h=1..33, err=100.0). ADR-022 requires strictly using snapshot_at_issue only, AND
+    # h>=49 with status="partial" must emit "1-60" instead of "settled".
+    mixed_rows = [
+        (
+            "2026-11-10 00:00:00+00:00,1,2026-11-10 00:30:00+00:00,"
+            "persistence-v0,150,120,125,30.0,100.0,archive_at_scoring"
+        ),
+        (
+            "2026-11-11 00:00:00+00:00,1,2026-11-11 00:30:00+00:00,"
+            "persistence-v0,150,120,132,30.0,12.0,snapshot_at_issue"
+        ),
+        (
+            "2026-11-11 00:00:00+00:00,60,2026-11-12 06:00:00+00:00,"
+            "persistence-v0,150,120,138,30.0,18.0,snapshot_at_issue"
+        ),
+        (
+            "2026-11-11T00:00:00Z,1,2026-11-11T00:30:00Z,"
+            "lgbm-v2,126,120,132,6.0,12.0,snapshot_at_issue"
+        ),
+    ]
+    scores_file.write_text(header + "\n".join(mixed_rows) + "\n", encoding="utf-8")
+
+    app_instance = create_app(scores_path=scores_file)
+    with TestClient(app_instance) as c:
+        r1 = c.get("/metrics")
+        assert r1.status_code == 200
+        fam1 = list(text_string_to_metric_families(r1.text))
+        mae1 = next(f for f in fam1 if f.name == "gridcast_last_measured_mae")
+        cnt1 = next(f for f in fam1 if f.name == "gridcast_last_measured_mae_samples")
+
+        oper1 = [s for s in mae1.samples if s.labels.get("series") == "operator"]
+        assert len(oper1) == 1
+        assert oper1[0].labels.get("status") == "partial"
+        assert oper1[0].labels.get("horizons") == "1-60"
+        assert math.isclose(oper1[0].value, 15.0)
+        oper_cnt1 = next(s for s in cnt1.samples if s.labels.get("series") == "operator")
+        assert oper_cnt1.value == 2.0
+
+        # Empty (header-only) scores.csv clears all MAE gauges
+        scores_file.write_text(header, encoding="utf-8")
+        r2 = c.get("/metrics")
+        assert r2.status_code == 200
+        fam2 = list(text_string_to_metric_families(r2.text))
+        mae2 = next(f for f in fam2 if f.name == "gridcast_last_measured_mae")
+        cnt2 = next(f for f in fam2 if f.name == "gridcast_last_measured_mae_samples")
+        assert len(mae2.samples) == 0
+        assert len(cnt2.samples) == 0
+
+        # Re-populate, then delete scores.csv -> gauges clear again
+        scores_file.write_text(header + "\n".join(mixed_rows) + "\n", encoding="utf-8")
+        assert c.get("/metrics").status_code == 200
+        scores_file.unlink()
+        r3 = c.get("/metrics")
+        assert r3.status_code == 200
+        fam3 = list(text_string_to_metric_families(r3.text))
+        mae3 = next(f for f in fam3 if f.name == "gridcast_last_measured_mae")
+        cnt3 = next(f for f in fam3 if f.name == "gridcast_last_measured_mae_samples")
+        assert len(mae3.samples) == 0
+        assert len(cnt3.samples) == 0
+
+
 
 
