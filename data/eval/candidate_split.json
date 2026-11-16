@@ -1,0 +1,47 @@
+{
+  "schema_version": "v2",
+  "created_at": "2026-11-16T18:57:10Z",
+  "purpose": "Phase P6 failing accuracy gate demonstration on PR branch",
+  "base_fixture": "data/eval/frozen_split_v2.parquet",
+  "base_fixture_sha256": "87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51",
+  "candidate_name": "calendar_plus_horizon",
+  "dropped_feature_prefixes": [
+    "actual_",
+    "mix_"
+  ],
+  "feature_columns": [
+    "horizon",
+    "hour_of_day",
+    "day_of_week",
+    "month",
+    "is_weekend",
+    "is_uk_bank_holiday",
+    "sin_hour",
+    "cos_hour",
+    "sin_day_of_year",
+    "cos_day_of_year"
+  ],
+  "num_boost_round": 100,
+  "origins": [
+    "2026-09-04 23:00 UTC",
+    "2026-09-08 23:00 UTC",
+    "2026-09-12 23:00 UTC",
+    "2026-09-16 23:00 UTC",
+    "2026-09-20 23:00 UTC",
+    "2026-09-24 23:00 UTC",
+    "2026-09-28 23:00 UTC",
+    "2026-10-02 23:00 UTC",
+    "2026-10-06 23:00 UTC",
+    "2026-10-10 23:00 UTC",
+    "2026-10-14 23:00 UTC",
+    "2026-10-18 23:00 UTC",
+    "2026-10-22 23:00 UTC",
+    "2026-10-27 00:00 UTC",
+    "2026-10-31 00:00 UTC"
+  ],
+  "row_count": 1440,
+  "parquet_sha256": "3fe819c38e1653f2d3bd84b108430851798e72f2b8018d2df19736db1bd3a4de",
+  "gate_value": 48.681643,
+  "threshold_required_mae": 43.3379,
+  "verdict": "FAIL"
+}
