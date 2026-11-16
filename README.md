@@ -8,15 +8,16 @@
 
 ## Live Scoreboard
 
-See the full Markdown report in [docs/scoreboard.md](docs/scoreboard.md) and the static HTML/SVG report in [docs/index.html](docs/index.html) (generated deterministically on `main` from `data/scoreboard/scores.csv`, `data/scoreboard/forecasts.parquet`, and `data/eval/frozen_split_v2.parquet`, ready to publish via `Settings -> Pages -> Deploy from branch: main (/docs)` at target URL `https://dash3210.github.io/gridcast/`).
+See the full Markdown report in [docs/scoreboard.md](docs/scoreboard.md) and the **live static HTML/SVG scoreboard** at **[https://dash3210.github.io/gridcast/](https://dash3210.github.io/gridcast/)** (generated deterministically on `main` into [docs/index.html](docs/index.html) from `data/scoreboard/scores.csv`, `data/scoreboard/forecasts.parquet`, and `data/eval/frozen_split_v2.parquet`).
 
 - **Record span:** `15 consecutive days recorded` (`2026-11-02 to 2026-11-16`, scoreboard started `2026-11-02`)
-- **Models issued nightly:** `lgbm-v2` (now issuing daily going forward; `0` settled points until its first 48h window settles) alongside the continuous `persistence-v0` baseline (`1,332` settled points)
+- **Models issued nightly:** `lgbm-v2` (now issuing daily alongside `persistence-v0`; first `40` settled points scored on `2026-11-16`) and the continuous `persistence-v0` baseline (`1,376` settled points)
 
 | Live Plane / Source | Model | Date Range | Scored Points | Model MAE (Macro / Row) | Operator MAE | Notes |
 |---|---|---|---|---|---|---|
-| All Settled Points | `persistence-v0` | `2026-11-02` to `2026-11-16` | `1,332` | `37.42` / `37.18` | — | `0–12h`: `28.58` (`354`), `12–24h`: `37.14` (`336`), `24–36h`: `40.96` (`330`), `36–48h`: `42.96` (`312`) |
-| `snapshot_at_issue` (verified vintage) | `persistence-v0` | `None` | `0` | `N/A` | `N/A` | Awaiting verified issue-time NESO snapshots |
+| All Settled Points | `lgbm-v2` | `2026-11-16` to `2026-11-16` | `40` | `28.90` / `28.90` | — | `0–12h`: `16.36` (`24`), `12–24h`: `47.71` (`16`), `24–36h`: `N/A`, `36–48h`: `N/A` |
+| All Settled Points | `persistence-v0` | `2026-11-02` to `2026-11-16` | `1,376` | `39.06` / `38.81` | — | `0–12h`: `28.99` (`360`), `12–24h`: `39.33` (`352`), `24–36h`: `41.60` (`336`), `36–48h`: `46.16` (`328`) |
+| `snapshot_at_issue` (verified vintage) | `lgbm-v2` / `persistence-v0` | `None` | `0` | `N/A` | `N/A` | Awaiting verified issue-time NESO snapshots |
 | `archive_at_scoring` (unverified vintage) | `persistence-v0` | `2026-11-02` to `2026-11-02` | `33` (`h=1..33`) | `24.67` | `9.15` | *Published NESO forecast for the same periods, vintage unverified; refusing to aggregate across sources (ADR-022)* |
 
 ### Frozen 15-Origin Benchmark
@@ -49,7 +50,7 @@ A deliberately degraded candidate pull request proves the CI accuracy gate rejec
 | P4 | Service: FastAPI prediction API and Prometheus metrics endpoint | done |
 | P5 | Packaging: Docker containerisation and GitHub Actions CI workflow | done |
 | P6 | Verification: deliberately failing pull request demonstrating accuracy gate | done ([PR #1](https://github.com/Dash3210/gridcast/pull/1) open; red CI verified) |
-| P7 | Deployment: automated schedule, documentation, and scoreboard publication | done in repo (nightly dual-model scoreboard, `docs/index.html` ready for Pages, `MODEL_CARD.md` failure modes, `render.yaml` ready) |
+| P7 | Deployment: automated schedule, documentation, and scoreboard publication | done (nightly dual-model scoreboard live, [GitHub Pages](https://dash3210.github.io/gridcast/) live, `MODEL_CARD.md` failure modes, `render.yaml` ready) |
 
 ## Quickstart
 
@@ -390,7 +391,7 @@ docker run --rm \
 ### Deployment (Render + GitHub Pages, Phase P7)
 
 - **Render (`render.yaml`)**: Defines a single-instance free-tier Docker web service (`type: web`, `name: gridcast`, `runtime: docker`, `plan: free`, `dockerfilePath: ./Dockerfile`, `numInstances: 1`, `healthCheckPath: /health`, `autoDeploy: true`, with `PORT=8000` and `GRIDCAST_RELOAD_TOKEN` marked `sync: false`). Because `Dockerfile` bakes the committed `data/curated/`, `data/mix/`, and `data/scoreboard/` snapshot, the Blueprint is ready in the repo; live hosting requires connecting the repository as a Render Blueprint and setting `GRIDCAST_RELOAD_TOKEN` in Render (no live Render URL is deployed yet).
-- **GitHub Pages (`docs/index.html` + `.github/workflows/nightly.yml`)**: Every nightly workflow run executes `make ingest`, issues both `persistence-v0` and `lgbm-v2` forecasts via `gridcast forecast`, scores settled targets via `gridcast score`, and deterministically regenerates `docs/scoreboard.md` and the zero-dependency static HTML/CSS/SVG report `docs/index.html` on `main`, ready to publish via `Settings -> Pages -> Deploy from branch: main (/docs)` (target URL `https://dash3210.github.io/gridcast/`, returning 404 until enabled in repository settings).
+- **GitHub Pages (`docs/index.html` + `.github/workflows/nightly.yml`)**: Live at **[https://dash3210.github.io/gridcast/](https://dash3210.github.io/gridcast/)** (`main /docs`). Every nightly workflow run executes `make ingest`, issues both `persistence-v0` and `lgbm-v2` forecasts via `gridcast forecast`, scores settled targets via `gridcast score`, and deterministically regenerates `docs/scoreboard.md` and the zero-dependency static HTML/CSS/SVG report `docs/index.html`, automatically redeploying Pages.
 
 ## Layout
 
