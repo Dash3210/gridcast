@@ -32,10 +32,10 @@ Evaluated on `frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c
 
 ### Phase P6 Failing-Gate Proof
 
-A deliberately degraded candidate branch proves the CI accuracy gate rejects underperforming models while code quality, unit tests, and container checks remain green:
+A deliberately degraded candidate pull request proves the CI accuracy gate rejects underperforming models while code quality, unit tests, and container checks remain green:
 
-- **Branch / Commit:** [`demo/p6-failing-accuracy-gate`](https://github.com/Dash3210/gridcast/tree/demo/p6-failing-accuracy-gate) (`5e6bf56`) — PR staged for owner click-through (`0` open PRs on GitHub yet): [`compare/main...demo/p6-failing-accuracy-gate`](https://github.com/Dash3210/gridcast/compare/main...demo/p6-failing-accuracy-gate?expand=1)
-- **Red CI Run (branch push):** [`actions/runs/43934808856`](https://github.com/Dash3210/gridcast/actions/runs/43934808856) (triggered on `push` to `demo/p6-failing-accuracy-gate`)
+- **Pull Request:** [PR #1 — `demo(p6): deliberately degraded model to prove CI accuracy gate fails`](https://github.com/Dash3210/gridcast/pull/1) (`demo/p6-failing-accuracy-gate`, `5e6bf56`)
+- **Red CI Runs:** [`actions/runs/43953778363`](https://github.com/Dash3210/gridcast/actions/runs/43953778363) (`pull_request`) and [`actions/runs/43934808856`](https://github.com/Dash3210/gridcast/actions/runs/43934808856) (`push` to `demo/p6-failing-accuracy-gate`)
 - **Observed Outcome:** `data/eval/candidate_split.parquet` (`calendar_plus_horizon`, 10 features dropping `actual_*` and `mix_*`, 7 truth/baseline columns byte-for-byte identical to the pinned fixture) passed `Run check suite (lint, typecheck, test, data-check)` (`lint`, `typecheck`, `337` tests, `data-check`) and `Docker Container Build & Smoke Verification`, and failed specifically on `Run evaluation gate and assert PASS with fixture SHA-256` (`make eval` exit `1`, `Candidate GATE_VALUE: 48.682 gCO2/kWh > 43.3379`, `GATE VERDICT: FAIL`).
 
 ## Status
@@ -48,7 +48,7 @@ A deliberately degraded candidate branch proves the CI accuracy gate rejects und
 | P3 | Models: baseline models, backtesting engine, and evaluation gate | closed (no gate verdict; ADR-020) |
 | P4 | Service: FastAPI prediction API and Prometheus metrics endpoint | done |
 | P5 | Packaging: Docker containerisation and GitHub Actions CI workflow | done |
-| P6 | Verification: deliberately failing pull request demonstrating accuracy gate | verified on branch (red CI run 43934808856); PR staged |
+| P6 | Verification: deliberately failing pull request demonstrating accuracy gate | done ([PR #1](https://github.com/Dash3210/gridcast/pull/1) open; red CI verified) |
 | P7 | Deployment: automated schedule, documentation, and scoreboard publication | done in repo (nightly dual-model scoreboard, `docs/index.html` ready for Pages, `MODEL_CARD.md` failure modes, `render.yaml` ready) |
 
 ## Quickstart
