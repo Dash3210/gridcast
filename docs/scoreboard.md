@@ -4,20 +4,35 @@ scoreboard started 2026-11-02; consecutive days recorded: 15
 
 ## Live Model Performance (All Settled Points)
 
-### persistence-v0
+### lgbm-v2
 
-- **Date range covered:** 2026-11-02 to 2026-11-16
-- **Scored points:** 1332
-- **Model MAE (macro mean, h=1..96):** 37.42
-- **Model MAE (row mean):** 37.18
-- **Operator vintage breakdown:** snapshot_at_issue: 0, archive_at_scoring: 33, none: 1299
+- **Date range covered:** 2026-11-16 to 2026-11-16
+- **Scored points:** 40
+- **Model MAE (macro mean, h=1..96):** 28.90
+- **Model MAE (row mean):** 28.90
+- **Operator vintage breakdown:** snapshot_at_issue: 0, archive_at_scoring: 0, none: 40
 
 | Horizon Bucket | Scored Points | Model MAE |
 |---|---|---|
-| 0–12h | 354 | 28.58 |
-| 12–24h | 336 | 37.14 |
-| 24–36h | 330 | 40.96 |
-| 36–48h | 312 | 42.96 |
+| 0–12h | 24 | 16.36 |
+| 12–24h | 16 | 47.71 |
+| 24–36h | 0 | N/A |
+| 36–48h | 0 | N/A |
+
+### persistence-v0
+
+- **Date range covered:** 2026-11-02 to 2026-11-16
+- **Scored points:** 1376
+- **Model MAE (macro mean, h=1..96):** 39.06
+- **Model MAE (row mean):** 38.81
+- **Operator vintage breakdown:** snapshot_at_issue: 0, archive_at_scoring: 33, none: 1343
+
+| Horizon Bucket | Scored Points | Model MAE |
+|---|---|---|
+| 0–12h | 360 | 28.99 |
+| 12–24h | 352 | 39.33 |
+| 24–36h | 336 | 41.60 |
+| 36–48h | 328 | 46.16 |
 
 ## Snapshot at Issue (Verified Vintage)
 
