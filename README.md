@@ -1,10 +1,42 @@
 # gridcast
 
+[![CI](https://github.com/Dash3210/gridcast/actions/workflows/ci.yml/badge.svg)](https://github.com/Dash3210/gridcast/actions/workflows/ci.yml) [![Nightly](https://github.com/Dash3210/gridcast/actions/workflows/nightly.yml/badge.svg)](https://github.com/Dash3210/gridcast/actions/workflows/nightly.yml)
+
 **Target.** gridcast is a forecasting service for Great Britain's half-hourly grid carbon intensity (containerised in Phase P5), forecasting 48 hours ahead and gated in CI on forecast accuracy. It aims to answer whether a solo open-source model can beat the National Energy System Operator's (NESO) published forecast on a permanent, public scoreboard.
 
 > Phase P3 closes with no gate verdict (neither a pass nor a fail; ADR-020). The previously proposed 35.0 gCO2/kWh threshold was derived from the candidate's own validation score and was mathematically invalid to judge it. On the frozen evaluation split (frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins; 2026-09-04 23:00 UTC to 2026-10-31 00:00 UTC), the candidate model scores GATE_VALUE = 39.118 gCO2/kWh against persistence (53.741 gCO2/kWh), seasonal-naive (51.495 gCO2/kWh), and NESO operator (11.666 gCO2/kWh) (archive commit 3617143, restated from 39.032 gCO2/kWh at commit 3617143; frozen fixture v2). An external gap-closure gate referencing persistence and operator baselines is defined in ADR-021 and committed as an automated CI gate in ADR-030 for Phase P5.
 
-> Note: Upon completion of Phase P7, this README will open with the live forecast-vs-actual scoreboard table comparing gridcast models against the NESO baseline, positioned directly above the Quickstart.
+## Live Scoreboard
+
+See the full Markdown report in [docs/scoreboard.md](docs/scoreboard.md) and the static HTML/SVG report in [docs/index.html](docs/index.html) (generated deterministically on `main` from `data/scoreboard/scores.csv`, `data/scoreboard/forecasts.parquet`, and `data/eval/frozen_split_v2.parquet`, ready to publish via `Settings -> Pages -> Deploy from branch: main (/docs)` at target URL `https://dash3210.github.io/gridcast/`).
+
+- **Record span:** `15 consecutive days recorded` (`2026-11-02 to 2026-11-16`, scoreboard started `2026-11-02`)
+- **Models issued nightly:** `lgbm-v2` (now issuing daily going forward; `0` settled points until its first 48h window settles) alongside the continuous `persistence-v0` baseline (`1,332` settled points)
+
+| Live Plane / Source | Model | Date Range | Scored Points | Model MAE (Macro / Row) | Operator MAE | Notes |
+|---|---|---|---|---|---|---|
+| All Settled Points | `persistence-v0` | `2026-11-02` to `2026-11-16` | `1,332` | `37.42` / `37.18` | — | `0–12h`: `28.58` (`354`), `12–24h`: `37.14` (`336`), `24–36h`: `40.96` (`330`), `36–48h`: `42.96` (`312`) |
+| `snapshot_at_issue` (verified vintage) | `persistence-v0` | `None` | `0` | `N/A` | `N/A` | Awaiting verified issue-time NESO snapshots |
+| `archive_at_scoring` (unverified vintage) | `persistence-v0` | `2026-11-02` to `2026-11-02` | `33` (`h=1..33`) | `24.67` | `9.15` | *Published NESO forecast for the same periods, vintage unverified; refusing to aggregate across sources (ADR-022)* |
+
+### Frozen 15-Origin Benchmark
+
+Evaluated on `frozen fixture v2, sha256 87d322235bdc9de95c32a9622ca75b226ba9e30c3d1ce4e5126a93ac77e9eb51, archive commit 3617143, window 2026-09-05 to 2026-11-01, 15 origins` (`1,440` identical-intersection periods, external gate threshold `43.3379 gCO2/kWh`):
+
+| Model / Baseline | GATE_VALUE (gCO2/kWh) | Notes |
+|---|---|---|
+| `lgbm-v2` (candidate) | **39.118** | Closes **34.75%** of persistence-to-operator gap (`GATE VERDICT: PASS`, `39.118 <= 43.3379`) |
+| `persistence` | **53.741** | Issue-anchored persistence baseline (`issue_time - 3h`) |
+| `seasonal-naive` | **51.495** | 24h lagged actual baseline |
+| NESO operator | **11.666** | *Published NESO forecast for the same periods, vintage unverified (ADR-022)* |
+
+### Phase P6 Failing-Gate Proof
+
+A deliberately degraded candidate branch proves the CI accuracy gate rejects underperforming models while code quality, unit tests, and container checks remain green:
+
+- **Branch / Commit:** [`demo/p6-failing-accuracy-gate`](https://github.com/Dash3210/gridcast/tree/demo/p6-failing-accuracy-gate) (`5e6bf56`) — PR staged for owner click-through (`0` open PRs on GitHub yet): [`compare/main...demo/p6-failing-accuracy-gate`](https://github.com/Dash3210/gridcast/compare/main...demo/p6-failing-accuracy-gate?expand=1)
+- **Red CI Run (branch push):** [`actions/runs/43934808856`](https://github.com/Dash3210/gridcast/actions/runs/43934808856) (triggered on `push` to `demo/p6-failing-accuracy-gate`)
+- **Observed Outcome:** `data/eval/candidate_split.parquet` (`calendar_plus_horizon`, 10 features dropping `actual_*` and `mix_*`, 7 truth/baseline columns byte-for-byte identical to the pinned fixture) passed `Run check suite (lint, typecheck, test, data-check)` (`lint`, `typecheck`, `337` tests, `data-check`) and `Docker Container Build & Smoke Verification`, and failed specifically on `Run evaluation gate and assert PASS with fixture SHA-256` (`make eval` exit `1`, `Candidate GATE_VALUE: 48.682 gCO2/kWh > 43.3379`, `GATE VERDICT: FAIL`).
 
 ## Status
 
@@ -15,9 +47,9 @@
 | P2 | Features: feature extraction and temporal leakage test suite | done |
 | P3 | Models: baseline models, backtesting engine, and evaluation gate | closed (no gate verdict; ADR-020) |
 | P4 | Service: FastAPI prediction API and Prometheus metrics endpoint | done |
-| P5 | Packaging: Docker containerisation and GitHub Actions CI workflow | ready for P5 gate (P5-a gate + P5-b container/CI) |
-| P6 | Verification: deliberately failing pull request demonstrating accuracy gate | not started |
-| P7 | Deployment: automated schedule, documentation, and scoreboard publication | not started |
+| P5 | Packaging: Docker containerisation and GitHub Actions CI workflow | done |
+| P6 | Verification: deliberately failing pull request demonstrating accuracy gate | verified on branch (red CI run 43934808856); PR staged |
+| P7 | Deployment: automated schedule, documentation, and scoreboard publication | done in repo (nightly dual-model scoreboard, `docs/index.html` ready for Pages, `MODEL_CARD.md` failure modes, `render.yaml` ready) |
 
 ## Quickstart
 
@@ -79,7 +111,7 @@ python -m gridcast version
 
 ## What works today
 
-Today (Phase P5), the working automation targets are:
+Today (Phase P7), the working automation targets are:
 - `make install` — creates the virtual environment and installs dependencies in editable mode
 - `make test` — runs the test suite with coverage enforcement (>= 85%) and temporal leakage validation
 - `make lint` — checks codebase formatting and linting rules with ruff
@@ -293,7 +325,8 @@ Audit logs are stored in `data/audit/` and created lazily only when anomalies oc
 Phase milestones:
 - `make serve` runs the FastAPI forecast prediction service (`python -m gridcast.cli serve --run`, P4).
 - `make docker` builds the multi-stage, non-root (`UID 10001`) production Docker image `gridcast:latest` (P5).
-- `make train`, `make eval`, `make eval-serve`, and `make gate-negative` are active automation targets (P3/P5).
+- `make train`, `make eval`, `make eval-serve`, and `make gate-negative` are active automation targets (P3/P5/P6).
+- `gridcast forecast` issues both `lgbm-v2` and `persistence-v0` forecasts; `gridcast score` updates `data/scoreboard/scores.csv`, `docs/scoreboard.md`, and `docs/index.html` (P7).
 
 ### Serving API (Phase P4)
 
@@ -326,7 +359,7 @@ Phase P5 packages `gridcast` as a multi-stage, non-root production Docker image 
 
 - **Base Image & Lockfile**: Both builder and runtime stages pin `python:3.10-slim` by SHA-256 digest (`sha256:6ff506466f8b1e981719b468cc0023b8ef000b983cdec0eafe119d01f379e31d`). Runtime dependencies are hash-verified (`pip install --require-hashes --no-deps -r requirements.lock`, 30 Linux packages; `httpx2` used by Starlette `TestClient` is isolated to `[project.optional-dependencies].dev` in `pyproject.toml`). The runtime stage installs `libgomp1` for LightGBM, runs as non-root user `gridcast` (`UID/GID 10001`), exposes port `8000` with a `/health` `HEALTHCHECK`, and is verified `< 400 MB` in CI.
 - **Startup Integrity (`data/models/runtime.json`)**: `runtime.json` pins `lightgbm_version` (`4.7.0`), `model_sha256` (`1cd13471...`), and `interval_sha256` (`ab94aa71...`). `verify_startup_environment()` runs at Docker image build time and service startup, refusing to boot if `runtime.json` is missing/invalid or if the installed `lightgbm` version or artifact SHA-256 digests mismatch.
-- **Read-Only Data Mounts & Single-Worker Topology**: `.dockerignore` excludes `data/curated/`, `data/mix/`, `data/scoreboard/`, `data/weather/`, `data/audit/`, `data/cache/`, `tests/`, and `docs/` from the image. Mount `data/curated`, `data/mix`, and `data/scoreboard` read-only (`:ro`) at runtime; serving paths perform zero filesystem writes. Always run with a single worker / replica (`--workers 1` / `replicas: 1`) because `ModelSnapshot` reload state and the Prometheus metrics registry are held in-process.
+- **Baked Snapshot & Read-Only Data Mounts (ADR-034)**: `.dockerignore` excludes `data/weather/`, `data/audit/`, `data/cache/`, `tests/`, and `docs/`, while `Dockerfile` copies the committed `data/curated/`, `data/mix/`, and `data/scoreboard/` snapshot (`~11.7 MB`) into `/app/data/` so stateless container platforms (such as Render) serve HTTP `200` on `/health`, `/ready`, and `/forecast` immediately on boot. When running with live host-updated partitions, mount `data/curated`, `data/mix`, and `data/scoreboard` read-only (`:ro`) to overlay the baked snapshot; serving paths perform zero filesystem writes. Always run with a single worker / replica (`--workers 1` / `replicas: 1`) because `ModelSnapshot` reload state and the Prometheus metrics registry are held in-process.
 - **Reload Authentication (`GRIDCAST_RELOAD_TOKEN`)**: Pass `-e GRIDCAST_RELOAD_TOKEN="<secret>"` to arm `POST /reload` (via `Authorization: Bearer <secret>` or `X-Reload-Token` header). When unset, `POST /reload` remains closed (HTTP 503).
 
 Run the containerised service with read-only operational mounts:
@@ -354,27 +387,34 @@ docker run --rm \
   - `gate` job runs `make check` (`lint`, `typecheck`, `test`, `data-check`), `make eval` (asserting `GATE VERDICT: PASS` and pinned fixture SHA-256), `make gate-negative` (asserting rejection), `make eval-serve` (asserting `SERVE GATE VERDICT: PASS`, `0.00000000` delta, pinned model and prediction SHA-256s), and `git diff --exit-code`. `make eval-reproduce` is kept manual/platform-scoped per ADR-031.
   - `docker` job runs `make docker`, checks image size `< 400 MB`, verifies `id -u == 10001`, runs in-container `eval-serve` with `:ro` mounts, and smoke-tests `/health`, `/ready`, `/model`, `/metrics`, `/forecast?hours=48`, and `/reload` (`401` unauthenticated, `200` with `GRIDCAST_RELOAD_TOKEN`).
 
+### Deployment (Render + GitHub Pages, Phase P7)
+
+- **Render (`render.yaml`)**: Defines a single-instance free-tier Docker web service (`type: web`, `name: gridcast`, `runtime: docker`, `plan: free`, `dockerfilePath: ./Dockerfile`, `numInstances: 1`, `healthCheckPath: /health`, `autoDeploy: true`, with `PORT=8000` and `GRIDCAST_RELOAD_TOKEN` marked `sync: false`). Because `Dockerfile` bakes the committed `data/curated/`, `data/mix/`, and `data/scoreboard/` snapshot, the Blueprint is ready in the repo; live hosting requires connecting the repository as a Render Blueprint and setting `GRIDCAST_RELOAD_TOKEN` in Render (no live Render URL is deployed yet).
+- **GitHub Pages (`docs/index.html` + `.github/workflows/nightly.yml`)**: Every nightly workflow run executes `make ingest`, issues both `persistence-v0` and `lgbm-v2` forecasts via `gridcast forecast`, scores settled targets via `gridcast score`, and deterministically regenerates `docs/scoreboard.md` and the zero-dependency static HTML/CSS/SVG report `docs/index.html` on `main`, ready to publish via `Settings -> Pages -> Deploy from branch: main (/docs)` (target URL `https://dash3210.github.io/gridcast/`, returning 404 until enabled in repository settings).
+
 ## Layout
 
 ```
 gridcast/
-|-- .dockerignore         # Excludes data stores, tests, docs, and caches from Docker build context
+|-- .dockerignore         # Excludes weather, audit, cache, tests, and docs from Docker build context
 |-- .gitattributes        # Binary/LF attributes for Parquet and pinned model artifacts
 |-- .github/
 |   `-- workflows/
 |       |-- ci.yml        # CI gate (check, eval, gate-negative, eval-serve) and docker jobs
-|       `-- nightly.yml   # Scheduled ingest and live scoreboard update workflow
+|       `-- nightly.yml   # Scheduled ingest, dual-model forecast, and scoreboard/Pages update
 |-- Dockerfile            # Multi-stage, non-root (UID 10001) production container (< 400 MB)
 |-- LICENSE               # MIT License
 |-- Makefile              # Automation recipes restricted to cmd/sh common subset
-|-- MODEL_CARD.md         # Model lineage, serving contracts, and pinned evaluation metrics
+|-- MODEL_CARD.md         # Model lineage, serving contracts, failure modes, and pinned metrics
 |-- pyproject.toml        # PEP 621 package metadata, dependencies, and tool configurations
-|-- README.md             # Project overview, status tracking, and module guide
+|-- README.md             # Project overview, live scoreboard, status tracking, and module guide
+|-- render.yaml           # Render free-tier single-instance Docker deployment blueprint
 |-- requirements.lock     # Hash-pinned Linux runtime lockfile (30 packages) for Docker builds
 |-- docs/
 |   |-- ablations/        # Ablation study records
 |   |-- decisions.md      # Architecture Decision Records (ADRs)
-|   `-- scoreboard.md     # Live forecast-vs-actual scoreboard report
+|   |-- index.html        # Deterministic static GitHub Pages scoreboard (HTML/CSS/inline SVG)
+|   `-- scoreboard.md     # Live forecast-vs-actual Markdown scoreboard report
 |-- src/
 |   `-- gridcast/
 |       |-- py.typed      # PEP 561 marker for inline type annotations
